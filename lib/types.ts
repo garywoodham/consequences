@@ -11,9 +11,13 @@ export type Player = {
 
 export type StoryLine = {
   promptId: string;
+  promptLabel: string;
   text: string;
+  /** The contributor's raw answer formatted as a natural story segment. */
+  display: string;
   playerId: string;
   playerName: string;
+  playerAvatarUrl?: string;
 };
 
 export type StoryPanel = {

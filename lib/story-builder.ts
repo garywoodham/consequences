@@ -27,31 +27,31 @@ function formatLine(text: string, prefix?: string): string {
   return `${prefix} ${trimmed.charAt(0).toLowerCase() + trimmed.slice(1)}`;
 }
 
-function buildProse(lines: StoryLine[], templateId: string): string {
-  const template = getTemplateById(templateId);
-  const parts: string[] = [];
+const CONNECTOR_PREFIXES = ["met", "at", "to"];
 
-  for (let i = 0; i < template.prompts.length; i++) {
-    const prompt = template.prompts[i];
-    const line = lines.find((l) => l.promptId === prompt.id);
-    if (!line) continue;
+/** Format a single segment as it appears within the flowing story. */
+function buildSegment(text: string, prefix: string | undefined, index: number): string {
+  const formatted = formatLine(text, prefix);
 
-    const formatted = formatLine(line.text, prompt.prefix);
-
-    if (i === 0) {
-      parts.push(formatted);
-    } else if (i === 1) {
-      parts.push(formatted);
-    } else if (prompt.prefix && ["met", "at", "to"].includes(prompt.prefix.toLowerCase())) {
-      parts.push(formatted);
-    } else if (prompt.prefix) {
-      parts.push(formatted + ".");
-    } else {
-      parts.push(capitalizeFirst(line.text) + ".");
-    }
+  if (index <= 1) {
+    return formatted;
   }
+  if (prefix && CONNECTOR_PREFIXES.includes(prefix.toLowerCase())) {
+    return formatted;
+  }
+  if (prefix) {
+    return formatted + ".";
+  }
+  return capitalizeFirst(text.trim()) + ".";
+}
 
-  return parts.join(" ").replace(/\s+/g, " ").replace(/\.\./g, ".").trim();
+function buildProse(lines: StoryLine[]): string {
+  return lines
+    .map((line) => line.display)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .replace(/\.\./g, ".")
+    .trim();
 }
 
 function pickPlayerOrder(players: Player[], storyIndex: number): Player[] {
@@ -81,16 +81,19 @@ export function buildMixedStories(
       const text = submissions[player.id]?.[prompt.id] ?? "...";
       return {
         promptId: prompt.id,
+        promptLabel: prompt.label,
         text,
+        display: buildSegment(text, prompt.prefix, promptIndex),
         playerId: player.id,
         playerName: player.name,
+        playerAvatarUrl: player.avatarUrl,
       };
     });
 
     return {
       id: `story-${storyIndex + 1}`,
       lines,
-      prose: buildProse(lines, templateId),
+      prose: buildProse(lines),
     };
   });
 }

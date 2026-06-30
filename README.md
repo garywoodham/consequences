@@ -35,8 +35,13 @@ cp .env.local.example .env.local
 
 | Variable | Required | Description |
 |---|---|---|
-| `NEXT_PUBLIC_PARTYKIT_HOST` | Dev: `localhost:1999` | PartyKit server host |
+| `NEXT_PUBLIC_PARTYKIT_HOST` | Build-time fallback | PartyKit host baked into the client (used on Vercel). |
+| `PARTYKIT_HOST` | Runtime override | Read at request time by `/api/config`, so the host can change without rebuilding (handy for preview tunnels). |
 | `BLOB_READ_WRITE_TOKEN` | Optional | Vercel Blob token for avatar uploads. Without it, avatars use base64 fallback. |
+
+The client resolves the PartyKit host in this order: it first uses
+`NEXT_PUBLIC_PARTYKIT_HOST` (if set at build time), then overrides it with
+whatever `/api/config` returns at runtime (`PARTYKIT_HOST`).
 
 ### Run locally
 

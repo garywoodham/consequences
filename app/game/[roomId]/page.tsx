@@ -52,9 +52,25 @@ export default function GamePage() {
 
   return (
     <div className="mx-auto w-full max-w-lg space-y-4 px-4 py-8">
-      <div className="text-center">
+      <div className="flex items-center justify-between gap-2">
+        <button
+          onClick={() => {
+            try {
+              sessionStorage.removeItem("consequences-session");
+            } catch {
+              // ignore
+            }
+            window.location.href = "/";
+          }}
+          className="text-sm text-white/50 underline-offset-2 hover:text-white/80 hover:underline"
+        >
+          Leave game
+        </button>
         <p className="text-sm text-white/60">
-          {connected ? "Connected" : "Connecting..."} · {template.name} · {state.players.length} players
+          <span className={connected ? "text-emerald-300" : "text-amber-300"}>
+            {connected ? "Connected" : "Connecting..."}
+          </span>{" "}
+          · {template.name} · {state.players.length} players
         </p>
       </div>
 

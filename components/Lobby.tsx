@@ -16,6 +16,7 @@ type LobbyProps = {
 
 export function Lobby({ state, currentPlayerId, onStart, error }: LobbyProps) {
   const [copied, setCopied] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
   const isHost = state.hostId === currentPlayerId;
   const connectedCount = state.players.filter((p) => p.connected).length;
 
@@ -23,6 +24,13 @@ export function Lobby({ state, currentPlayerId, onStart, error }: LobbyProps) {
     await navigator.clipboard.writeText(state.roomCode);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  }
+
+  async function copyLink() {
+    const url = typeof window !== "undefined" ? window.location.href : "";
+    await navigator.clipboard.writeText(url);
+    setLinkCopied(true);
+    setTimeout(() => setLinkCopied(false), 2000);
   }
 
   return (
@@ -39,6 +47,13 @@ export function Lobby({ state, currentPlayerId, onStart, error }: LobbyProps) {
         </div>
         <Button variant="secondary" size="icon" onClick={copyCode} aria-label="Copy room code">
           {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+        </Button>
+      </div>
+
+      <div className="mb-6 flex justify-center">
+        <Button variant="ghost" size="sm" onClick={copyLink}>
+          {linkCopied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+          {linkCopied ? "Link copied!" : "Copy invite link"}
         </Button>
       </div>
 

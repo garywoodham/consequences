@@ -44,7 +44,7 @@ export function PromptForm({ state, currentPlayerId, onSubmit }: PromptFormProps
         <div className="mt-4 h-2 overflow-hidden rounded-full bg-white/10">
           <div
             className="h-full rounded-full bg-violet-500 transition-all"
-            style={{ width: `${(submittedCount / totalCount) * 100}%` }}
+            style={{ width: `${totalCount > 0 ? (submittedCount / totalCount) * 100 : 0}%` }}
           />
         </div>
       </Card>

@@ -11,17 +11,40 @@ type UseGameOptions = {
   session: GameSession | null;
 };
 
+const BUILD_TIME_HOST = process.env.NEXT_PUBLIC_PARTYKIT_HOST ?? "";
+
 export function useGame({ roomId, session }: UseGameOptions) {
   const [state, setState] = useState<GameState>(EMPTY_GAME_STATE);
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
+  // Resolve the PartyKit host at runtime so a changing preview URL doesn't
+  // require rebuilding. Falls back to the build-time env (used on Vercel).
+  const [partyHost, setPartyHost] = useState<string>(BUILD_TIME_HOST);
   const joinedRef = useRef(false);
 
-  const host = process.env.NEXT_PUBLIC_PARTYKIT_HOST ?? "localhost:1999";
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/config")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { partyHost?: string } | null) => {
+        if (!cancelled && data?.partyHost && data.partyHost !== partyHost) {
+          setPartyHost(data.partyHost);
+        }
+      })
+      .catch(() => {
+        // Keep the build-time fallback if the config fetch fails.
+      });
+    return () => {
+      cancelled = true;
+    };
+    // Only run once on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const socket = usePartySocket({
-    host,
+    host: partyHost || "localhost:1999",
     room: roomId.toLowerCase(),
+    enabled: Boolean(roomId) && Boolean(partyHost || BUILD_TIME_HOST),
     onOpen() {
       setConnected(true);
     },

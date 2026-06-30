@@ -1,10 +1,11 @@
 "use client";
 
 import { useState } from "react";
-import { ChevronLeft, ChevronRight, Copy, Maximize2, Sparkles, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Check, Copy, Maximize2, Sparkles, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardTitle } from "@/components/ui/card";
 import type { GameState } from "@/lib/types";
+import { PlayerAvatar } from "./PlayerAvatar";
 
 type StoryRevealProps = {
   state: GameState;
@@ -52,26 +53,27 @@ export function StoryReveal({ state, isHost, onPlayAgain }: StoryRevealProps) {
 
     return (
       <div className="fixed inset-0 z-50 flex flex-col bg-gradient-to-br from-violet-950 via-purple-900 to-fuchsia-900 p-6">
-        <div className="flex justify-end">
-          <Button variant="ghost" size="icon" onClick={() => setReadAloud(false)}>
+        <div className="flex items-center justify-between">
+          <p className="text-sm uppercase tracking-widest text-white/50">
+            Story {index + 1} of {stories.length}
+          </p>
+          <Button variant="ghost" size="icon" onClick={() => setReadAloud(false)} aria-label="Close read-aloud">
             <X className="h-5 w-5" />
           </Button>
         </div>
         <div className="flex flex-1 flex-col items-center justify-center text-center">
-          <p className="mb-4 text-sm uppercase tracking-widest text-white/50">
-            Story {index + 1} of {stories.length} — Line {lineIndex + 1}
-          </p>
-          <p className="max-w-2xl text-3xl font-medium leading-relaxed text-white md:text-4xl">
-            {line ? (
-              <>
-                <span className="text-white/60">{line.text}</span>
-              </>
-            ) : (
-              story.prose
-            )}
+          <p className="max-w-3xl text-2xl font-medium leading-relaxed text-white md:text-4xl">
+            {story.lines.slice(0, lineIndex + 1).map((l, i) => (
+              <span key={l.promptId} className={i === lineIndex ? "text-white" : "text-white/35"}>
+                {l.display}{" "}
+              </span>
+            ))}
           </p>
           {line && (
-            <p className="mt-4 text-sm text-white/40">— {line.playerName}</p>
+            <div className="mt-8 flex items-center gap-2 text-sm text-white/50">
+              <PlayerAvatar name={line.playerName} avatarUrl={line.playerAvatarUrl} size="sm" />
+              <span>contributed by {line.playerName}</span>
+            </div>
           )}
         </div>
         <div className="flex justify-center gap-3">
@@ -80,7 +82,7 @@ export function StoryReveal({ state, isHost, onPlayAgain }: StoryRevealProps) {
             disabled={lineIndex === 0}
             onClick={() => setLineIndex((i) => i - 1)}
           >
-            <ChevronLeft className="h-4 w-4" /> Previous line
+            <ChevronLeft className="h-4 w-4" /> Back
           </Button>
           <Button
             variant="secondary"
@@ -93,7 +95,7 @@ export function StoryReveal({ state, isHost, onPlayAgain }: StoryRevealProps) {
               }
             }}
           >
-            {isLastLine ? "Done" : "Next line"} <ChevronRight className="h-4 w-4" />
+            {isLastLine ? "Finish" : "Reveal next"} <ChevronRight className="h-4 w-4" />
           </Button>
         </div>
       </div>
@@ -109,7 +111,7 @@ export function StoryReveal({ state, isHost, onPlayAgain }: StoryRevealProps) {
         </div>
         <div className="flex gap-2">
           <Button variant="secondary" size="icon" onClick={copyStory} aria-label="Copy story">
-            {copied ? "✓" : <Copy className="h-4 w-4" />}
+            {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
           </Button>
           <Button variant="secondary" size="icon" onClick={() => setReadAloud(true)} aria-label="Read aloud mode">
             <Maximize2 className="h-4 w-4" />
@@ -125,10 +127,16 @@ export function StoryReveal({ state, isHost, onPlayAgain }: StoryRevealProps) {
         <summary className="cursor-pointer text-sm font-medium text-white/80">
           See who wrote what
         </summary>
-        <ul className="mt-3 space-y-2">
+        <ul className="mt-3 space-y-3">
           {story.lines.map((line) => (
-            <li key={line.promptId} className="text-sm text-white/70">
-              <span className="text-white/40">{line.playerName}:</span> {line.text}
+            <li key={line.promptId} className="flex items-start gap-3">
+              <PlayerAvatar name={line.playerName} avatarUrl={line.playerAvatarUrl} size="sm" />
+              <div className="text-sm">
+                <p className="text-white/40">
+                  {line.promptLabel} · {line.playerName}
+                </p>
+                <p className="text-white">{line.text}</p>
+              </div>
             </li>
           ))}
         </ul>
