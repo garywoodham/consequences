@@ -84,7 +84,7 @@ function pick<T>(pool: T[]): T {
 export function pickSampleAnswer(prompt: Prompt): string {
   if (prompt.type === "name") return pick(NAMES);
 
-  const hint = `${prompt.label} ${prompt.prefix ?? ""}`.toLowerCase();
+  const hint = `${prompt.label} ${prompt.segment ?? ""}`.toLowerCase();
 
   if (hint.includes("adjective")) return pick(ADJECTIVES);
   if (hint.includes("wore") || hint.includes("wear")) return pick(CLOTHING);
