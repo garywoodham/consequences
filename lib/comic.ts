@@ -45,10 +45,11 @@ export function scriptPanels(story: Story): Omit<StoryPanel, "imageUrl">[] {
     }
 
     const sceneDescription =
-      `${PANEL_STYLE}. Scene ${index + 1}: ${caption}` +
+      `Illustrate this story moment: ${caption}` +
       (characters.length
-        ? `. Featuring ${characters.map((c) => c.name).join(" and ")}.`
-        : "");
+        ? ` Featuring ${characters.map((c) => c.name).join(" and ")}.`
+        : "") +
+      ` Style: ${PANEL_STYLE}.`;
 
     return { index, caption, sceneDescription, characters };
   });
@@ -157,9 +158,13 @@ async function generatePanelImage(scene: string, characters: ComicCharacter[]): 
     usableRefs.forEach((r, i) => form.append("image[]", r.blob, `character-${i}.png`));
     form.append(
       "prompt",
-      `${scene} The provided reference images show what the characters look like. ` +
-        `Draw ${castNames} so they clearly resemble those reference images, ` +
-        `keeping each character's appearance consistent across panels.`
+      `${scene} ` +
+        `Compose a brand-new full comic panel that depicts the scene, setting and action ` +
+        `described above — this must be an illustrated story moment, NOT a portrait. ` +
+        `The attached reference image(s) only show what ${castNames} look like: keep their ` +
+        `faces and likeness, but draw them inside this scene actively doing the described action, ` +
+        `with a background and props that match the story. ` +
+        `Do not simply reproduce, crop, or restyle the reference image.`
     );
     form.append("size", "1024x1024");
     form.append("quality", "low");
