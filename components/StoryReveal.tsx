@@ -4,8 +4,9 @@ import { useState } from "react";
 import { ChevronLeft, ChevronRight, Check, Copy, Maximize2, Sparkles, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardTitle } from "@/components/ui/card";
-import type { GameState } from "@/lib/types";
+import type { ComicStripData, GameState, Story } from "@/lib/types";
 import { PlayerAvatar } from "./PlayerAvatar";
+import { ComicStrip, ComicStripSkeleton } from "./ComicStrip";
 
 type StoryRevealProps = {
   state: GameState;
@@ -18,6 +19,9 @@ export function StoryReveal({ state, isHost, onPlayAgain }: StoryRevealProps) {
   const [readAloud, setReadAloud] = useState(false);
   const [lineIndex, setLineIndex] = useState(0);
   const [copied, setCopied] = useState(false);
+  const [comics, setComics] = useState<Record<string, ComicStripData>>({});
+  const [comicLoading, setComicLoading] = useState(false);
+  const [comicError, setComicError] = useState<string | null>(null);
 
   const stories = state.stories;
   const story = stories[index];
@@ -39,6 +43,28 @@ export function StoryReveal({ state, isHost, onPlayAgain }: StoryRevealProps) {
   function prevStory() {
     setIndex((i) => Math.max(i - 1, 0));
     setLineIndex(0);
+  }
+
+  async function generateComic(target: Story) {
+    setComicError(null);
+    setComicLoading(true);
+    try {
+      const res = await fetch("/api/generate-comic", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ story: target }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error ?? "Comic generation failed");
+      }
+      const data = (await res.json()) as { comic: ComicStripData };
+      setComics((prev) => ({ ...prev, [target.id]: data.comic }));
+    } catch (err) {
+      setComicError(err instanceof Error ? err.message : "Comic generation failed");
+    } finally {
+      setComicLoading(false);
+    }
   }
 
   async function copyStory() {
@@ -154,18 +180,43 @@ export function StoryReveal({ state, isHost, onPlayAgain }: StoryRevealProps) {
         </Button>
       </div>
 
-      <Button
-        variant="secondary"
-        className="mb-3 w-full"
-        disabled
-        title="Coming in Phase 2"
-      >
-        <Sparkles className="h-4 w-4" />
-        Generate comic strip (Phase 2)
-      </Button>
+      <div className="mb-4">
+        {comics[story.id] ? (
+          <ComicStrip comic={comics[story.id]} />
+        ) : comicLoading ? (
+          <div className="space-y-3">
+            <p className="text-center text-sm text-white/60">Drawing your comic strip...</p>
+            <ComicStripSkeleton />
+          </div>
+        ) : (
+          <Button
+            variant="secondary"
+            className="w-full"
+            onClick={() => generateComic(story)}
+          >
+            <Sparkles className="h-4 w-4" />
+            Generate comic strip
+          </Button>
+        )}
+        {comicError && (
+          <p className="mt-2 text-center text-sm text-red-300">{comicError}</p>
+        )}
+        {comics[story.id] && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="mx-auto mt-2 flex"
+            onClick={() => generateComic(story)}
+            disabled={comicLoading}
+          >
+            <Sparkles className="h-4 w-4" />
+            Regenerate
+          </Button>
+        )}
+      </div>
 
       {isHost && (
-        <Button className="w-full" onClick={onPlayAgain}>
+        <Button className="mt-2 w-full" onClick={onPlayAgain}>
           Play again
         </Button>
       )}

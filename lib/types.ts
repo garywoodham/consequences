@@ -4,6 +4,8 @@ export type Player = {
   id: string;
   name: string;
   avatarUrl?: string;
+  /** Cartoon caricature derived from the uploaded photo (Phase 2). */
+  caricatureUrl?: string;
   connected: boolean;
   isHost: boolean;
   hasSubmitted: boolean;
@@ -20,16 +22,34 @@ export type StoryLine = {
   playerAvatarUrl?: string;
 };
 
-export type StoryPanel = {
-  caption: string;
+export type ComicCharacter = {
+  id: string;
+  name: string;
+  /** Image used to represent the character (caricature, else avatar). */
   imageUrl?: string;
+};
+
+export type StoryPanel = {
+  index: number;
+  caption: string;
+  /** LLM/heuristic-authored prompt describing the scene for an image model. */
+  sceneDescription: string;
+  characters: ComicCharacter[];
+  /** Generated panel illustration (filled when an image provider is configured). */
+  imageUrl?: string;
+};
+
+export type ComicStripData = {
+  panels: StoryPanel[];
+  /** "ai" when illustrated by an image model, "photo" for the no-key fallback. */
+  mode: "ai" | "photo";
 };
 
 export type Story = {
   id: string;
   lines: StoryLine[];
   prose: string;
-  panels?: StoryPanel[];
+  comic?: ComicStripData;
 };
 
 export type GameState = {

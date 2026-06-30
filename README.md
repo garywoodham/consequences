@@ -10,7 +10,9 @@ An online multiplayer version of the classic **Consequences** parlour game. Play
 - **Name picker** — choose a fellow player's name or type your own for name prompts
 - **Real-time multiplayer** via PartyKit WebSockets
 - **Story reveal** — navigate mixed-up stories with read-aloud mode
-- **Phase 2 stub** — comic strip generation button (coming soon)
+- **Comic strips** — turn any story into a comic strip. With `OPENAI_API_KEY`,
+  uploaded photos become cartoon caricatures that star in AI-illustrated panels;
+  without a key, a photo-based comic strip is rendered from player avatars.
 
 ## Quick start
 
@@ -38,6 +40,7 @@ cp .env.local.example .env.local
 | `NEXT_PUBLIC_PARTYKIT_HOST` | Build-time fallback | PartyKit host baked into the client (used on Vercel). |
 | `PARTYKIT_HOST` | Runtime override | Read at request time by `/api/config`, so the host can change without rebuilding (handy for preview tunnels). |
 | `BLOB_READ_WRITE_TOKEN` | Optional | Vercel Blob token for avatar uploads. Without it, avatars use base64 fallback. |
+| `OPENAI_API_KEY` | Optional | Enables AI comic strips: caricatures of player photos + illustrated panels. Without it, a photo-based comic is rendered instead. |
 
 The client resolves the PartyKit host in this order: it first uses
 `NEXT_PUBLIC_PARTYKIT_HOST` (if set at build time), then overrides it with
@@ -87,12 +90,28 @@ npm run deploy:party
 
 Set `NEXT_PUBLIC_PARTYKIT_HOST` to your deployed PartyKit host (e.g. `consequences.your-username.partykit.dev`).
 
+## Comic strips (Phase 2)
+
+After the reveal, tap **Generate comic strip** on any story:
+
+1. The story is split into 3–6 panels (one beat per panel).
+2. Each panel shows the contributing players and a caption.
+3. With `OPENAI_API_KEY` set, each uploaded photo is first turned into a
+   reusable cartoon **caricature**, then every panel is illustrated with those
+   caricatures as the recurring characters (`lib/comic.ts`).
+4. Without a key, the strip is rendered client-side from player avatars with a
+   comic-book style (so the feature is fully usable offline/free).
+
+Relevant files: `lib/comic.ts`, `app/api/generate-comic/route.ts`,
+`app/api/caricature/route.ts`, `components/ComicStrip.tsx`.
+
 ## Tech stack
 
 - **Next.js 16** — React frontend + API routes
 - **PartyKit** — real-time multiplayer rooms
 - **Tailwind CSS** — styling
 - **Vercel Blob** — avatar image storage (optional)
+- **OpenAI image API** — caricatures + comic panels (optional)
 
 ## Project structure
 
