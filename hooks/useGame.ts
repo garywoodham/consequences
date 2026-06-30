@@ -77,6 +77,12 @@ export function useGame({ roomId, session }: UseGameOptions) {
         templateId: session.templateId,
       } satisfies ClientMessage)
     );
+
+    // Sample game: immediately populate players + stories so it lands on the
+    // reveal screen. The server ignores this once the room leaves the lobby.
+    if (session.sample) {
+      socket.send(JSON.stringify({ type: "seed-sample" } satisfies ClientMessage));
+    }
   }, [session, connected, socket]);
 
   const send = useCallback(
