@@ -84,6 +84,7 @@ export async function generateCaricature(imageUrl: string): Promise<string | nul
       `Transform this person into a ${CARICATURE_STYLE}. Keep them recognizable.`
     );
     form.append("size", "1024x1024");
+    form.append("quality", "medium");
 
     const res = await fetch("https://api.openai.com/v1/images/edits", {
       method: "POST",
@@ -99,10 +100,8 @@ export async function generateCaricature(imageUrl: string): Promise<string | nul
   }
 }
 
-/** Generate a single comic panel illustration (OpenAI image generation). */
-async function generatePanelImage(scene: string, characters: ComicCharacter[]): Promise<string | null> {
-  if (!OPENAI_API_KEY) return null;
-
+/** Text-to-image fallback when no character reference photos are available. */
+async function generatePanelFromText(scene: string, characters: ComicCharacter[]): Promise<string | null> {
   const cast = characters.length
     ? ` The recurring characters are: ${characters.map((c) => c.name).join(", ")}.`
     : "";
@@ -118,6 +117,7 @@ async function generatePanelImage(scene: string, characters: ComicCharacter[]): 
         model: "gpt-image-1",
         prompt: `${scene}${cast}`,
         size: "1024x1024",
+        quality: "low",
         n: 1,
       }),
     });
@@ -128,6 +128,57 @@ async function generatePanelImage(scene: string, characters: ComicCharacter[]): 
   } catch {
     return null;
   }
+}
+
+/**
+ * Generate a single comic panel. When the characters have reference images
+ * (their caricature, derived from the uploaded photo) those images are passed
+ * to the image-edit endpoint so the drawn characters resemble the real players.
+ */
+async function generatePanelImage(scene: string, characters: ComicCharacter[]): Promise<string | null> {
+  if (!OPENAI_API_KEY) return null;
+
+  const named = characters.filter((c) => c.imageUrl);
+  const refs = (
+    await Promise.all(named.map((c) => fetchAsBlob(c.imageUrl as string)))
+  ).map((blob, i) => ({ blob, name: named[i].name }));
+  const usableRefs = refs.filter((r): r is { blob: Blob; name: string } => Boolean(r.blob));
+
+  // No uploaded photos for this panel's cast → plain text-to-image.
+  if (usableRefs.length === 0) {
+    return generatePanelFromText(scene, characters);
+  }
+
+  const castNames = usableRefs.map((r) => r.name).join(", ");
+
+  try {
+    const form = new FormData();
+    form.append("model", "gpt-image-1");
+    usableRefs.forEach((r, i) => form.append("image[]", r.blob, `character-${i}.png`));
+    form.append(
+      "prompt",
+      `${scene} The provided reference images show what the characters look like. ` +
+        `Draw ${castNames} so they clearly resemble those reference images, ` +
+        `keeping each character's appearance consistent across panels.`
+    );
+    form.append("size", "1024x1024");
+    form.append("quality", "low");
+
+    const res = await fetch("https://api.openai.com/v1/images/edits", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+      body: form,
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const b64 = data?.data?.[0]?.b64_json;
+      if (b64) return `data:image/png;base64,${b64}`;
+    }
+  } catch {
+    // fall through to text generation below
+  }
+
+  return generatePanelFromText(scene, characters);
 }
 
 /**

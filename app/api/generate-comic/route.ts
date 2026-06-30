@@ -4,7 +4,7 @@ import type { Story } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 // Image generation can take a while; allow a generous budget where supported.
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 export async function POST(request: NextRequest) {
   let body: { story?: Story };
