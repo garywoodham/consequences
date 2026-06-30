@@ -7,43 +7,39 @@ import { PromptForm } from "@/components/PromptForm";
 import { StoryReveal } from "@/components/StoryReveal";
 import { useGame } from "@/hooks/useGame";
 import { getTemplateById } from "@/lib/prompts";
-import { loadSession } from "@/lib/session";
-
-function useIsClient() {
-  return useSyncExternalStore(
-    () => () => {},
-    () => true,
-    () => false
-  );
-}
-
-function useGameSession(roomId: string) {
-  return useSyncExternalStore(
-    () => () => {},
-    () => (roomId ? loadSession(roomId) : null),
-    () => null
-  );
-}
+import {
+  getServerSessionSnapshot,
+  getSessionSnapshot,
+  subscribeToSession,
+} from "@/lib/session-store";
 
 export default function GamePage() {
   const params = useParams();
   const router = useRouter();
   const roomId = String(params.roomId ?? "").toUpperCase();
-  const isClient = useIsClient();
-  const session = useGameSession(roomId);
+  const session = useSyncExternalStore(
+    subscribeToSession,
+    () => getSessionSnapshot(roomId),
+    getServerSessionSnapshot
+  );
 
   useEffect(() => {
-    if (isClient && roomId && !session) {
-      router.replace("/");
+    if (session === null && roomId) {
+      const timer = setTimeout(() => {
+        if (!getSessionSnapshot(roomId)) {
+          router.replace("/");
+        }
+      }, 100);
+      return () => clearTimeout(timer);
     }
-  }, [isClient, roomId, session, router]);
+  }, [session, roomId, router]);
 
   const { state, error, connected, startGame, submitAnswers, playAgain } = useGame({
     roomId,
-    session: isClient ? session : null,
+    session,
   });
 
-  if (!isClient || !session) {
+  if (!session) {
     return (
       <div className="flex min-h-[50vh] items-center justify-center text-white/60">
         Loading game...
