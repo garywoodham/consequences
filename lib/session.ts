@@ -9,24 +9,11 @@ export type GameSession = {
 
 const SESSION_KEY = "consequences-session";
 
-function canUseStorage(): boolean {
-  try {
-    const test = "__storage_test__";
-    sessionStorage.setItem(test, test);
-    sessionStorage.removeItem(test);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export function saveSession(session: GameSession): void {
   const data = JSON.stringify(session);
-  if (canUseStorage()) {
-    sessionStorage.setItem(SESSION_KEY, data);
-  }
+  // sessionStorage is per-tab, so multiple players can test from different tabs
   try {
-    localStorage.setItem(SESSION_KEY, data);
+    sessionStorage.setItem(SESSION_KEY, data);
   } catch {
     // ignore
   }
@@ -35,18 +22,17 @@ export function saveSession(session: GameSession): void {
 export function loadSession(roomId: string): GameSession | null {
   if (typeof window === "undefined") return null;
 
-  const sources = [sessionStorage.getItem(SESSION_KEY), localStorage.getItem(SESSION_KEY)];
+  // Only read from sessionStorage — each tab/player keeps their own session
+  const raw = sessionStorage.getItem(SESSION_KEY);
+  if (!raw) return null;
 
-  for (const raw of sources) {
-    if (!raw) continue;
-    try {
-      const parsed = JSON.parse(raw) as GameSession;
-      if (parsed.roomCode.toUpperCase() === roomId.toUpperCase()) {
-        return parsed;
-      }
-    } catch {
-      continue;
+  try {
+    const parsed = JSON.parse(raw) as GameSession;
+    if (parsed.roomCode.toUpperCase() === roomId.toUpperCase()) {
+      return parsed;
     }
+  } catch {
+    return null;
   }
 
   return null;

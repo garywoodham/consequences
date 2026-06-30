@@ -14,23 +14,9 @@ export function generateRoomCode(): string {
   return code;
 }
 
-export function getOrCreatePlayerId(): string {
-  if (typeof window === "undefined") return "";
-
-  const key = "consequences-player-id";
-
-  try {
-    let id = sessionStorage.getItem(key) ?? localStorage.getItem(key);
-    if (!id) {
-      id =
-        typeof crypto !== "undefined" && crypto.randomUUID
-          ? crypto.randomUUID()
-          : `player-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      sessionStorage.setItem(key, id);
-      localStorage.setItem(key, id);
-    }
-    return id;
-  } catch {
-    return `player-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+export function createPlayerId(): string {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
   }
+  return `player-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }

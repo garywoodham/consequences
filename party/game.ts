@@ -55,6 +55,7 @@ export default class GameServer implements Party.Server {
   }
 
   handleJoin(msg: Extract<ClientMessage, { type: "join" }>, sender: Party.Connection) {
+    // Only the first connection can create a room, and only when no state exists
     if (!this.state && msg.isHost) {
       this.state = {
         roomCode: this.room.id.toUpperCase(),
@@ -81,10 +82,13 @@ export default class GameServer implements Party.Server {
 
     const existing = this.state.players.find((p) => p.id === msg.playerId);
     if (existing) {
+      // Reconnecting player — update profile but never change host status
       existing.name = msg.name;
       existing.avatarUrl = msg.avatarUrl;
       existing.connected = true;
+      existing.isHost = existing.id === this.state.hostId;
     } else if (this.state.phase === "lobby") {
+      // New player — host is determined solely by hostId, never by the join message
       const player: Player = {
         id: msg.playerId,
         name: msg.name,

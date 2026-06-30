@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { saveSession } from "@/lib/session";
-import { getOrCreatePlayerId } from "@/lib/utils";
+import { createPlayerId } from "@/lib/utils";
 
 export function JoinGameForm() {
   const [roomCode, setRoomCode] = useState("");
@@ -34,7 +34,7 @@ export function JoinGameForm() {
     setJoining(true);
 
     try {
-      const playerId = getOrCreatePlayerId();
+      const playerId = createPlayerId();
       if (!playerId) {
         throw new Error("Could not create player ID. Try refreshing the page.");
       }

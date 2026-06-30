@@ -7,7 +7,7 @@ import { Card, CardDescription, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { PROMPT_TEMPLATES } from "@/lib/prompts";
 import { saveSession } from "@/lib/session";
-import { generateRoomCode, getOrCreatePlayerId } from "@/lib/utils";
+import { generateRoomCode, createPlayerId } from "@/lib/utils";
 
 export function CreateGameForm() {
   const [name, setName] = useState("");
@@ -30,7 +30,7 @@ export function CreateGameForm() {
 
     try {
       const roomCode = generateRoomCode();
-      const playerId = getOrCreatePlayerId();
+      const playerId = createPlayerId();
 
       if (!playerId) {
         throw new Error("Could not create player ID. Try refreshing the page.");

@@ -48,7 +48,7 @@ export default function GamePage() {
   }
 
   const template = getTemplateById(state.templateId || session.templateId || "classic");
-  const isHost = session.playerId === state.hostId || session.isHost;
+  const isHost = session.playerId === state.hostId;
 
   return (
     <div className="mx-auto w-full max-w-lg space-y-4 px-4 py-8">

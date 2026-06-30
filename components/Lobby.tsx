@@ -29,7 +29,7 @@ export function Lobby({ state, currentPlayerId, onStart, error }: LobbyProps) {
     <Card>
       <CardTitle>Waiting in the lobby</CardTitle>
       <CardDescription className="mt-1 mb-4">
-        Share the room code so friends can join
+        Share the room code so friends can join. Each player needs their own device or browser tab.
       </CardDescription>
 
       <div className="mb-6 flex items-center justify-center gap-3">
