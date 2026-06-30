@@ -1,0 +1,5 @@
+{
+  "name": "consequences",
+  "main": "party/game.ts",
+  "compatibilityDate": "2024-11-01"
+}
