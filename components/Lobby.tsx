@@ -85,8 +85,8 @@ export function Lobby({ state, currentPlayerId, onStart, error }: LobbyProps) {
       {error && <p className="mb-3 text-sm text-red-300">{error}</p>}
 
       {isHost ? (
-        <Button className="w-full" onClick={onStart} disabled={connectedCount < 2}>
-          Start game {connectedCount < 2 && "(need 2+ players)"}
+        <Button className="w-full" onClick={onStart} disabled={connectedCount < 1}>
+          Start game
         </Button>
       ) : (
         <p className="text-center text-sm text-white/60">Waiting for the host to start...</p>

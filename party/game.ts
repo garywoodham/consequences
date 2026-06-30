@@ -118,8 +118,8 @@ export default class GameServer implements Party.Server {
       sender.send(JSON.stringify({ type: "error", message: "Only the host can start" }));
       return;
     }
-    if (this.state.players.filter((p) => p.connected).length < 2) {
-      sender.send(JSON.stringify({ type: "error", message: "Need at least 2 players" }));
+    if (this.state.players.filter((p) => p.connected).length < 1) {
+      sender.send(JSON.stringify({ type: "error", message: "Need at least 1 player" }));
       return;
     }
 
