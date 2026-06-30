@@ -5,6 +5,8 @@ export type GameSession = {
   isHost: boolean;
   templateId?: string;
   roomCode: string;
+  /** When true, the room is auto-populated with sample players + stories. */
+  sample?: boolean;
 };
 
 const SESSION_KEY = "consequences-session";

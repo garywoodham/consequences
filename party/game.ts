@@ -1,6 +1,10 @@
 import type * as Party from "partykit/server";
 import { buildMixedStories } from "../lib/story-builder";
+import { getTemplateById } from "../lib/prompts";
+import { SAMPLE_PLAYER_NAMES, buildSampleSubmissions } from "../lib/sample-data";
 import type { ClientMessage, GameState, Player } from "../lib/types";
+
+const SAMPLE_PLAYER_COUNT = 3;
 
 export default class GameServer implements Party.Server {
   state: GameState | null = null;
@@ -50,6 +54,9 @@ export default class GameServer implements Party.Server {
         break;
       case "play-again":
         this.handlePlayAgain(sender);
+        break;
+      case "seed-sample":
+        this.handleSeedSample(sender);
         break;
     }
   }
@@ -165,6 +172,48 @@ export default class GameServer implements Party.Server {
     this.state.players.forEach((p) => {
       p.hasSubmitted = false;
     });
+    this.broadcastState();
+  }
+
+  handleSeedSample(sender: Party.Connection) {
+    if (!this.state) return;
+    // Only seed an untouched lobby (avoids re-seeding on reconnect/refresh).
+    if (this.state.phase !== "lobby") return;
+
+    const playerId = this.connectionToPlayer.get(sender.id);
+    if (!playerId || playerId !== this.state.hostId) {
+      sender.send(
+        JSON.stringify({ type: "error", message: "Only the host can create a sample game" })
+      );
+      return;
+    }
+
+    // Top up with sample players until the room has SAMPLE_PLAYER_COUNT total.
+    let nameIndex = 0;
+    while (this.state.players.length < SAMPLE_PLAYER_COUNT) {
+      const name = SAMPLE_PLAYER_NAMES[nameIndex % SAMPLE_PLAYER_NAMES.length];
+      nameIndex += 1;
+      this.state.players.push({
+        id: `sample-${crypto.randomUUID()}`,
+        name,
+        connected: true,
+        isHost: false,
+        hasSubmitted: true,
+      });
+    }
+
+    const template = getTemplateById(this.state.templateId);
+    const playerIds = this.state.players.map((p) => p.id);
+    this.state.submissions = buildSampleSubmissions(template.prompts, playerIds);
+    this.state.players.forEach((p) => {
+      p.hasSubmitted = true;
+    });
+    this.state.stories = buildMixedStories(
+      this.state.players,
+      this.state.submissions,
+      this.state.templateId
+    );
+    this.state.phase = "reveal";
     this.broadcastState();
   }
 

@@ -73,7 +73,8 @@ export type ClientMessage =
     }
   | { type: "start" }
   | { type: "submit"; answers: Record<string, string> }
-  | { type: "play-again" };
+  | { type: "play-again" }
+  | { type: "seed-sample" };
 
 export type ServerMessage =
   | { type: "state"; state: GameState }
