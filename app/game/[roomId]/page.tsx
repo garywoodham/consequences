@@ -1,52 +1,52 @@
 "use client";
 
-import { useEffect, useMemo } from "react";
+import { useSyncExternalStore, useEffect } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { Lobby } from "@/components/Lobby";
 import { PromptForm } from "@/components/PromptForm";
 import { StoryReveal } from "@/components/StoryReveal";
 import { useGame } from "@/hooks/useGame";
 import { getTemplateById } from "@/lib/prompts";
+import { loadSession } from "@/lib/session";
 
-type Session = {
-  playerId: string;
-  name: string;
-  avatarUrl?: string;
-  isHost: boolean;
-  templateId?: string;
-  roomCode: string;
-};
+function useIsClient() {
+  return useSyncExternalStore(
+    () => () => {},
+    () => true,
+    () => false
+  );
+}
 
-function loadSession(roomId: string): Session | null {
-  if (typeof window === "undefined") return null;
-  const raw = sessionStorage.getItem("consequences-session");
-  if (!raw) return null;
-  const parsed = JSON.parse(raw) as Session;
-  if (parsed.roomCode.toUpperCase() !== roomId) return null;
-  return parsed;
+function useGameSession(roomId: string) {
+  return useSyncExternalStore(
+    () => () => {},
+    () => (roomId ? loadSession(roomId) : null),
+    () => null
+  );
 }
 
 export default function GamePage() {
   const params = useParams();
   const router = useRouter();
-  const roomId = (params.roomId as string).toUpperCase();
-  const session = useMemo(() => loadSession(roomId), [roomId]);
+  const roomId = String(params.roomId ?? "").toUpperCase();
+  const isClient = useIsClient();
+  const session = useGameSession(roomId);
 
   useEffect(() => {
-    if (!session) {
-      router.push("/");
+    if (isClient && roomId && !session) {
+      router.replace("/");
     }
-  }, [session, router]);
+  }, [isClient, roomId, session, router]);
 
   const { state, error, connected, startGame, submitAnswers, playAgain } = useGame({
     roomId,
-    session,
+    session: isClient ? session : null,
   });
 
-  if (!session) {
+  if (!isClient || !session) {
     return (
       <div className="flex min-h-[50vh] items-center justify-center text-white/60">
-        Loading...
+        Loading game...
       </div>
     );
   }

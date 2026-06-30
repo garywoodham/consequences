@@ -5,18 +5,11 @@ import usePartySocket from "partysocket/react";
 import type { ClientMessage, GameState, ServerMessage } from "@/lib/types";
 import { EMPTY_GAME_STATE } from "@/lib/types";
 
-type Session = {
-  playerId: string;
-  name: string;
-  avatarUrl?: string;
-  isHost: boolean;
-  templateId?: string;
-  roomCode: string;
-};
+import type { GameSession } from "@/lib/session";
 
 type UseGameOptions = {
   roomId: string;
-  session: Session | null;
+  session: GameSession | null;
 };
 
 export function useGame({ roomId, session }: UseGameOptions) {

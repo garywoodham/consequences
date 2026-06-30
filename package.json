@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "concurrently \"npm run dev:next\" \"npm run dev:party\"",
     "dev:next": "next dev",
-    "dev:party": "partykit dev",
+    "dev:party": "partykit dev --port 1999",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",

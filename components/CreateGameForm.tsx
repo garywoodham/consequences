@@ -1,44 +1,55 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
 import { AvatarUpload } from "@/components/AvatarUpload";
 import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { PROMPT_TEMPLATES } from "@/lib/prompts";
+import { saveSession } from "@/lib/session";
 import { generateRoomCode, getOrCreatePlayerId } from "@/lib/utils";
 
 export function CreateGameForm() {
-  const router = useRouter();
   const [name, setName] = useState("");
   const [templateId, setTemplateId] = useState("classic");
   const [avatarUrl, setAvatarUrl] = useState<string | undefined>();
   const [error, setError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!name.trim()) {
-      setError("Please enter your name");
+    setError(null);
+
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      setError("Please enter your name to continue");
       return;
     }
 
-    const roomCode = generateRoomCode();
-    const playerId = getOrCreatePlayerId();
+    setCreating(true);
 
-    sessionStorage.setItem(
-      "consequences-session",
-      JSON.stringify({
+    try {
+      const roomCode = generateRoomCode();
+      const playerId = getOrCreatePlayerId();
+
+      if (!playerId) {
+        throw new Error("Could not create player ID. Try refreshing the page.");
+      }
+
+      saveSession({
         playerId,
-        name: name.trim(),
+        name: trimmedName,
         avatarUrl,
         isHost: true,
         templateId,
         roomCode,
-      })
-    );
+      });
 
-    router.push(`/game/${roomCode}`);
+      window.location.href = `/game/${roomCode}`;
+    } catch (err) {
+      setCreating(false);
+      setError(err instanceof Error ? err.message : "Something went wrong. Please try again.");
+    }
   }
 
   return (
@@ -48,17 +59,28 @@ export function CreateGameForm() {
       <form onSubmit={handleSubmit} className="space-y-4">
         <AvatarUpload name={name} value={avatarUrl} onChange={setAvatarUrl} />
         <div>
-          <label className="mb-1 block text-sm text-white/80">Your name</label>
+          <label htmlFor="create-name" className="mb-1 block text-sm text-white/80">
+            Your name <span className="text-red-300">*</span>
+          </label>
           <Input
+            id="create-name"
             value={name}
-            onChange={(e) => setName(e.target.value)}
+            onChange={(e) => {
+              setName(e.target.value);
+              if (error) setError(null);
+            }}
             placeholder="Enter your name"
             maxLength={30}
+            required
+            autoComplete="name"
           />
         </div>
         <div>
-          <label className="mb-1 block text-sm text-white/80">Story template</label>
+          <label htmlFor="create-template" className="mb-1 block text-sm text-white/80">
+            Story template
+          </label>
           <select
+            id="create-template"
             value={templateId}
             onChange={(e) => setTemplateId(e.target.value)}
             className="flex h-11 w-full rounded-xl border border-white/20 bg-white/10 px-4 text-sm text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
@@ -70,9 +92,13 @@ export function CreateGameForm() {
             ))}
           </select>
         </div>
-        {error && <p className="text-sm text-red-300">{error}</p>}
-        <Button type="submit" className="w-full">
-          Create game
+        {error && (
+          <p className="rounded-lg border border-red-400/30 bg-red-500/20 px-3 py-2 text-sm text-red-200">
+            {error}
+          </p>
+        )}
+        <Button type="submit" className="w-full" disabled={creating}>
+          {creating ? "Creating..." : "Create game"}
         </Button>
       </form>
     </Card>
