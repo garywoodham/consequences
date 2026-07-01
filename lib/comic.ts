@@ -8,6 +8,11 @@ const CARICATURE_STYLE =
 const PANEL_STYLE =
   "fun comic book panel, bold ink outlines, halftone shading, vibrant flat colors, " +
   "expressive cartoon characters, dynamic composition";
+// The readable caption is shown beneath each panel in the UI, so the artwork
+// itself must contain no lettering.
+const NO_TEXT =
+  "Important: the image must contain NO text of any kind — no words, letters, " +
+  "captions, titles, speech bubbles, thought bubbles, signs, or writing.";
 
 export function hasAiProvider(): boolean {
   return Boolean(OPENAI_API_KEY);
@@ -116,7 +121,7 @@ async function generatePanelFromText(scene: string, characters: ComicCharacter[]
       },
       body: JSON.stringify({
         model: "gpt-image-1",
-        prompt: `${scene}${cast}`,
+        prompt: `${scene}${cast} ${NO_TEXT}`,
         size: "1024x1024",
         quality: "low",
         n: 1,
@@ -164,7 +169,7 @@ async function generatePanelImage(scene: string, characters: ComicCharacter[]): 
         `The attached reference image(s) only show what ${castNames} look like: keep their ` +
         `faces and likeness, but draw them inside this scene actively doing the described action, ` +
         `with a background and props that match the story. ` +
-        `Do not simply reproduce, crop, or restyle the reference image.`
+        `Do not simply reproduce, crop, or restyle the reference image. ${NO_TEXT}`
     );
     form.append("size", "1024x1024");
     form.append("quality", "low");
