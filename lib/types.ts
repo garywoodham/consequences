@@ -49,6 +49,8 @@ export type Story = {
   id: string;
   lines: StoryLine[];
   prose: string;
+  /** AI-polished version of the prose (when the polish toggle is on). */
+  tidyProse?: string;
   comic?: ComicStripData;
 };
 
@@ -56,6 +58,8 @@ export type GameState = {
   roomCode: string;
   hostId: string;
   templateId: string;
+  /** When true, stories are polished into readable sentences by AI on reveal. */
+  tidyEnabled: boolean;
   phase: GamePhase;
   players: Player[];
   submissions: Record<string, Record<string, string>>;
@@ -70,11 +74,13 @@ export type ClientMessage =
       avatarUrl?: string;
       isHost?: boolean;
       templateId?: string;
+      tidyEnabled?: boolean;
     }
   | { type: "start" }
   | { type: "submit"; answers: Record<string, string> }
   | { type: "play-again" }
-  | { type: "seed-sample" };
+  | { type: "seed-sample" }
+  | { type: "set-tidy"; stories: { id: string; tidyProse: string }[] };
 
 export type ServerMessage =
   | { type: "state"; state: GameState }
@@ -84,6 +90,7 @@ export const EMPTY_GAME_STATE: GameState = {
   roomCode: "",
   hostId: "",
   templateId: "classic",
+  tidyEnabled: false,
   phase: "lobby",
   players: [],
   submissions: {},

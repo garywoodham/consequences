@@ -58,7 +58,27 @@ export default class GameServer implements Party.Server {
       case "seed-sample":
         this.handleSeedSample(sender);
         break;
+      case "set-tidy":
+        this.handleSetTidy(parsed, sender);
+        break;
     }
+  }
+
+  handleSetTidy(msg: Extract<ClientMessage, { type: "set-tidy" }>, sender: Party.Connection) {
+    if (!this.state) return;
+    const playerId = this.connectionToPlayer.get(sender.id);
+    // Only the host publishes polished stories, so everyone sees the same text.
+    if (!playerId || playerId !== this.state.hostId) return;
+
+    let changed = false;
+    for (const tidied of msg.stories) {
+      const story = this.state.stories.find((s) => s.id === tidied.id);
+      if (story && tidied.tidyProse && story.tidyProse !== tidied.tidyProse) {
+        story.tidyProse = tidied.tidyProse;
+        changed = true;
+      }
+    }
+    if (changed) this.broadcastState();
   }
 
   handleJoin(msg: Extract<ClientMessage, { type: "join" }>, sender: Party.Connection) {
@@ -68,6 +88,7 @@ export default class GameServer implements Party.Server {
         roomCode: this.room.id.toUpperCase(),
         hostId: msg.playerId,
         templateId: msg.templateId ?? "classic",
+        tidyEnabled: msg.tidyEnabled ?? false,
         phase: "lobby",
         players: [],
         submissions: {},
