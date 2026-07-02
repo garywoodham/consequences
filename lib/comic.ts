@@ -193,6 +193,125 @@ async function describeCaricature(dataUrl: string): Promise<string> {
   }
 }
 
+/**
+ * Extract the final assistant text from an OpenAI Responses API payload.
+ * Falls back across the convenience `output_text` field and the `output`
+ * array of message items.
+ */
+function extractResponsesText(data: unknown): string {
+  const d = data as {
+    output_text?: unknown;
+    output?: Array<{
+      type?: string;
+      content?: Array<{ type?: string; text?: unknown }>;
+    }>;
+  };
+  if (typeof d?.output_text === "string" && d.output_text.trim()) {
+    return d.output_text;
+  }
+  const output = d?.output;
+  if (!Array.isArray(output)) return "";
+  for (let i = output.length - 1; i >= 0; i--) {
+    const item = output[i];
+    if (item?.type === "message" && Array.isArray(item.content)) {
+      const part = item.content.find(
+        (c) => c?.type === "output_text" && typeof c.text === "string"
+      );
+      if (part && typeof part.text === "string") return part.text;
+    }
+  }
+  return "";
+}
+
+// Process-level cache so a given typed name is only looked up once, even
+// across stories / regenerate clicks within the same server process.
+const personLookupCache = new Map<string, string>();
+
+/**
+ * Scrub a looked-up description so no name (nor citation markup) leaks into
+ * the image prompt: drop markdown/citation links, remove a leading "Name(s)
+ * is/was a …" subject clause, strip the surrounding quotes, and remove any
+ * remaining occurrences of the typed name.
+ */
+function cleanupPersonDescription(text: string, name: string): string {
+  let out = text.trim().replace(/^["']|["']$/g, "");
+  // Remove markdown links and parenthetical citations: ([label](url)) / [label](url)
+  out = out.replace(/\(\[[^\]]*\]\([^)]*\)\)/g, "");
+  out = out.replace(/\[[^\]]*\]\([^)]*\)/g, "");
+  // Drop a leading "<Name ...> is/was/are a|an|the " subject clause.
+  out = out.replace(/^[^.]*?\b(?:is|was|are|were)\s+(a|an|the)\s+/i, "$1 ");
+  // Remove any remaining occurrences of each token of the typed name.
+  for (const token of name.split(/\s+/)) {
+    const t = token.trim();
+    if (t.length < 2) continue;
+    const escaped = t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out.replace(new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "giu"), "");
+  }
+  return out.replace(/\s{2,}/g, " ").replace(/\s+([,.])/g, "$1").trim();
+}
+
+/**
+ * When a player types a NAME that has no uploaded photo, try to find a physical
+ * description online (via the OpenAI Responses web-search tool) so the image
+ * model can draw a matching likeness. Returns "" for ordinary names that don't
+ * resolve to a recognisable public figure. The name itself is never sent to
+ * the image model — only the resulting appearance description.
+ */
+async function lookupPersonDescription(name: string): Promise<string> {
+  if (!OPENAI_API_KEY) return "";
+  const trimmed = name.trim();
+  if (!trimmed) return "";
+
+  const cacheKey = trimmed.toLowerCase();
+  const cached = personLookupCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  let result = "";
+  try {
+    const res = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        tools: [{ type: "web_search" }],
+        tool_choice: "auto",
+        temperature: 0,
+        input:
+          `A player in a party game typed "${trimmed}" as a character name. ` +
+          `Decide whether this clearly refers to a SPECIFIC, widely-recognised ` +
+          `real public figure (celebrity, musician, actor, athlete, politician, ` +
+          `historical figure, etc.). Search the web to confirm their appearance ` +
+          `if helpful.\n\n` +
+          `If YES: reply with ONLY a 45-75 word physical-appearance description ` +
+          `an artist could use to draw a caricature. Begin DIRECTLY with the ` +
+          `appearance (e.g. "a 40-year-old woman with...") and cover perceived ` +
+          `gender & age range, build, skin tone, face shape, hair ` +
+          `(colour/length/style), facial hair, glasses/accessories, ` +
+          `distinctive features, and their typical/signature clothing or look. ` +
+          `Physical appearance ONLY. Do NOT include the person's name anywhere, ` +
+          `no citations, no commentary.\n\n` +
+          `If it is NOT a clearly recognisable public figure (e.g. an ordinary ` +
+          `first name like "Dave" or "Sarah"), reply with exactly: NONE`,
+      }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const text = extractResponsesText(data).trim();
+      if (text && !/^none\b/i.test(text) && text.length >= 12) {
+        result = cleanupPersonDescription(text, trimmed);
+      }
+    }
+  } catch {
+    result = "";
+  }
+
+  personLookupCache.set(cacheKey, result);
+  return result;
+}
+
 /** Whole-word, Unicode-aware replacement of a character's name with a label. */
 function replaceNameWithLabel(text: string, name: string, label: string): string {
   const needle = name.trim();
@@ -420,17 +539,30 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
   const storyCast = resolveStoryCast(story, scripted);
   const caricatureCache = new Map<string, string | null>();
   const descriptionCache = new Map<string, string>();
+  const descriptionSource = new Map<string, "photo" | "web">();
 
   await Promise.all(
-    storyCast
-      .filter((c) => c.imageUrl)
-      .map(async (c) => {
+    storyCast.map(async (c) => {
+      if (c.imageUrl) {
+        // Photo uploaded → caricature it and describe the caricature.
         const caricature = await generateCaricature(c.imageUrl as string);
         caricatureCache.set(c.id, caricature);
         if (caricature) {
-          descriptionCache.set(c.id, await describeCaricature(caricature));
+          const desc = await describeCaricature(caricature);
+          if (desc) {
+            descriptionCache.set(c.id, desc);
+            descriptionSource.set(c.id, "photo");
+          }
         }
-      })
+      } else {
+        // No photo → search online for a matching public-figure description.
+        const desc = await lookupPersonDescription(c.name);
+        if (desc) {
+          descriptionCache.set(c.id, desc);
+          descriptionSource.set(c.id, "web");
+        }
+      }
+    })
   );
 
   // The cast list returned to the client for review: name + the exact
@@ -440,6 +572,7 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
     name: c.name,
     imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
     description: descriptionCache.get(c.id) ?? "",
+    descriptionSource: descriptionSource.get(c.id),
   }));
 
   const panels: StoryPanel[] = await Promise.all(

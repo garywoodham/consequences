@@ -91,13 +91,25 @@ export function ComicStrip({ comic }: ComicStripProps) {
               <li key={c.id} className="flex items-start gap-3">
                 <PlayerAvatar name={c.name} avatarUrl={c.imageUrl} size="sm" />
                 <div className="text-sm">
-                  <p className="font-medium text-white">{c.name}</p>
+                  <p className="flex items-center gap-2 font-medium text-white">
+                    {c.name}
+                    {c.descriptionSource === "photo" && (
+                      <span className="rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-medium text-emerald-200">
+                        from photo
+                      </span>
+                    )}
+                    {c.descriptionSource === "web" && (
+                      <span className="rounded-full bg-sky-500/20 px-2 py-0.5 text-[10px] font-medium text-sky-200">
+                        found online
+                      </span>
+                    )}
+                  </p>
                   <p className="text-white/60">
                     {c.description ? (
                       c.description
                     ) : (
                       <span className="italic text-white/40">
-                        No reference photo — drawn as an original character.
+                        No photo or online match — drawn as an original character.
                       </span>
                     )}
                   </p>

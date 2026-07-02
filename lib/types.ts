@@ -28,11 +28,16 @@ export type ComicCharacter = {
   /** Image used to represent the character (caricature, else avatar). */
   imageUrl?: string;
   /**
-   * Detailed physical description generated once up front from the player's
-   * photo. This — not the name — is what anchors the character's look in the
-   * image prompts, and it's surfaced in the UI for review.
+   * Detailed physical description generated once up front. This — not the
+   * name — is what anchors the character's look in the image prompts, and it's
+   * surfaced in the UI for review.
    */
   description?: string;
+  /**
+   * Where the description came from: "photo" (from an uploaded picture) or
+   * "web" (looked up online for a recognised public figure typed as a name).
+   */
+  descriptionSource?: "photo" | "web";
 };
 
 export type StoryPanel = {
