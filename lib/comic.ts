@@ -1,6 +1,7 @@
 // Server-only module: reads OPENAI_API_KEY and calls external image APIs.
 import type { ComicCharacter, ComicStripData, Story, StoryLine, StoryPanel } from "./types";
 import { sanitizeCaptionsForImage, type SanitizeLevel } from "./safe-rewrite";
+import { buildCastSheet } from "./cast-sheet";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const CARICATURE_STYLE =
@@ -37,6 +38,8 @@ export function scriptPanels(story: Story): Omit<StoryPanel, "imageUrl">[] {
     groups.push(lines.slice(i, i + perPanel));
   }
 
+  const storyCast = story.characters ?? [];
+
   return groups.map((group, index) => {
     const caption = group
       .map((l) => l.display)
@@ -44,16 +47,12 @@ export function scriptPanels(story: Story): Omit<StoryPanel, "imageUrl">[] {
       .replace(/\s+/g, " ")
       .trim();
 
-    const characters: ComicCharacter[] = [];
-    for (const line of group) {
-      if (!characters.some((c) => c.id === line.playerId)) {
-        characters.push({
-          id: line.playerId,
-          name: line.playerName,
-          imageUrl: line.playerAvatarUrl,
-        });
-      }
-    }
+    // Character list = story characters mentioned by name in this panel's
+    // caption. If none is mentioned (the panel is pure narration) fall back
+    // to the full story cast so the image still shows the right people.
+    const mentioned = storyCast.filter((c) => mentionsName(caption, c.name));
+    const characters: ComicCharacter[] =
+      mentioned.length > 0 ? mentioned : storyCast;
 
     return {
       index,
@@ -62,6 +61,14 @@ export function scriptPanels(story: Story): Omit<StoryPanel, "imageUrl">[] {
       characters,
     };
   });
+}
+
+/** Whole-word, case-insensitive, Unicode-aware name mention check. */
+function mentionsName(text: string, name: string): boolean {
+  const needle = name.trim();
+  if (!needle) return false;
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "iu").test(text);
 }
 
 function buildSceneDescription(caption: string, characters: ComicCharacter[]): string {
@@ -105,8 +112,6 @@ export async function generateCaricature(imageUrl: string): Promise<string | nul
     );
     form.append("size", "1024x1024");
     form.append("quality", "medium");
-    // Least-restrictive filtering — suits an adults-only party game (still
-    // blocks the hard-disallowed categories).
     form.append("moderation", "low");
 
     const res = await fetch("https://api.openai.com/v1/images/edits", {
@@ -202,61 +207,108 @@ async function generatePanelFromText(scene: string, characters: ComicCharacter[]
   }
 }
 
+type CastRef = {
+  id: string;
+  name: string;
+  imageUrl: string;
+  description: string;
+};
+
 /**
- * Generate a single comic panel. When the characters have reference images
- * (their caricature, derived from the uploaded photo) those images are passed
- * to the image-edit endpoint so the drawn characters resemble the real players.
+ * Generate a single comic panel using an ORDERED, LABELLED cast sheet as the
+ * one and only reference image. The image model sees each named character
+ * exactly once (numbered 1..N with the name printed under each caricature) and
+ * the prompt references those numbered slots explicitly. This is much more
+ * reliable at preserving identity than passing several separate references.
  */
 async function generatePanelImage(
-  scene: string,
+  caption: string,
   characters: ComicCharacter[],
-  descriptions: Map<string, string> = new Map()
+  descriptions: Map<string, string>,
+  caricatures: Map<string, string | null>
 ): Promise<string | null> {
   if (!OPENAI_API_KEY) return null;
 
-  const named = characters.filter((c) => c.imageUrl);
-  const refs = (
-    await Promise.all(named.map((c) => fetchAsBlob(c.imageUrl as string)))
-  ).map((blob, i) => ({
-    blob,
-    name: named[i].name,
-    description: descriptions.get(named[i].id) ?? "",
-  }));
-  const usableRefs = refs.filter(
-    (r): r is { blob: Blob; name: string; description: string } => Boolean(r.blob)
-  );
-
-  // No uploaded photos for this panel's cast → plain text-to-image.
-  if (usableRefs.length === 0) {
-    return generatePanelFromText(scene, characters);
+  // Split the panel's characters into two buckets:
+  //   • castRefs   — have a reference image (uploaded photo → caricature)
+  //   • extraNames — mentioned in the caption but no photo attached
+  // Both must appear in the drawn panel, but only castRefs constrain likeness.
+  const castRefs: CastRef[] = [];
+  const extraNames: string[] = [];
+  for (const c of characters) {
+    const caricature = caricatures.get(c.id) ?? c.imageUrl;
+    if (caricature) {
+      castRefs.push({
+        id: c.id,
+        name: c.name,
+        imageUrl: caricature,
+        description: descriptions.get(c.id) ?? "",
+      });
+    } else {
+      extraNames.push(c.name);
+    }
   }
 
-  const castNames = usableRefs.map((r) => r.name).join(", ");
-  const refLegend = usableRefs
+  const allNames = [...castRefs.map((r) => r.name), ...extraNames];
+  const emphaticList = allNames.length
+    ? allNames.map((n) => `**${n}**`).join(", ")
+    : "the characters described";
+
+  // No reference images at all — fall back to text-to-image but still list
+  // every required character name in the prompt.
+  if (castRefs.length === 0) {
+    return generatePanelFromText(buildSceneDescription(caption, characters), characters);
+  }
+
+  const castSheetBuf = await buildCastSheet(
+    castRefs.map((r) => ({ name: r.name, imageUrl: r.imageUrl }))
+  );
+  if (!castSheetBuf) {
+    return generatePanelFromText(buildSceneDescription(caption, characters), characters);
+  }
+
+  const castSheetBlob = new Blob([new Uint8Array(castSheetBuf)], { type: "image/png" });
+
+  const rosterLines = castRefs
     .map((r, i) => {
       const desc = r.description ? ` — ${r.description}` : "";
-      return `Reference image ${i + 1} shows ${r.name}${desc}.`;
+      return `  ${i + 1}. ${r.name} (tile #${i + 1} of the cast sheet, labelled "${r.name.toUpperCase()}")${desc}`;
     })
-    .join(" ");
+    .join("\n");
+
+  const extrasNote = extraNames.length
+    ? `\n\nADDITIONAL NAMED CHARACTERS (no reference image — draw them as ` +
+      `plausible cartoon characters and reuse the same look for them across ` +
+      `all panels): ${extraNames.join(", ")}.`
+    : "";
+
+  const prompt =
+    `${NO_TEXT}\n\n` +
+    `TASK: draw ONE brand-new comic panel illustrating the story caption below.\n\n` +
+    `CAST SHEET (attached reference image): a labelled roster showing the ` +
+    `characters that have a reference photo in this game. Each is a numbered ` +
+    `tile with their name printed beneath. Roster:\n${rosterLines}${extrasNote}\n\n` +
+    `IDENTITY RULES (highest priority):\n` +
+    `  • For every roster character, copy their distinctive features EXACTLY ` +
+    `from their tile (hair, face, skin tone, glasses, facial hair, notable ` +
+    `clothing). They must be instantly recognisable as themselves.\n` +
+    `  • Do NOT invent new characters in place of a roster character, do NOT ` +
+    `swap features between people, do NOT replace anyone with a random person.\n` +
+    `  • Every named character listed here MUST appear in the panel: ${emphaticList}.\n` +
+    `  • If the panel cannot comfortably fit everyone at close-up scale, use ` +
+    `a wider composition — never omit any of ${allNames.join(", ") || "the characters"}.\n\n` +
+    `SCENE: ${caption}\n\n` +
+    `STYLE: ${PANEL_STYLE}. This is a NEW illustration, not a re-crop or ` +
+    `re-style of the reference sheet.\n\n` +
+    `${NO_TEXT}`;
 
   try {
     const form = new FormData();
     form.append("model", "gpt-image-1");
-    usableRefs.forEach((r, i) => form.append("image[]", r.blob, `character-${i}.png`));
-    form.append(
-      "prompt",
-      `${NO_TEXT}\n\n${scene}\n\n` +
-        `CHARACTER LEGEND (memorise before drawing): ${refLegend}\n\n` +
-        `Compose a brand-new full comic panel that depicts the scene above — an ` +
-        `illustrated story moment, NOT a portrait. Each named character in the caption ` +
-        `(${castNames}) MUST appear in the panel drawn to match BOTH their reference image ` +
-        `AND their description in the legend above, keeping the same distinctive features ` +
-        `(hair, face, skin tone, glasses, etc.) across every panel. Do not swap, merge, ` +
-        `omit, or replace anyone with a random person. Do not simply reproduce, crop, or ` +
-        `restyle the reference — invent the scene fresh.\n\n${NO_TEXT}`
-    );
+    form.append("image", castSheetBlob, "cast-sheet.png");
+    form.append("prompt", prompt);
     form.append("size", "1024x1024");
-    form.append("quality", "low");
+    form.append("quality", "medium");
     form.append("moderation", "low");
 
     const res = await fetch("https://api.openai.com/v1/images/edits", {
@@ -273,7 +325,7 @@ async function generatePanelImage(
     // fall through to text generation below
   }
 
-  return generatePanelFromText(scene, characters);
+  return generatePanelFromText(buildSceneDescription(caption, characters), characters);
 }
 
 /**
@@ -335,9 +387,10 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
 
       // Try level 0; if the image model refuses, escalate to level 1 then 2.
       let imageUrl = await generatePanelImage(
-        buildSceneDescription(caption, characters),
+        caption,
         characters,
-        descriptionCache
+        descriptionCache,
+        caricatureCache
       );
 
       const levels: SanitizeLevel[] = [1, 2];
@@ -350,9 +403,10 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
         if (!escalated || escalated === caption) continue;
         caption = escalated;
         imageUrl = await generatePanelImage(
-          buildSceneDescription(caption, characters),
+          caption,
           characters,
-          descriptionCache
+          descriptionCache,
+          caricatureCache
         );
       }
 
