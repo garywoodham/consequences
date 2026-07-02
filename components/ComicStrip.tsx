@@ -73,6 +73,16 @@ export function ComicStrip({ comic }: ComicStripProps) {
             <figcaption className="border-t-2 border-white/80 bg-white px-3 py-2 text-sm font-medium leading-snug text-zinc-900">
               {panel.caption}
             </figcaption>
+            {panel.imagePrompt && (
+              <details className="border-t border-zinc-200 bg-zinc-50 px-3 py-2">
+                <summary className="cursor-pointer text-[11px] font-medium text-zinc-500">
+                  Text sent to the image AI
+                </summary>
+                <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-zinc-600">
+                  {panel.imagePrompt}
+                </pre>
+              </details>
+            )}
           </figure>
         ))}
       </div>

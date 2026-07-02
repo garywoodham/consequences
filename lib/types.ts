@@ -48,6 +48,12 @@ export type StoryPanel = {
   characters: ComicCharacter[];
   /** Generated panel illustration (filled when an image provider is configured). */
   imageUrl?: string;
+  /**
+   * The full text prompt actually sent to the image model for this panel
+   * (after safe-rewrite + name→label substitution). Surfaced in the UI so the
+   * exact instruction behind each image can be reviewed.
+   */
+  imagePrompt?: string;
 };
 
 export type ComicStripData = {

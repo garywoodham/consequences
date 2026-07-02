@@ -381,10 +381,12 @@ function buildCharacterGuide(cast: PanelCharacter[], withCastSheet: boolean): st
  * Text-to-image fallback (no reference photos). Characters are still described
  * by features + neutral labels so we get consistent lookalikes, not real people.
  */
+type PanelResult = { imageUrl: string | null; prompt: string };
+
 async function generatePanelFromTextCast(
   sceneWithLabels: string,
   cast: PanelCharacter[]
-): Promise<string | null> {
+): Promise<PanelResult> {
   const guide = cast.length ? buildCharacterGuide(cast, false) : "";
   const labelList = cast.map((c) => c.label).join(", ");
   const guideBlock = guide
@@ -392,6 +394,9 @@ async function generatePanelFromTextCast(
       `All of these characters (${labelList}) must appear in the panel doing ` +
       `exactly what the scene says; do not swap or omit anyone.\n\n`
     : "";
+  const prompt =
+    `${NO_TEXT}\n\n${guideBlock}SCENE: ${sceneWithLabels}\n\n` +
+    `STYLE: ${PANEL_STYLE}.\n\n${NO_TEXT}`;
 
   try {
     const res = await fetch("https://api.openai.com/v1/images/generations", {
@@ -402,21 +407,19 @@ async function generatePanelFromTextCast(
       },
       body: JSON.stringify({
         model: "gpt-image-1",
-        prompt:
-          `${NO_TEXT}\n\n${guideBlock}SCENE: ${sceneWithLabels}\n\n` +
-          `STYLE: ${PANEL_STYLE}.\n\n${NO_TEXT}`,
+        prompt,
         size: "1024x1024",
         quality: "low",
         moderation: "low",
         n: 1,
       }),
     });
-    if (!res.ok) return null;
+    if (!res.ok) return { imageUrl: null, prompt };
     const data = await res.json();
     const b64 = data?.data?.[0]?.b64_json;
-    return b64 ? `data:image/png;base64,${b64}` : null;
+    return { imageUrl: b64 ? `data:image/png;base64,${b64}` : null, prompt };
   } catch {
-    return null;
+    return { imageUrl: null, prompt };
   }
 }
 
@@ -433,8 +436,8 @@ async function generatePanelImage(
   characters: ComicCharacter[],
   descriptions: Map<string, string>,
   caricatures: Map<string, string | null>
-): Promise<string | null> {
-  if (!OPENAI_API_KEY) return null;
+): Promise<PanelResult> {
+  if (!OPENAI_API_KEY) return { imageUrl: null, prompt: "" };
 
   const { cast, sceneCaptionRewriter } = buildPanelCast(
     characters,
@@ -497,13 +500,16 @@ async function generatePanelImage(
     if (res.ok) {
       const data = await res.json();
       const b64 = data?.data?.[0]?.b64_json;
-      if (b64) return `data:image/png;base64,${b64}`;
+      if (b64) return { imageUrl: `data:image/png;base64,${b64}`, prompt };
     }
   } catch {
     // fall through to text generation below
   }
 
-  return generatePanelFromTextCast(sceneWithLabels, cast);
+  // Fall back to text-to-image, but keep the richer cast-sheet prompt as the
+  // record of what we asked for (it's the more descriptive instruction).
+  const fallback = await generatePanelFromTextCast(sceneWithLabels, cast);
+  return { imageUrl: fallback.imageUrl, prompt: fallback.imageUrl ? fallback.prompt : prompt };
 }
 
 /**
@@ -586,7 +592,7 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
       let caption = safeCaptions[i] ?? panel.caption;
 
       // Try level 0; if the image model refuses, escalate to level 1 then 2.
-      let imageUrl = await generatePanelImage(
+      let result = await generatePanelImage(
         caption,
         characters,
         descriptionCache,
@@ -595,14 +601,14 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
 
       const levels: SanitizeLevel[] = [1, 2];
       for (const level of levels) {
-        if (imageUrl) break;
+        if (result.imageUrl) break;
         const [escalated] = await sanitizeCaptionsForImage(
           [{ caption: panel.caption, names }],
           level
         );
         if (!escalated || escalated === caption) continue;
         caption = escalated;
-        imageUrl = await generatePanelImage(
+        result = await generatePanelImage(
           caption,
           characters,
           descriptionCache,
@@ -610,7 +616,12 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
         );
       }
 
-      return { ...panel, characters, imageUrl: imageUrl ?? undefined };
+      return {
+        ...panel,
+        characters,
+        imageUrl: result.imageUrl ?? undefined,
+        imagePrompt: result.prompt || undefined,
+      };
     })
   );
 
