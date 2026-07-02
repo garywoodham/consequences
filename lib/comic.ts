@@ -47,12 +47,25 @@ export function scriptPanels(story: Story): Omit<StoryPanel, "imageUrl">[] {
       .replace(/\s+/g, " ")
       .trim();
 
-    // Character list = story characters mentioned by name in this panel's
-    // caption. If none is mentioned (the panel is pure narration) fall back
-    // to the full story cast so the image still shows the right people.
-    const mentioned = storyCast.filter((c) => mentionsName(caption, c.name));
-    const characters: ComicCharacter[] =
-      mentioned.length > 0 ? mentioned : storyCast;
+    // ALWAYS include every named story character in every panel, so each
+    // character's description is passed to the image model for all panels
+    // (keeps the whole cast consistent, never dropping anyone). Only legacy
+    // stories with no resolved cast fall back to the panel's line authors.
+    let characters: ComicCharacter[];
+    if (storyCast.length > 0) {
+      characters = storyCast;
+    } else {
+      characters = [];
+      for (const line of group) {
+        if (!characters.some((c) => c.id === line.playerId)) {
+          characters.push({
+            id: line.playerId,
+            name: line.playerName,
+            imageUrl: line.playerAvatarUrl,
+          });
+        }
+      }
+    }
 
     return {
       index,
@@ -547,10 +560,15 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
   // Sanitise per-panel captions for the image model in one batched call.
   // The original captions are kept for display below the panels; character
   // names are preserved so the image model still draws the right people.
+  // Only ask the sanitiser to preserve the names that actually appear in a
+  // given caption (a panel now carries the full cast, but not every name is
+  // written in every caption).
   const safeCaptions = await sanitizeCaptionsForImage(
     scripted.map((p) => ({
       caption: p.caption,
-      names: p.characters.map((c) => c.name),
+      names: p.characters
+        .filter((c) => mentionsName(p.caption, c.name))
+        .map((c) => c.name),
     }))
   );
 
@@ -605,7 +623,9 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
         imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
         description: descriptionCache.get(c.id) ?? c.description ?? "",
       }));
-      const names = panel.characters.map((c) => c.name);
+      const names = panel.characters
+        .filter((c) => mentionsName(panel.caption, c.name))
+        .map((c) => c.name);
       let caption = safeCaptions[i] ?? panel.caption;
 
       // Try level 0; if the image model refuses, escalate to level 1 then 2.
