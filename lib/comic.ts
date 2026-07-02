@@ -557,21 +557,6 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
     };
   }
 
-  // Sanitise per-panel captions for the image model in one batched call.
-  // The original captions are kept for display below the panels; character
-  // names are preserved so the image model still draws the right people.
-  // Only ask the sanitiser to preserve the names that actually appear in a
-  // given caption (a panel now carries the full cast, but not every name is
-  // written in every caption).
-  const safeCaptions = await sanitizeCaptionsForImage(
-    scripted.map((p) => ({
-      caption: p.caption,
-      names: p.characters
-        .filter((c) => mentionsName(p.caption, c.name))
-        .map((c) => c.name),
-    }))
-  );
-
   // STEP 1 — up front, lock in every named character's identity: caricature
   // each unique player photo once and generate a detailed feature description
   // from it. Descriptions are keyed by character id (which maps 1:1 to the
@@ -617,7 +602,7 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
   }));
 
   const panels: StoryPanel[] = await Promise.all(
-    scripted.map(async (panel, i) => {
+    scripted.map(async (panel) => {
       const characters = panel.characters.map((c) => ({
         ...c,
         imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
@@ -626,25 +611,40 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
       const names = panel.characters
         .filter((c) => mentionsName(panel.caption, c.name))
         .map((c) => c.name);
-      let caption = safeCaptions[i] ?? panel.caption;
 
-      // Try level 0; if the image model refuses, escalate to level 1 then 2.
+      // Push the crudest version FIRST: attempt the raw player caption
+      // unchanged (only names→labels). gpt-image-1 at moderation:"low" allows
+      // a lot of risqué content, and image moderation is somewhat
+      // non-deterministic — so we try the raw text (twice, to ride out flaky
+      // refusals) before softening anything. Only if the model still refuses
+      // do we walk down the softening ladder (0 = surgical swap, 1 =
+      // aftermath, 2 = whimsical), keeping the least-softened version that the
+      // model actually accepts.
+      let caption = panel.caption;
       let result = await generatePanelImage(
         caption,
         characters,
         descriptionCache,
         caricatureCache
       );
+      if (!result.imageUrl) {
+        result = await generatePanelImage(
+          caption,
+          characters,
+          descriptionCache,
+          caricatureCache
+        );
+      }
 
-      const levels: SanitizeLevel[] = [1, 2];
+      const levels: SanitizeLevel[] = [0, 1, 2];
       for (const level of levels) {
         if (result.imageUrl) break;
-        const [escalated] = await sanitizeCaptionsForImage(
+        const [softer] = await sanitizeCaptionsForImage(
           [{ caption: panel.caption, names }],
           level
         );
-        if (!escalated || escalated === caption) continue;
-        caption = escalated;
+        if (!softer || softer === caption) continue;
+        caption = softer;
         result = await generatePanelImage(
           caption,
           characters,
