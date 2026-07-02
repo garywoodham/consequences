@@ -4,7 +4,9 @@ import { sanitizeCaptionsForImage, type SanitizeLevel } from "./safe-rewrite";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const CARICATURE_STYLE =
-  "bold-outlined cartoon caricature, exaggerated friendly features, flat vibrant colors, " +
+  "bold-outlined cartoon caricature with all distinctive facial features clearly " +
+  "preserved (hair color and style, eye color, skin tone, glasses, facial hair, " +
+  "notable clothing) — exaggerated but instantly recognisable, flat vibrant colors, " +
   "clean white background, character reference sheet style";
 const PANEL_STYLE =
   "fun comic book panel, bold ink outlines, halftone shading, vibrant flat colors, " +
@@ -121,6 +123,52 @@ export async function generateCaricature(imageUrl: string): Promise<string | nul
   }
 }
 
+/**
+ * Ask a vision LLM to describe the caricature so we can embed a textual
+ * fingerprint of the character alongside the reference image in panel prompts.
+ * Cheap gpt-4o-mini call; returns "" on any failure.
+ */
+async function describeCaricature(dataUrl: string): Promise<string> {
+  if (!OPENAI_API_KEY || !dataUrl.startsWith("data:image")) return "";
+  try {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You describe cartoon character illustrations concisely for an artist so " +
+              "they can reproduce the same character. Reply with ONE short comma-separated " +
+              "list of distinctive visual features only (hair color/style, eye color, skin " +
+              "tone, facial hair, glasses, notable clothing). Max 20 words. No preamble.",
+          },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Distinctive features of this character:" },
+              { type: "image_url", image_url: { url: dataUrl } },
+            ],
+          },
+        ],
+        temperature: 0.3,
+        max_tokens: 80,
+      }),
+    });
+    if (!res.ok) return "";
+    const data = await res.json();
+    const text = data?.choices?.[0]?.message?.content;
+    return typeof text === "string" ? text.trim().replace(/^["']|["']$/g, "") : "";
+  } catch {
+    return "";
+  }
+}
+
 /** Text-to-image fallback when no character reference photos are available. */
 async function generatePanelFromText(scene: string, characters: ComicCharacter[]): Promise<string | null> {
   const cast = characters.length
@@ -159,14 +207,24 @@ async function generatePanelFromText(scene: string, characters: ComicCharacter[]
  * (their caricature, derived from the uploaded photo) those images are passed
  * to the image-edit endpoint so the drawn characters resemble the real players.
  */
-async function generatePanelImage(scene: string, characters: ComicCharacter[]): Promise<string | null> {
+async function generatePanelImage(
+  scene: string,
+  characters: ComicCharacter[],
+  descriptions: Map<string, string> = new Map()
+): Promise<string | null> {
   if (!OPENAI_API_KEY) return null;
 
   const named = characters.filter((c) => c.imageUrl);
   const refs = (
     await Promise.all(named.map((c) => fetchAsBlob(c.imageUrl as string)))
-  ).map((blob, i) => ({ blob, name: named[i].name }));
-  const usableRefs = refs.filter((r): r is { blob: Blob; name: string } => Boolean(r.blob));
+  ).map((blob, i) => ({
+    blob,
+    name: named[i].name,
+    description: descriptions.get(named[i].id) ?? "",
+  }));
+  const usableRefs = refs.filter(
+    (r): r is { blob: Blob; name: string; description: string } => Boolean(r.blob)
+  );
 
   // No uploaded photos for this panel's cast → plain text-to-image.
   if (usableRefs.length === 0) {
@@ -175,7 +233,10 @@ async function generatePanelImage(scene: string, characters: ComicCharacter[]): 
 
   const castNames = usableRefs.map((r) => r.name).join(", ");
   const refLegend = usableRefs
-    .map((r, i) => `Reference image ${i + 1} shows ${r.name}.`)
+    .map((r, i) => {
+      const desc = r.description ? ` — ${r.description}` : "";
+      return `Reference image ${i + 1} shows ${r.name}${desc}.`;
+    })
     .join(" ");
 
   try {
@@ -184,14 +245,15 @@ async function generatePanelImage(scene: string, characters: ComicCharacter[]): 
     usableRefs.forEach((r, i) => form.append("image[]", r.blob, `character-${i}.png`));
     form.append(
       "prompt",
-      `${NO_TEXT}\n\n${scene} ` +
-        `Compose a brand-new full comic panel that depicts the scene, setting and action ` +
-        `described above — this must be an illustrated story moment, NOT a portrait. ` +
-        `${refLegend} Draw the named characters (${castNames}) so they clearly resemble their ` +
-        `matching reference image, doing exactly what the caption says. Anyone named in the ` +
-        `caption MUST appear in the panel and must be the same person as their reference. ` +
-        `Do not swap, merge or omit characters. Do not simply reproduce, crop, or restyle the ` +
-        `reference image.\n\n${NO_TEXT}`
+      `${NO_TEXT}\n\n${scene}\n\n` +
+        `CHARACTER LEGEND (memorise before drawing): ${refLegend}\n\n` +
+        `Compose a brand-new full comic panel that depicts the scene above — an ` +
+        `illustrated story moment, NOT a portrait. Each named character in the caption ` +
+        `(${castNames}) MUST appear in the panel drawn to match BOTH their reference image ` +
+        `AND their description in the legend above, keeping the same distinctive features ` +
+        `(hair, face, skin tone, glasses, etc.) across every panel. Do not swap, merge, ` +
+        `omit, or replace anyone with a random person. Do not simply reproduce, crop, or ` +
+        `restyle the reference — invent the scene fresh.\n\n${NO_TEXT}`
     );
     form.append("size", "1024x1024");
     form.append("quality", "low");
@@ -239,8 +301,11 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
     }))
   );
 
-  // Caricature each unique player photo once, reuse across panels.
+  // Caricature each unique player photo once, and ask a vision LLM to
+  // describe the caricature so we have both a visual AND textual fingerprint
+  // of every character to anchor identity across panels.
   const caricatureCache = new Map<string, string | null>();
+  const descriptionCache = new Map<string, string>();
   const uniqueAvatars = new Map<string, string>();
   for (const panel of scripted) {
     for (const c of panel.characters) {
@@ -251,7 +316,11 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
   }
   await Promise.all(
     [...uniqueAvatars.entries()].map(async ([id, url]) => {
-      caricatureCache.set(id, await generateCaricature(url));
+      const caricature = await generateCaricature(url);
+      caricatureCache.set(id, caricature);
+      if (caricature) {
+        descriptionCache.set(id, await describeCaricature(caricature));
+      }
     })
   );
 
@@ -267,7 +336,8 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
       // Try level 0; if the image model refuses, escalate to level 1 then 2.
       let imageUrl = await generatePanelImage(
         buildSceneDescription(caption, characters),
-        characters
+        characters,
+        descriptionCache
       );
 
       const levels: SanitizeLevel[] = [1, 2];
@@ -281,7 +351,8 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
         caption = escalated;
         imageUrl = await generatePanelImage(
           buildSceneDescription(caption, characters),
-          characters
+          characters,
+          descriptionCache
         );
       }
 

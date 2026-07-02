@@ -19,49 +19,62 @@ const BASE_RULES =
 
 const LEVEL_INSTRUCTIONS: Record<SanitizeLevel, string> = {
   0:
-    "You are the *lightest possible* image-safety pass for an adult party " +
-    "game. Do NOT sanitise wholesomely — the humour is meant to be crude and " +
-    "cheeky and readers WILL see the raw caption; you are only adjusting what " +
-    "the image model sees.\n\n" +
-    "Only change wording where an image generator would refuse. Use the " +
-    "MINIMUM softening required. Prefer the sexiest / edgiest workaround that " +
-    "still passes. Keep the same tone; do not turn adult humour into " +
-    "children's cartoon.\n\n" +
-    "Examples of the RIGHT level of softening:\n" +
-    "  • 'Bob got naked' → 'Bob wearing only a tiny strategic towel around " +
-    "his waist, otherwise nude'\n" +
-    "  • 'Alice and Dave had sex' → 'Alice and Dave visibly making out under " +
-    "the covers, only bare shoulders showing'\n" +
-    "  • 'Kim gave Sara a blowjob' → 'Kim and Sara in a suggestive pose, " +
-    "Kim kneeling in front of Sara, both fully clothed but heavily implied'\n" +
-    "  • 'Dave shot Kim with a rifle' → 'Dave aiming a comically oversized " +
-    "cartoon rifle at Kim in a slapstick face-off'\n" +
-    "  • 'Sara did lines of cocaine' → 'Sara enthusiastically snorting a " +
-    "line of glittery sherbet off a mirror'\n" +
+    "You are the image-safety pass for an ADULT party game. The story is " +
+    "crude and cheeky and readers see the raw caption; you are only adjusting " +
+    "what the image model sees. DO NOT turn adult humour into a children's " +
+    "cartoon. If the caption is already image-safe, return it UNCHANGED.\n\n" +
+    "TECHNIQUE — IMPLY THROUGH AFTERMATH & CONTEXT.\n" +
+    "The reliable way to pass image safety is to describe the AFTERMATH, " +
+    "MOOD, or SURROUNDING CONTEXT that makes it OBVIOUS what happened — " +
+    "without showing the act itself. Keep it adult. Do not depict the " +
+    "moment of sex, nudity, drug use, or graphic violence directly.\n\n" +
+    "Examples of the RIGHT level of softening (aftermath / context style):\n" +
+    "  • 'Alice and Bob had sex' → 'Alice and Bob lying in bed together " +
+    "afterwards, tangled in the sheets, both sweating and looking blissfully " +
+    "satisfied, clothes strewn on the floor'\n" +
+    "  • 'Bob got completely naked' → 'Bob standing beside a heap of his " +
+    "own discarded clothes, holding a strategically placed potted plant in " +
+    "front of himself, bare shoulders and legs visible'\n" +
+    "  • 'Kim gave Sara oral sex' → 'Sara sitting on the sofa with a rapturous " +
+    "expression, biting her lip, Kim just visible below the frame, only the " +
+    "top of Kim's head showing above Sara's lap'\n" +
+    "  • 'Dave shot Kim with a rifle' → 'Kim collapsed dramatically on the " +
+    "ground with cartoon X-eyes and comic-book stars circling, Dave standing " +
+    "over her clutching a smoking cartoon rifle, wisps of smoke curling off'\n" +
+    "  • 'Sara did lines of cocaine' → 'Sara wild-eyed with spiral pupils and " +
+    "a manic grin, dust of glittery white powder on her nose, an empty mirror " +
+    "and rolled-up note on the table'\n" +
+    "  • 'They got smashed on tequila' → 'Alice and Bob slumped against each " +
+    "other on a stool, cheeks flushed, empty shot glasses stacked in a tower " +
+    "in front of them'\n" +
     "\n" +
-    "If the caption is already safe, return it unchanged.",
+    "Rule of thumb: SHOW WHAT HAPPENED BEFORE OR AFTER, not the act itself. " +
+    "Use body language, expressions, environment and props to make the " +
+    "outcome unmistakable.",
   1:
-    "STRONGER RETRY. Your previous rewrite (or the un-softened caption) was " +
-    "still likely to be refused by the image model. Escalate to visual " +
-    "workarounds that clearly imply the same idea without showing what would " +
-    "be refused. Keep it adult and cheeky, not childish.\n\n" +
+    "STRONGER RETRY. Your last attempt was still refused by the image " +
+    "model. Push the aftermath/context technique further — remove any " +
+    "residual reference to the explicit act itself and rely entirely on " +
+    "visible clues.\n\n" +
     "Examples:\n" +
-    "  • 'Bob got naked' → 'Bob wearing a skin-toned bodysuit with his " +
-    "entire body pixelated/blurred to imply nudity'\n" +
-    "  • 'Alice and Dave had sex' → 'Alice and Dave in bed, blanket covering " +
-    "everything, exaggerated cartoon 'sound effect' shapes flying off (no " +
-    "text)'\n" +
-    "  • 'Kim gave Sara a blowjob' → 'Kim kneeling in front of Sara with " +
-    "her face pixelated/censored, Sara looking blissfully skyward'\n" +
-    "  • 'Dave shot Kim' → 'Dave with a joke pop-gun and a big \"BANG\" " +
-    "flag on a stick emerging from it, Kim theatrically fainting'\n" +
+    "  • 'Alice and Bob had sex' → 'Alice and Bob sitting on the edge of a " +
+    "rumpled bed side by side, both wrapped in a single duvet, hair " +
+    "dishevelled, sharing a knowing satisfied smile'\n" +
+    "  • 'Bob got naked' → 'Bob in a skin-toned bodysuit with his entire " +
+    "body slightly blurred to imply he is naked, everyone around him " +
+    "reacting with shocked exaggerated expressions'\n" +
+    "  • 'Dave shot Kim' → 'Kim theatrically fainting backwards with " +
+    "cartoon X-eyes, Dave in a slapstick pose holding a comic-book pop-gun " +
+    "with a small \"BANG\" flag popping out (no letters/writing on flag)'\n" +
+    "  • 'Sara did cocaine' → 'Sara wild-eyed and buzzing with cartoon " +
+    "jitter-lines around her head, empty mirror on the table'\n" +
     "\n" +
     "Every required name MUST still appear verbatim.",
   2:
     "LAST RETRY. Both previous attempts were rejected. Fall back to a very " +
-    "gentle whimsical cartoon description of the same story beat. Every " +
-    "required name MUST still appear verbatim. Prefer harmless, absurd " +
-    "actions that at least gesture at the original vibe.",
+    "gentle whimsical cartoon depiction of the same story beat that at " +
+    "least gestures at the original vibe. Every required name MUST still " +
+    "appear verbatim.",
 };
 
 function systemPrompt(level: SanitizeLevel, retryDueToNameDrop = false): string {
