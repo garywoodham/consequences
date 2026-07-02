@@ -4,13 +4,10 @@
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-const SYSTEM_PROMPT =
-  "You rewrite comic-panel scene captions so an image generator is unlikely " +
-  "to refuse them, while keeping the story intact. This is for an adult party " +
-  "game; the rewrites should still feel adult and cheeky.\n\n" +
+const BASE_RULES =
   "ABSOLUTE RULES:\n" +
-  "1. Every character name provided in `names` MUST appear in the rewrite " +
-  "spelled EXACTLY as given, in the same role/position they had in the " +
+  "1. Every character name provided for an item MUST appear in that item's " +
+  "rewrite spelled EXACTLY as given, in the same role/position it had in the " +
   "original caption (the actor stays the actor, not swapped with anyone " +
   "else). Do not replace names with pronouns, roles ('the man'), or " +
   "different names.\n" +
@@ -24,10 +21,35 @@ const SYSTEM_PROMPT =
   "suspiciously glowing cocktail').\n" +
   "4. Keep the humour and absurdity, roughly the same length, one caption " +
   "per input.\n" +
-  "5. If the caption is already safe, return it unchanged.\n" +
-  "6. No moralising, apologies or explanations.\n\n" +
-  "Return JSON with the exact shape: {\"captions\": [\"...\", \"...\"]} " +
-  "with the same number of items as the input array, in the same order.";
+  "5. If the caption is already safe AND already contains every required " +
+  "name verbatim, return it unchanged.\n" +
+  "6. No moralising, apologies or explanations.\n";
+
+function systemPrompt(attempt: number): string {
+  const strictness =
+    attempt === 0
+      ? "You rewrite comic-panel scene captions so an image generator is " +
+        "unlikely to refuse them, while keeping the story intact. This is " +
+        "for an adult party game; the rewrites should still feel adult and " +
+        "cheeky.\n\n"
+      : attempt === 1
+        ? "STRICTER RETRY. Your last rewrite dropped or altered one or more " +
+          "required character names. This is unacceptable — every listed " +
+          "name MUST appear verbatim in that item's rewrite. Also soften " +
+          "the wording more aggressively so the image model will accept " +
+          "it.\n\n"
+        : "FINAL RETRY. Previous attempts failed. Produce very gentle, " +
+          "family-friendly cartoon descriptions that still hint at the " +
+          "story beat, but every required name MUST appear verbatim in " +
+          "its own item's rewrite. Prefer harmless, whimsical actions.\n\n";
+
+  return (
+    strictness +
+    BASE_RULES +
+    '\nReturn JSON with the exact shape: {"captions": ["...", "..."]} ' +
+    "with the same number of items as the input array, in the same order."
+  );
+}
 
 export function hasSafeRewriteProvider(): boolean {
   return Boolean(OPENAI_API_KEY);
@@ -47,13 +69,25 @@ function preservesNames(rewrite: string, names: string[]): boolean {
 }
 
 /**
- * Rewrite each caption to an image-safe version. Character names must be
- * preserved verbatim; if a rewrite drops any expected name the original
- * caption is used for that item instead. Any failure falls back to originals.
+ * A guaranteed name-preserving, image-safe caption for a panel when even the
+ * retry loop failed. Not funny — but it never gets refused and always draws
+ * the right people.
  */
-export async function sanitizeCaptionsForImage(items: SafeRewriteItem[]): Promise<string[]> {
-  if (!OPENAI_API_KEY || items.length === 0) return items.map((i) => i.caption);
+function synthesizeFallback(item: SafeRewriteItem): string {
+  if (item.names.length === 0) {
+    return "A whimsical cartoon scene with playful characters.";
+  }
+  if (item.names.length === 1) {
+    return `${item.names[0]} strikes a comedic cartoon pose in a whimsical scene.`;
+  }
+  const list = item.names.slice(0, -1).join(", ") + " and " + item.names[item.names.length - 1];
+  return `${list} share a comedic cartoon moment together in a whimsical scene.`;
+}
 
+async function callSanitizer(
+  items: SafeRewriteItem[],
+  attempt: number
+): Promise<string[] | null> {
   try {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -65,30 +99,60 @@ export async function sanitizeCaptionsForImage(items: SafeRewriteItem[]): Promis
         model: "gpt-4o-mini",
         response_format: { type: "json_object" },
         messages: [
-          { role: "system", content: SYSTEM_PROMPT },
+          { role: "system", content: systemPrompt(attempt) },
           { role: "user", content: JSON.stringify({ items }) },
         ],
-        temperature: 0.7,
+        temperature: 0.6,
       }),
     });
-    if (!res.ok) return items.map((i) => i.caption);
+    if (!res.ok) return null;
     const data = await res.json();
     const content = data?.choices?.[0]?.message?.content;
-    if (typeof content !== "string") return items.map((i) => i.caption);
+    if (typeof content !== "string") return null;
     const parsed = JSON.parse(content) as { captions?: unknown };
     if (!Array.isArray(parsed.captions) || parsed.captions.length !== items.length) {
-      return items.map((i) => i.caption);
+      return null;
     }
-    return parsed.captions.map((c, i) => {
-      const orig = items[i].caption;
-      if (typeof c !== "string" || !c.trim()) return orig;
-      const rewrite = c.trim();
-      // Belt-and-braces: if any required name is missing, keep the original so
-      // the wrong person isn't drawn.
-      if (!preservesNames(rewrite, items[i].names)) return orig;
-      return rewrite;
-    });
+    return parsed.captions.map((c) => (typeof c === "string" ? c.trim() : ""));
   } catch {
-    return items.map((i) => i.caption);
+    return null;
   }
+}
+
+/**
+ * Rewrite each caption to an image-safe version. Character names must be
+ * preserved verbatim; on failure the sanitiser retries with escalating
+ * strictness, and finally synthesises a name-preserving safe caption so the
+ * image model always draws the right people.
+ */
+export async function sanitizeCaptionsForImage(items: SafeRewriteItem[]): Promise<string[]> {
+  if (!OPENAI_API_KEY || items.length === 0) return items.map((i) => i.caption);
+
+  const finalResults: (string | null)[] = items.map(() => null);
+  let pendingIndices: number[] = items.map((_, i) => i);
+  const MAX_ATTEMPTS = 3;
+
+  for (let attempt = 0; attempt < MAX_ATTEMPTS && pendingIndices.length > 0; attempt++) {
+    const attemptItems = pendingIndices.map((i) => items[i]);
+    const rewrites = await callSanitizer(attemptItems, attempt);
+
+    const stillPending: number[] = [];
+    pendingIndices.forEach((origIdx, k) => {
+      const rw = rewrites?.[k];
+      if (rw && preservesNames(rw, items[origIdx].names)) {
+        finalResults[origIdx] = rw;
+      } else {
+        stillPending.push(origIdx);
+      }
+    });
+    pendingIndices = stillPending;
+  }
+
+  // Anything the retry loop couldn't rescue → synthesised safe caption that is
+  // guaranteed to contain every required name.
+  pendingIndices.forEach((i) => {
+    finalResults[i] = synthesizeFallback(items[i]);
+  });
+
+  return finalResults.map((r, i) => r ?? synthesizeFallback(items[i]));
 }
