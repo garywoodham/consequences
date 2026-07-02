@@ -1,6 +1,6 @@
 // Server-only module: reads OPENAI_API_KEY and calls external image APIs.
 import type { ComicCharacter, ComicStripData, Story, StoryLine, StoryPanel } from "./types";
-import { sanitizeCaptionsForImage } from "./safe-rewrite";
+import { sanitizeCaptionsForImage, type SanitizeLevel } from "./safe-rewrite";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const CARICATURE_STYLE =
@@ -12,8 +12,11 @@ const PANEL_STYLE =
 // The readable caption is shown beneath each panel in the UI, so the artwork
 // itself must contain no lettering.
 const NO_TEXT =
-  "Important: the image must contain NO text of any kind — no words, letters, " +
-  "captions, titles, speech bubbles, thought bubbles, signs, or writing.";
+  "STRICT RULE — NO TEXT ANYWHERE IN THE IMAGE. The final image must contain " +
+  "absolutely no readable characters: no words, no letters, no digits, no " +
+  "captions, no titles, no chapter headings, no speech bubbles, no thought " +
+  "bubbles, no signs, no book covers, no shop names, no logos, no watermarks, " +
+  "no scribbles that resemble writing. All storytelling must be visual only.";
 
 export function hasAiProvider(): boolean {
   return Boolean(OPENAI_API_KEY);
@@ -135,7 +138,7 @@ async function generatePanelFromText(scene: string, characters: ComicCharacter[]
       },
       body: JSON.stringify({
         model: "gpt-image-1",
-        prompt: `${scene}${cast} ${NO_TEXT}`,
+        prompt: `${NO_TEXT}\n\n${scene}${cast}\n\n${NO_TEXT}`,
         size: "1024x1024",
         quality: "low",
         moderation: "low",
@@ -181,14 +184,14 @@ async function generatePanelImage(scene: string, characters: ComicCharacter[]): 
     usableRefs.forEach((r, i) => form.append("image[]", r.blob, `character-${i}.png`));
     form.append(
       "prompt",
-      `${scene} ` +
+      `${NO_TEXT}\n\n${scene} ` +
         `Compose a brand-new full comic panel that depicts the scene, setting and action ` +
         `described above — this must be an illustrated story moment, NOT a portrait. ` +
         `${refLegend} Draw the named characters (${castNames}) so they clearly resemble their ` +
         `matching reference image, doing exactly what the caption says. Anyone named in the ` +
         `caption MUST appear in the panel and must be the same person as their reference. ` +
         `Do not swap, merge or omit characters. Do not simply reproduce, crop, or restyle the ` +
-        `reference image. ${NO_TEXT}`
+        `reference image.\n\n${NO_TEXT}`
     );
     form.append("size", "1024x1024");
     form.append("quality", "low");
@@ -258,9 +261,30 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
         ...c,
         imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
       }));
-      const safeCaption = safeCaptions[i] ?? panel.caption;
-      const imageScene = buildSceneDescription(safeCaption, characters);
-      const imageUrl = await generatePanelImage(imageScene, characters);
+      const names = panel.characters.map((c) => c.name);
+      let caption = safeCaptions[i] ?? panel.caption;
+
+      // Try level 0; if the image model refuses, escalate to level 1 then 2.
+      let imageUrl = await generatePanelImage(
+        buildSceneDescription(caption, characters),
+        characters
+      );
+
+      const levels: SanitizeLevel[] = [1, 2];
+      for (const level of levels) {
+        if (imageUrl) break;
+        const [escalated] = await sanitizeCaptionsForImage(
+          [{ caption: panel.caption, names }],
+          level
+        );
+        if (!escalated || escalated === caption) continue;
+        caption = escalated;
+        imageUrl = await generatePanelImage(
+          buildSceneDescription(caption, characters),
+          characters
+        );
+      }
+
       return { ...panel, characters, imageUrl: imageUrl ?? undefined };
     })
   );
