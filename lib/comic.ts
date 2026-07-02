@@ -219,8 +219,13 @@ const DESCRIBE_SYSTEM_PROMPT =
   "to any real or famous person. No preamble, no bullet characters — just the " +
   "description sentence(s).";
 
-async function describeCaricature(dataUrl: string): Promise<string> {
-  if (!OPENAI_API_KEY || !dataUrl.startsWith("data:image")) return "";
+async function describeCaricature(imageUrl: string): Promise<string> {
+  // Accept both the caricature data URL and a plain http(s) photo URL — the
+  // vision endpoint handles either, and describing the original photo is a
+  // valuable fallback when caricature generation flakes out.
+  const usable =
+    imageUrl.startsWith("data:image") || /^https?:\/\//i.test(imageUrl);
+  if (!OPENAI_API_KEY || !usable) return "";
   try {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -236,7 +241,7 @@ async function describeCaricature(dataUrl: string): Promise<string> {
             role: "user",
             content: [
               { type: "text", text: "Create the model-sheet description for this character:" },
-              { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
+              { type: "image_url", image_url: { url: imageUrl, detail: "high" } },
             ],
           },
         ],
@@ -599,6 +604,7 @@ export async function buildComic(
   story: Story,
   style: CaricatureStyle = "balanced"
 ): Promise<ComicStripData> {
+  const buildStart = Date.now();
   const scripted = scriptPanels(story);
 
   if (!hasAiProvider()) {
@@ -621,15 +627,24 @@ export async function buildComic(
   await Promise.all(
     storyCast.map(async (c) => {
       if (c.imageUrl) {
-        // Photo uploaded → caricature it and describe the caricature.
-        const caricature = await generateCaricature(c.imageUrl as string, style);
+        // Photo uploaded → caricature it (retry once; image generation is
+        // non-deterministic and an occasional flaky refusal shouldn't drop the
+        // character), then describe it. If the caricature never comes through,
+        // still describe the ORIGINAL photo so this character ALWAYS has a
+        // feature description to anchor every panel.
+        let caricature = await generateCaricature(c.imageUrl as string, style);
+        if (!caricature) {
+          caricature = await generateCaricature(c.imageUrl as string, style);
+        }
         caricatureCache.set(c.id, caricature);
-        if (caricature) {
-          const desc = await describeCaricature(caricature);
-          if (desc) {
-            descriptionCache.set(c.id, desc);
-            descriptionSource.set(c.id, "photo");
-          }
+
+        const desc = await describeCaricature(caricature ?? (c.imageUrl as string));
+        if (desc) {
+          descriptionCache.set(c.id, desc);
+          descriptionSource.set(c.id, "photo");
+        }
+        if (!caricature) {
+          console.warn(`[comic] caricature failed for "${c.name}", using original photo + description`);
         }
       } else {
         // No photo → search online for a matching public-figure description.
@@ -652,10 +667,16 @@ export async function buildComic(
     descriptionSource: descriptionSource.get(c.id),
   }));
 
-  // Cap total time per panel so a single slow/refused panel can't hold up
-  // the whole comic past the browser/tunnel budget. When the budget is spent
-  // we return whatever we have and let the panel render as a photo fallback.
-  const PANEL_BUDGET_MS = 75_000;
+  // Overall wall-clock deadline for the whole request (panels run in
+  // parallel and share this clock). Caricature generation above has already
+  // consumed some of it. We only start a new image attempt while there is
+  // enough time left to plausibly finish one, so a slow/refused panel can't
+  // push the response past the browser/tunnel window (~100s for Cloudflare
+  // quick tunnels). Panels that run out of time render as a photo fallback.
+  const OVERALL_DEADLINE_MS = 92_000;
+  const MIN_ATTEMPT_MS = 16_000;
+  const deadline = buildStart + OVERALL_DEADLINE_MS;
+  const canAttempt = () => Date.now() < deadline - MIN_ATTEMPT_MS;
 
   const panels: StoryPanel[] = await Promise.all(
     scripted.map(async (panel, panelIdx) => {
@@ -668,62 +689,63 @@ export async function buildComic(
         .filter((c) => mentionsName(panel.caption, c.name))
         .map((c) => c.name);
 
-      const started = Date.now();
-      const timeLeft = () => PANEL_BUDGET_MS - (Date.now() - started);
+      // Build the ordered list of caption variants to try. Crudest first:
+      //   raw (twice — image moderation is non-deterministic, so a flaky
+      //   refusal on the first pass often succeeds on a retry), then the
+      //   softening ladder (0 = surgical swap · 1 = aftermath · 2 = whimsical).
+      // Each softened variant is only added if it actually differs from what
+      // we've already tried, so a clean caption doesn't waste attempts on
+      // no-op "softenings".
+      type Attempt = { label: string; caption: string };
+      const attempts: Attempt[] = [
+        { label: "raw", caption: panel.caption },
+        { label: "raw-retry", caption: panel.caption },
+      ];
 
-      // Attempt the raw player caption first (only names→labels), then walk
-      // the softening ladder if the image model refuses:
-      //   0 = surgical swap · 1 = aftermath · 2 = whimsical.
-      // We keep the least-softened version the model actually accepts.
-      let caption = panel.caption;
       let result: { imageUrl: string | null; prompt: string } = {
         imageUrl: null,
         prompt: "",
       };
+      const tried = new Set<string>();
 
-      {
+      const runAttempt = async (a: Attempt) => {
+        tried.add(a.caption);
         const t0 = Date.now();
         result = await generatePanelImage(
-          caption,
+          a.caption,
           characters,
           descriptionCache,
           caricatureCache
         );
         console.log(
-          `[comic] panel ${panelIdx} attempt=raw ` +
+          `[comic] panel ${panelIdx} attempt=${a.label} ` +
             `imageOk=${Boolean(result.imageUrl)} ` +
-            `took=${Date.now() - t0}ms budget=${timeLeft()}ms`
+            `took=${Date.now() - t0}ms remaining=${deadline - Date.now()}ms`
         );
+      };
+
+      for (const attempt of attempts) {
+        if (result.imageUrl) break;
+        if (!canAttempt()) break;
+        await runAttempt(attempt);
       }
 
       const levels: SanitizeLevel[] = [0, 1, 2];
       for (const level of levels) {
         if (result.imageUrl) break;
-        if (timeLeft() <= 0) break;
+        if (!canAttempt()) break;
         const [softer] = await sanitizeCaptionsForImage(
           [{ caption: panel.caption, names }],
           level
         );
-        if (!softer || softer === caption) continue;
-        caption = softer;
-        const t0 = Date.now();
-        result = await generatePanelImage(
-          caption,
-          characters,
-          descriptionCache,
-          caricatureCache
-        );
-        console.log(
-          `[comic] panel ${panelIdx} attempt=level${level} ` +
-            `imageOk=${Boolean(result.imageUrl)} ` +
-            `took=${Date.now() - t0}ms budget=${timeLeft()}ms`
-        );
+        if (!softer || tried.has(softer)) continue;
+        await runAttempt({ label: `level${level}`, caption: softer });
       }
 
       if (!result.imageUrl) {
         console.warn(
-          `[comic] panel ${panelIdx} exhausted attempts, ` +
-            `total=${Date.now() - started}ms ` +
+          `[comic] panel ${panelIdx} produced no image, ` +
+            `total=${Date.now() - buildStart}ms ` +
             `caption=${JSON.stringify(panel.caption.slice(0, 60))}`
         );
       }
