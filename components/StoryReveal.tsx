@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Check, Copy, Maximize2, Sparkles, Wand2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardTitle } from "@/components/ui/card";
-import type { ComicStripData, GameState, Story } from "@/lib/types";
+import type { CaricatureStyle, ComicStripData, GameState, Story } from "@/lib/types";
 import { PlayerAvatar } from "./PlayerAvatar";
 import { ComicStrip, ComicStripSkeleton } from "./ComicStrip";
 
@@ -14,6 +14,17 @@ type StoryRevealProps = {
   onPlayAgain: () => void;
   onSubmitTidy?: (stories: { id: string; tidyProse: string }[]) => void;
 };
+
+const STYLE_OPTIONS: {
+  value: CaricatureStyle;
+  label: string;
+  hint: string;
+}[] = [
+  { value: "faithful", label: "Close to photo", hint: "Barely stylised — keeps features close to the original image." },
+  { value: "balanced", label: "Balanced", hint: "A recognisable caricature with a moderate cartoon exaggeration." },
+  { value: "exaggerated", label: "Exaggerated", hint: "High harshness — really amplifies each person's distinctive features." },
+  { value: "flattering", label: "Flattering", hint: "Enhances attractive features so everyone looks their best." },
+];
 
 function splitSentences(text: string): string[] {
   return text
@@ -31,6 +42,7 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
   const [comicLoading, setComicLoading] = useState(false);
   const [comicError, setComicError] = useState<string | null>(null);
   const [tidying, setTidying] = useState(false);
+  const [caricatureStyle, setCaricatureStyle] = useState<CaricatureStyle>("balanced");
   const tidyAttemptRef = useRef<string>("");
 
   const stories = state.stories;
@@ -95,7 +107,7 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
       const res = await fetch("/api/generate-comic", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ story: target }),
+        body: JSON.stringify({ story: target, style: caricatureStyle }),
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -242,6 +254,35 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
       </div>
 
       <div className="mb-4">
+        <div className="mb-3 rounded-xl border border-white/10 bg-white/5 p-3">
+          <p className="mb-2 text-xs font-medium uppercase tracking-wide text-white/60">
+            Caricature style
+          </p>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {STYLE_OPTIONS.map((opt) => {
+              const selected = caricatureStyle === opt.value;
+              return (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() => setCaricatureStyle(opt.value)}
+                  disabled={comicLoading}
+                  aria-pressed={selected}
+                  className={`rounded-lg border px-3 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                    selected
+                      ? "border-violet-400 bg-violet-500/20 text-white"
+                      : "border-white/10 bg-white/5 text-white/70 hover:border-white/30 hover:text-white"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+          <p className="mt-2 text-xs text-white/50">
+            {STYLE_OPTIONS.find((o) => o.value === caricatureStyle)?.hint}
+          </p>
+        </div>
         {comics[story.id] ? (
           <ComicStrip comic={comics[story.id]} />
         ) : comicLoading ? (

@@ -1,14 +1,62 @@
 // Server-only module: reads OPENAI_API_KEY and calls external image APIs.
-import type { ComicCharacter, ComicStripData, Story, StoryLine, StoryPanel } from "./types";
+import type {
+  CaricatureStyle,
+  ComicCharacter,
+  ComicStripData,
+  Story,
+  StoryLine,
+  StoryPanel,
+} from "./types";
 import { sanitizeCaptionsForImage, type SanitizeLevel } from "./safe-rewrite";
 import { buildCastSheet } from "./cast-sheet";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const CARICATURE_STYLE =
-  "bold-outlined cartoon caricature with all distinctive facial features clearly " +
-  "preserved (hair color and style, eye color, skin tone, glasses, facial hair, " +
-  "notable clothing) — exaggerated but instantly recognisable, flat vibrant colors, " +
-  "clean white background, character reference sheet style";
+
+const CARICATURE_STYLE_BASE =
+  "bold ink outlines, flat vibrant colors, clean white background, single " +
+  "character, character reference sheet style";
+
+/** Build the caricature instruction for the chosen harshness/flattery style. */
+function caricaturePrompt(style: CaricatureStyle): string {
+  switch (style) {
+    case "faithful":
+      return (
+        "Turn this person into a clean cartoon version of themselves that stays " +
+        "TRUE TO LIFE. Keep facial proportions, features and skin tone close to " +
+        "the photo — only lightly stylise into a cartoon, do NOT exaggerate. " +
+        "Preserve every distinctive feature (hair colour/style, eye colour, skin " +
+        "tone, glasses, facial hair, notable clothing). " +
+        `${CARICATURE_STYLE_BASE}.`
+      );
+    case "exaggerated":
+      return (
+        "Turn this person into a BOLD, heavily EXAGGERATED caricature. Greatly " +
+        "amplify their most distinctive features (nose, jaw, ears, hair, " +
+        "expression) in classic over-the-top caricature style, while keeping " +
+        "them clearly recognisable. Preserve hair colour/style, skin tone, " +
+        "glasses, facial hair and notable clothing. " +
+        `${CARICATURE_STYLE_BASE}.`
+      );
+    case "flattering":
+      return (
+        "Turn this person into a FLATTERING, idealised cartoon caricature. " +
+        "Enhance their most attractive features and make them look their best — " +
+        "glamorous, clear skin, bright eyes, great hair, confident smile — while " +
+        "keeping them recognisable. Preserve hair colour/style, skin tone, " +
+        "glasses, facial hair and notable clothing. " +
+        `${CARICATURE_STYLE_BASE}.`
+      );
+    case "balanced":
+    default:
+      return (
+        "Transform this person into a cartoon caricature with all distinctive " +
+        "facial features clearly preserved (hair colour and style, eye colour, " +
+        "skin tone, glasses, facial hair, notable clothing) — moderately " +
+        "exaggerated but instantly recognisable. " +
+        `${CARICATURE_STYLE_BASE}.`
+      );
+  }
+}
 const PANEL_STYLE =
   "fun comic book panel, bold ink outlines, halftone shading, vibrant flat colors, " +
   "expressive cartoon characters, dynamic composition";
@@ -109,7 +157,10 @@ async function fetchAsBlob(url: string): Promise<Blob | null> {
 }
 
 /** Turn an uploaded photo into a cartoon caricature (OpenAI image edit). */
-export async function generateCaricature(imageUrl: string): Promise<string | null> {
+export async function generateCaricature(
+  imageUrl: string,
+  style: CaricatureStyle = "balanced"
+): Promise<string | null> {
   if (!OPENAI_API_KEY) return null;
 
   const blob = await fetchAsBlob(imageUrl);
@@ -119,10 +170,7 @@ export async function generateCaricature(imageUrl: string): Promise<string | nul
     const form = new FormData();
     form.append("model", "gpt-image-1");
     form.append("image", blob, "photo.png");
-    form.append(
-      "prompt",
-      `Transform this person into a ${CARICATURE_STYLE}. Keep them recognizable.`
-    );
+    form.append("prompt", caricaturePrompt(style));
     form.append("size", "1024x1024");
     form.append("quality", "medium");
     form.append("moderation", "low");
@@ -547,7 +595,10 @@ async function generatePanelImage(
  * configured each player photo is caricatured and every panel is illustrated;
  * otherwise it falls back to a photo-based strip rendered on the client.
  */
-export async function buildComic(story: Story): Promise<ComicStripData> {
+export async function buildComic(
+  story: Story,
+  style: CaricatureStyle = "balanced"
+): Promise<ComicStripData> {
   const scripted = scriptPanels(story);
 
   if (!hasAiProvider()) {
@@ -571,7 +622,7 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
     storyCast.map(async (c) => {
       if (c.imageUrl) {
         // Photo uploaded → caricature it and describe the caricature.
-        const caricature = await generateCaricature(c.imageUrl as string);
+        const caricature = await generateCaricature(c.imageUrl as string, style);
         caricatureCache.set(c.id, caricature);
         if (caricature) {
           const desc = await describeCaricature(caricature);

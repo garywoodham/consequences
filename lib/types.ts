@@ -22,6 +22,22 @@ export type StoryLine = {
   playerAvatarUrl?: string;
 };
 
+/**
+ * How the player photos are stylised into caricatures for the comic:
+ * - "faithful"    — stay close to the original photo (low exaggeration)
+ * - "balanced"    — moderate, recognisable caricature (default)
+ * - "exaggerated" — heavily amplify distinctive features (high harshness)
+ * - "flattering"  — enhance attractive features, idealised look
+ */
+export type CaricatureStyle = "faithful" | "balanced" | "exaggerated" | "flattering";
+
+export const CARICATURE_STYLES: CaricatureStyle[] = [
+  "faithful",
+  "balanced",
+  "exaggerated",
+  "flattering",
+];
+
 export type ComicCharacter = {
   id: string;
   name: string;

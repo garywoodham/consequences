@@ -1,13 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { buildComic } from "@/lib/comic";
-import type { Story } from "@/lib/types";
+import { CARICATURE_STYLES, type CaricatureStyle, type Story } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 // Image generation can take a while; allow a generous budget where supported.
 export const maxDuration = 300;
 
 export async function POST(request: NextRequest) {
-  let body: { story?: Story };
+  let body: { story?: Story; style?: CaricatureStyle };
   try {
     body = await request.json();
   } catch {
@@ -19,8 +19,12 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "A story with lines is required" }, { status: 400 });
   }
 
+  const style: CaricatureStyle = CARICATURE_STYLES.includes(body.style as CaricatureStyle)
+    ? (body.style as CaricatureStyle)
+    : "balanced";
+
   try {
-    const comic = await buildComic(story);
+    const comic = await buildComic(story, style);
     return NextResponse.json({ comic });
   } catch (error) {
     console.error("Comic generation failed:", error);
