@@ -121,7 +121,9 @@ export async function generateCaricature(imageUrl: string): Promise<string | nul
 /** Text-to-image fallback when no character reference photos are available. */
 async function generatePanelFromText(scene: string, characters: ComicCharacter[]): Promise<string | null> {
   const cast = characters.length
-    ? ` The recurring characters are: ${characters.map((c) => c.name).join(", ")}.`
+    ? ` The named characters (${characters
+        .map((c) => c.name)
+        .join(", ")}) must all appear in the panel doing exactly what the caption says; do not swap or omit them.`
     : "";
 
   try {
@@ -169,6 +171,9 @@ async function generatePanelImage(scene: string, characters: ComicCharacter[]): 
   }
 
   const castNames = usableRefs.map((r) => r.name).join(", ");
+  const refLegend = usableRefs
+    .map((r, i) => `Reference image ${i + 1} shows ${r.name}.`)
+    .join(" ");
 
   try {
     const form = new FormData();
@@ -179,10 +184,11 @@ async function generatePanelImage(scene: string, characters: ComicCharacter[]): 
       `${scene} ` +
         `Compose a brand-new full comic panel that depicts the scene, setting and action ` +
         `described above — this must be an illustrated story moment, NOT a portrait. ` +
-        `The attached reference image(s) only show what ${castNames} look like: keep their ` +
-        `faces and likeness, but draw them inside this scene actively doing the described action, ` +
-        `with a background and props that match the story. ` +
-        `Do not simply reproduce, crop, or restyle the reference image. ${NO_TEXT}`
+        `${refLegend} Draw the named characters (${castNames}) so they clearly resemble their ` +
+        `matching reference image, doing exactly what the caption says. Anyone named in the ` +
+        `caption MUST appear in the panel and must be the same person as their reference. ` +
+        `Do not swap, merge or omit characters. Do not simply reproduce, crop, or restyle the ` +
+        `reference image. ${NO_TEXT}`
     );
     form.append("size", "1024x1024");
     form.append("quality", "low");
@@ -221,8 +227,14 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
   }
 
   // Sanitise per-panel captions for the image model in one batched call.
-  // The original captions are kept for display below the panels.
-  const safeCaptions = await sanitizeCaptionsForImage(scripted.map((p) => p.caption));
+  // The original captions are kept for display below the panels; character
+  // names are preserved so the image model still draws the right people.
+  const safeCaptions = await sanitizeCaptionsForImage(
+    scripted.map((p) => ({
+      caption: p.caption,
+      names: p.characters.map((c) => c.name),
+    }))
+  );
 
   // Caricature each unique player photo once, reuse across panels.
   const caricatureCache = new Map<string, string | null>();
