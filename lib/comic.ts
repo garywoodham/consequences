@@ -129,8 +129,11 @@ export async function generateCaricature(imageUrl: string): Promise<string | nul
 }
 
 /**
- * Ask a vision LLM to describe the caricature so we can embed a textual
- * fingerprint of the character alongside the reference image in panel prompts.
+ * Ask a vision LLM to describe the caricature in enough detail that an artist
+ * could draw an original lookalike from the words alone. This description is
+ * the PRIMARY identity anchor in panel prompts: we refer to each character by
+ * their features (not their real name), so the image model draws a similar
+ * original cartoon character rather than trying to depict a real/known person.
  * Cheap gpt-4o-mini call; returns "" on any failure.
  */
 async function describeCaricature(dataUrl: string): Promise<string> {
@@ -148,21 +151,24 @@ async function describeCaricature(dataUrl: string): Promise<string> {
           {
             role: "system",
             content:
-              "You describe cartoon character illustrations concisely for an artist so " +
-              "they can reproduce the same character. Reply with ONE short comma-separated " +
-              "list of distinctive visual features only (hair color/style, eye color, skin " +
-              "tone, facial hair, glasses, notable clothing). Max 20 words. No preamble.",
+              "You are a character-design assistant. Describe this cartoon character so " +
+              "another artist could redraw a matching original character WITHOUT seeing " +
+              "the picture. Give ONE compact comma-separated list of concrete visual " +
+              "features, in this order when visible: approximate age range and build, " +
+              "skin tone, hair (colour, length, style), facial hair, eye colour, glasses " +
+              "or accessories, and any notable clothing. 25-40 words. Only physical " +
+              "features — do NOT name or guess who the person is, and no preamble.",
           },
           {
             role: "user",
             content: [
-              { type: "text", text: "Distinctive features of this character:" },
+              { type: "text", text: "Describe this character's appearance:" },
               { type: "image_url", image_url: { url: dataUrl } },
             ],
           },
         ],
         temperature: 0.3,
-        max_tokens: 80,
+        max_tokens: 140,
       }),
     });
     if (!res.ok) return "";
@@ -174,12 +180,85 @@ async function describeCaricature(dataUrl: string): Promise<string> {
   }
 }
 
-/** Text-to-image fallback when no character reference photos are available. */
-async function generatePanelFromText(scene: string, characters: ComicCharacter[]): Promise<string | null> {
-  const cast = characters.length
-    ? ` The named characters (${characters
-        .map((c) => c.name)
-        .join(", ")}) must all appear in the panel doing exactly what the caption says; do not swap or omit them.`
+/** Whole-word, Unicode-aware replacement of a character's name with a label. */
+function replaceNameWithLabel(text: string, name: string, label: string): string {
+  const needle = name.trim();
+  if (!needle) return text;
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return text.replace(new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "giu"), label);
+}
+
+type PanelCharacter = {
+  name: string;
+  label: string;
+  description: string;
+  image?: string;
+};
+
+/**
+ * Assign each panel character a neutral label ("Character 1", ...) plus its
+ * feature description and (when available) reference caricature. Rewrite the
+ * caption so character names become their labels — the image model then works
+ * from features + label, never a real identity.
+ */
+function buildPanelCast(
+  characters: ComicCharacter[],
+  descriptions: Map<string, string>,
+  caricatures: Map<string, string | null>
+): { cast: PanelCharacter[]; sceneCaptionRewriter: (caption: string) => string } {
+  const cast: PanelCharacter[] = characters.map((c, i) => ({
+    name: c.name,
+    label: `Character ${i + 1}`,
+    description: descriptions.get(c.id) ?? "",
+    image: caricatures.get(c.id) ?? c.imageUrl ?? undefined,
+  }));
+
+  const sceneCaptionRewriter = (caption: string): string => {
+    let out = caption;
+    for (const pc of cast) {
+      out = replaceNameWithLabel(out, pc.name, pc.label);
+    }
+    return out;
+  };
+
+  return { cast, sceneCaptionRewriter };
+}
+
+const FICTIONAL_NOTE =
+  "IMPORTANT: the people below are ORIGINAL FICTIONAL cartoon characters, each " +
+  "defined ONLY by the feature description given. They are NOT real, famous or " +
+  "identifiable individuals — draw an original cartoon character that matches " +
+  "the described features. Keep each character's look identical in every panel.";
+
+/** Build the "CHARACTER GUIDE" block describing each character by features. */
+function buildCharacterGuide(cast: PanelCharacter[], withCastSheet: boolean): string {
+  return cast
+    .map((pc) => {
+      const tile = withCastSheet && pc.image
+        ? ` (also shown on the attached cast sheet, tile labelled "${pc.label.toUpperCase()}")`
+        : "";
+      const features = pc.description
+        ? pc.description
+        : "an original cartoon character — invent a distinct, consistent look";
+      return `  • ${pc.label}${tile}: ${features}.`;
+    })
+    .join("\n");
+}
+
+/**
+ * Text-to-image fallback (no reference photos). Characters are still described
+ * by features + neutral labels so we get consistent lookalikes, not real people.
+ */
+async function generatePanelFromTextCast(
+  sceneWithLabels: string,
+  cast: PanelCharacter[]
+): Promise<string | null> {
+  const guide = cast.length ? buildCharacterGuide(cast, false) : "";
+  const labelList = cast.map((c) => c.label).join(", ");
+  const guideBlock = guide
+    ? `${FICTIONAL_NOTE}\n\nCHARACTER GUIDE:\n${guide}\n\n` +
+      `All of these characters (${labelList}) must appear in the panel doing ` +
+      `exactly what the scene says; do not swap or omit anyone.\n\n`
     : "";
 
   try {
@@ -191,7 +270,9 @@ async function generatePanelFromText(scene: string, characters: ComicCharacter[]
       },
       body: JSON.stringify({
         model: "gpt-image-1",
-        prompt: `${NO_TEXT}\n\n${scene}${cast}\n\n${NO_TEXT}`,
+        prompt:
+          `${NO_TEXT}\n\n${guideBlock}SCENE: ${sceneWithLabels}\n\n` +
+          `STYLE: ${PANEL_STYLE}.\n\n${NO_TEXT}`,
         size: "1024x1024",
         quality: "low",
         moderation: "low",
@@ -207,19 +288,13 @@ async function generatePanelFromText(scene: string, characters: ComicCharacter[]
   }
 }
 
-type CastRef = {
-  id: string;
-  name: string;
-  imageUrl: string;
-  description: string;
-};
-
 /**
- * Generate a single comic panel using an ORDERED, LABELLED cast sheet as the
- * one and only reference image. The image model sees each named character
- * exactly once (numbered 1..N with the name printed under each caricature) and
- * the prompt references those numbered slots explicitly. This is much more
- * reliable at preserving identity than passing several separate references.
+ * Generate a single comic panel. Characters are described by their FEATURES
+ * (from the caricature) under neutral labels, and the caption is rewritten so
+ * those labels replace the real names. When reference caricatures exist they
+ * are composited into one labelled cast sheet and attached as a visual anchor.
+ * This keeps the drawn people consistent lookalikes instead of the model
+ * substituting random or famous-looking people for named characters.
  */
 async function generatePanelImage(
   caption: string,
@@ -229,75 +304,46 @@ async function generatePanelImage(
 ): Promise<string | null> {
   if (!OPENAI_API_KEY) return null;
 
-  // Split the panel's characters into two buckets:
-  //   • castRefs   — have a reference image (uploaded photo → caricature)
-  //   • extraNames — mentioned in the caption but no photo attached
-  // Both must appear in the drawn panel, but only castRefs constrain likeness.
-  const castRefs: CastRef[] = [];
-  const extraNames: string[] = [];
-  for (const c of characters) {
-    const caricature = caricatures.get(c.id) ?? c.imageUrl;
-    if (caricature) {
-      castRefs.push({
-        id: c.id,
-        name: c.name,
-        imageUrl: caricature,
-        description: descriptions.get(c.id) ?? "",
-      });
-    } else {
-      extraNames.push(c.name);
-    }
-  }
+  const { cast, sceneCaptionRewriter } = buildPanelCast(
+    characters,
+    descriptions,
+    caricatures
+  );
+  const sceneWithLabels = sceneCaptionRewriter(caption);
+  const withRefs = cast.filter((c) => c.image);
 
-  const allNames = [...castRefs.map((r) => r.name), ...extraNames];
-  const emphaticList = allNames.length
-    ? allNames.map((n) => `**${n}**`).join(", ")
-    : "the characters described";
-
-  // No reference images at all — fall back to text-to-image but still list
-  // every required character name in the prompt.
-  if (castRefs.length === 0) {
-    return generatePanelFromText(buildSceneDescription(caption, characters), characters);
+  // No reference images at all → text-to-image using feature descriptions.
+  if (withRefs.length === 0) {
+    return generatePanelFromTextCast(sceneWithLabels, cast);
   }
 
   const castSheetBuf = await buildCastSheet(
-    castRefs.map((r) => ({ name: r.name, imageUrl: r.imageUrl }))
+    withRefs.map((c) => ({ name: c.label, imageUrl: c.image as string }))
   );
   if (!castSheetBuf) {
-    return generatePanelFromText(buildSceneDescription(caption, characters), characters);
+    return generatePanelFromTextCast(sceneWithLabels, cast);
   }
 
   const castSheetBlob = new Blob([new Uint8Array(castSheetBuf)], { type: "image/png" });
-
-  const rosterLines = castRefs
-    .map((r, i) => {
-      const desc = r.description ? ` — ${r.description}` : "";
-      return `  ${i + 1}. ${r.name} (tile #${i + 1} of the cast sheet, labelled "${r.name.toUpperCase()}")${desc}`;
-    })
-    .join("\n");
-
-  const extrasNote = extraNames.length
-    ? `\n\nADDITIONAL NAMED CHARACTERS (no reference image — draw them as ` +
-      `plausible cartoon characters and reuse the same look for them across ` +
-      `all panels): ${extraNames.join(", ")}.`
-    : "";
+  const guide = buildCharacterGuide(cast, true);
+  const labelList = cast.map((c) => c.label).join(", ");
 
   const prompt =
     `${NO_TEXT}\n\n` +
-    `TASK: draw ONE brand-new comic panel illustrating the story caption below.\n\n` +
-    `CAST SHEET (attached reference image): a labelled roster showing the ` +
-    `characters that have a reference photo in this game. Each is a numbered ` +
-    `tile with their name printed beneath. Roster:\n${rosterLines}${extrasNote}\n\n` +
+    `TASK: draw ONE brand-new comic panel illustrating the scene below.\n\n` +
+    `${FICTIONAL_NOTE}\n\n` +
+    `CHARACTER GUIDE (match these features precisely):\n${guide}\n\n` +
+    `A cast sheet is attached: each tile shows one character with their label ` +
+    `printed beneath. Use it together with the feature descriptions above.\n\n` +
     `IDENTITY RULES (highest priority):\n` +
-    `  • For every roster character, copy their distinctive features EXACTLY ` +
-    `from their tile (hair, face, skin tone, glasses, facial hair, notable ` +
-    `clothing). They must be instantly recognisable as themselves.\n` +
-    `  • Do NOT invent new characters in place of a roster character, do NOT ` +
-    `swap features between people, do NOT replace anyone with a random person.\n` +
-    `  • Every named character listed here MUST appear in the panel: ${emphaticList}.\n` +
-    `  • If the panel cannot comfortably fit everyone at close-up scale, use ` +
-    `a wider composition — never omit any of ${allNames.join(", ") || "the characters"}.\n\n` +
-    `SCENE: ${caption}\n\n` +
+    `  • Draw each character to match BOTH their cast-sheet tile AND their ` +
+    `feature description exactly (age/build, skin tone, hair, facial hair, ` +
+    `glasses, notable clothing). Keep them consistent across panels.\n` +
+    `  • Do NOT swap features between characters, do NOT merge them, do NOT ` +
+    `replace anyone with a random or famous-looking person.\n` +
+    `  • Every character listed MUST appear in the panel: ${labelList}.\n` +
+    `  • Prefer a wider composition over leaving anyone out.\n\n` +
+    `SCENE: ${sceneWithLabels}\n\n` +
     `STYLE: ${PANEL_STYLE}. This is a NEW illustration, not a re-crop or ` +
     `re-style of the reference sheet.\n\n` +
     `${NO_TEXT}`;
@@ -325,7 +371,7 @@ async function generatePanelImage(
     // fall through to text generation below
   }
 
-  return generatePanelFromText(buildSceneDescription(caption, characters), characters);
+  return generatePanelFromTextCast(sceneWithLabels, cast);
 }
 
 /**
