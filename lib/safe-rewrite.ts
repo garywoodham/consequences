@@ -59,12 +59,13 @@ export type SafeRewriteItem = { caption: string; names: string[] };
 
 /** All required names appear (case-insensitively) as whole-word matches. */
 function preservesNames(rewrite: string, names: string[]): boolean {
-  const lower = rewrite.toLowerCase();
   return names.every((n) => {
-    const needle = n.trim().toLowerCase();
+    const needle = n.trim();
     if (!needle) return true;
-    const re = new RegExp(`\\b${needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
-    return re.test(lower);
+    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // Unicode-aware boundaries so names like "Beyoncé" match correctly.
+    const re = new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "iu");
+    return re.test(rewrite);
   });
 }
 
