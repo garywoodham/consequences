@@ -362,6 +362,20 @@ const FICTIONAL_NOTE =
   "identifiable individuals — draw an original cartoon character that matches " +
   "the described features. Keep each character's look identical in every panel.";
 
+/**
+ * Guarantee the scene text references every character, so that even after the
+ * caption has been softened on a moderation retry (which can shift the focus
+ * onto one person) the image still contains everyone.
+ */
+function ensureAllPresent(scene: string, cast: PanelCharacter[]): string {
+  if (cast.length <= 1) return scene;
+  const labels = cast.map((c) => c.label);
+  return (
+    `${scene} (This panel must include ALL of ${labels.join(", ")} together, ` +
+    `each drawn to their own description above — do not drop or merge anyone.)`
+  );
+}
+
 /** Build the "CHARACTER GUIDE" block describing each character by features. */
 function buildCharacterGuide(cast: PanelCharacter[], withCastSheet: boolean): string {
   return cast
@@ -394,8 +408,9 @@ async function generatePanelFromTextCast(
       `All of these characters (${labelList}) must appear in the panel doing ` +
       `exactly what the scene says; do not swap or omit anyone.\n\n`
     : "";
+  const scene = ensureAllPresent(sceneWithLabels, cast);
   const prompt =
-    `${NO_TEXT}\n\n${guideBlock}SCENE: ${sceneWithLabels}\n\n` +
+    `${NO_TEXT}\n\n${guideBlock}SCENE: ${scene}\n\n` +
     `STYLE: ${PANEL_STYLE}.\n\n${NO_TEXT}`;
 
   try {
@@ -462,6 +477,7 @@ async function generatePanelImage(
   const castSheetBlob = new Blob([new Uint8Array(castSheetBuf)], { type: "image/png" });
   const guide = buildCharacterGuide(cast, true);
   const labelList = cast.map((c) => c.label).join(", ");
+  const scene = ensureAllPresent(sceneWithLabels, cast);
 
   const prompt =
     `${NO_TEXT}\n\n` +
@@ -476,9 +492,10 @@ async function generatePanelImage(
     `glasses, notable clothing). Keep them consistent across panels.\n` +
     `  • Do NOT swap features between characters, do NOT merge them, do NOT ` +
     `replace anyone with a random or famous-looking person.\n` +
-    `  • Every character listed MUST appear in the panel: ${labelList}.\n` +
+    `  • EVERY character listed MUST appear in the panel, even if the scene ` +
+    `sentence only names some of them: ${labelList}.\n` +
     `  • Prefer a wider composition over leaving anyone out.\n\n` +
-    `SCENE: ${sceneWithLabels}\n\n` +
+    `SCENE: ${scene}\n\n` +
     `STYLE: ${PANEL_STYLE}. This is a NEW illustration, not a re-crop or ` +
     `re-style of the reference sheet.\n\n` +
     `${NO_TEXT}`;
