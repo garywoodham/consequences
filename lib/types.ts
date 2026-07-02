@@ -49,6 +49,13 @@ export type Story = {
   id: string;
   lines: StoryLine[];
   prose: string;
+  /**
+   * The named characters mentioned by name in the story text (typically
+   * "Person 1" and "Person 2" from the name prompts). Each carries an avatar
+   * if the typed name matched a player in the game — this is what the comic
+   * generator uses to draw the right people in each panel.
+   */
+  characters: ComicCharacter[];
   /** AI-polished version of the prose (when the polish toggle is on). */
   tidyProse?: string;
   comic?: ComicStripData;

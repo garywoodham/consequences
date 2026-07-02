@@ -1,5 +1,5 @@
 import { getTemplateById } from "./prompts";
-import type { Player, Story, StoryLine } from "./types";
+import type { ComicCharacter, Player, Story, StoryLine } from "./types";
 
 function shuffle<T>(array: T[]): T[] {
   const result = [...array];
@@ -90,10 +90,43 @@ export function buildMixedStories(
       playerAvatarUrl: player.avatarUrl,
     }));
 
+    const characters = buildStoryCharacters(names, activePlayers);
+
     return {
       id: `story-${storyIndex + 1}`,
       lines,
       prose: buildProse(lines),
+      characters,
     };
   });
+}
+
+/**
+ * Resolve the character names that appear in the story (person1/person2) into
+ * `ComicCharacter` entries carrying their photo when a name matches a player
+ * in the game (case-insensitive whole-name match). This is what the comic
+ * generator needs so every image actually shows the right people.
+ */
+function buildStoryCharacters(
+  names: NameValues,
+  players: Player[]
+): ComicCharacter[] {
+  const uniqueNames = [names.person1, names.person2].filter(
+    (n): n is string => Boolean(n && n.trim())
+  );
+  const seen = new Set<string>();
+  const characters: ComicCharacter[] = [];
+  for (const rawName of uniqueNames) {
+    const name = rawName.trim();
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const match = players.find((p) => p.name.trim().toLowerCase() === key);
+    characters.push({
+      id: match?.id ?? `character-${key}`,
+      name,
+      imageUrl: match?.avatarUrl,
+    });
+  }
+  return characters;
 }
