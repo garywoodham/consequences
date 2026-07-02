@@ -670,11 +670,15 @@ export async function buildComic(
   // Overall wall-clock deadline for the whole request (panels run in
   // parallel and share this clock). Caricature generation above has already
   // consumed some of it. We only start a new image attempt while there is
-  // enough time left to plausibly finish one, so a slow/refused panel can't
-  // push the response past the browser/tunnel window (~100s for Cloudflare
-  // quick tunnels). Panels that run out of time render as a photo fallback.
-  const OVERALL_DEADLINE_MS = 92_000;
-  const MIN_ATTEMPT_MS = 16_000;
+  // enough time left to plausibly finish one, so a stuck/refused panel can't
+  // run unbounded. gpt-image-1 edits at quality:"medium" take ~30s each, and
+  // the caricature step alone can eat ~50s, so this must be generous enough
+  // that the raw retry and the softening ladder actually get a chance to run
+  // for edgy captions. The route's maxDuration is 300s and tunnels tolerate
+  // well over 100s, so 180s leaves room for several attempts per panel while
+  // still bounding the request.
+  const OVERALL_DEADLINE_MS = 180_000;
+  const MIN_ATTEMPT_MS = 20_000;
   const deadline = buildStart + OVERALL_DEADLINE_MS;
   const canAttempt = () => Date.now() < deadline - MIN_ATTEMPT_MS;
 
