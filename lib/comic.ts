@@ -91,6 +91,9 @@ export async function generateCaricature(imageUrl: string): Promise<string | nul
     );
     form.append("size", "1024x1024");
     form.append("quality", "medium");
+    // Least-restrictive filtering — suits an adults-only party game (still
+    // blocks the hard-disallowed categories).
+    form.append("moderation", "low");
 
     const res = await fetch("https://api.openai.com/v1/images/edits", {
       method: "POST",
@@ -124,6 +127,7 @@ async function generatePanelFromText(scene: string, characters: ComicCharacter[]
         prompt: `${scene}${cast} ${NO_TEXT}`,
         size: "1024x1024",
         quality: "low",
+        moderation: "low",
         n: 1,
       }),
     });
@@ -173,6 +177,7 @@ async function generatePanelImage(scene: string, characters: ComicCharacter[]): 
     );
     form.append("size", "1024x1024");
     form.append("quality", "low");
+    form.append("moderation", "low");
 
     const res = await fetch("https://api.openai.com/v1/images/edits", {
       method: "POST",
