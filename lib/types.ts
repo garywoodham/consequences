@@ -27,6 +27,12 @@ export type ComicCharacter = {
   name: string;
   /** Image used to represent the character (caricature, else avatar). */
   imageUrl?: string;
+  /**
+   * Detailed physical description generated once up front from the player's
+   * photo. This — not the name — is what anchors the character's look in the
+   * image prompts, and it's surfaced in the UI for review.
+   */
+  description?: string;
 };
 
 export type StoryPanel = {
@@ -43,6 +49,12 @@ export type ComicStripData = {
   panels: StoryPanel[];
   /** "ai" when illustrated by an image model, "photo" for the no-key fallback. */
   mode: "ai" | "photo";
+  /**
+   * The full story cast with the feature descriptions passed to the image
+   * model (names are NOT sent to the image model, but are kept here so the
+   * descriptions can be reviewed against who they belong to in the UI).
+   */
+  cast?: ComicCharacter[];
 };
 
 export type Story = {

@@ -136,6 +136,28 @@ export async function generateCaricature(imageUrl: string): Promise<string | nul
  * original cartoon character rather than trying to depict a real/known person.
  * Cheap gpt-4o-mini call; returns "" on any failure.
  */
+const DESCRIBE_SYSTEM_PROMPT =
+  "You are a character-design assistant creating a MODEL SHEET so another " +
+  "artist can redraw this exact cartoon character consistently from words " +
+  "alone, without ever seeing the picture. Study the image and output a " +
+  "single dense description covering EVERY field below (skip a field only if " +
+  "genuinely not visible). Be specific and concrete — say 'short wavy auburn " +
+  "hair swept to the right', not just 'brown hair'.\n\n" +
+  "Fields, in this order, as one flowing comma-separated description:\n" +
+  "• Perceived gender presentation and approximate age range\n" +
+  "• Build / body type\n" +
+  "• Skin tone\n" +
+  "• Face shape and notable facial structure (jaw, cheeks, nose)\n" +
+  "• Hair: colour, length, texture, style/parting (or bald)\n" +
+  "• Eyebrows and eye colour/shape\n" +
+  "• Facial hair (style + colour) or clean-shaven\n" +
+  "• Glasses/accessories (shape, colour) if any\n" +
+  "• Distinctive marks (freckles, dimples, moles, etc.)\n" +
+  "• Notable clothing (colour + type) and any headwear\n\n" +
+  "Rules: 45-75 words, physical appearance ONLY. Do NOT name, guess, or refer " +
+  "to any real or famous person. No preamble, no bullet characters — just the " +
+  "description sentence(s).";
+
 async function describeCaricature(dataUrl: string): Promise<string> {
   if (!OPENAI_API_KEY || !dataUrl.startsWith("data:image")) return "";
   try {
@@ -148,27 +170,18 @@ async function describeCaricature(dataUrl: string): Promise<string> {
       body: JSON.stringify({
         model: "gpt-4o-mini",
         messages: [
-          {
-            role: "system",
-            content:
-              "You are a character-design assistant. Describe this cartoon character so " +
-              "another artist could redraw a matching original character WITHOUT seeing " +
-              "the picture. Give ONE compact comma-separated list of concrete visual " +
-              "features, in this order when visible: approximate age range and build, " +
-              "skin tone, hair (colour, length, style), facial hair, eye colour, glasses " +
-              "or accessories, and any notable clothing. 25-40 words. Only physical " +
-              "features — do NOT name or guess who the person is, and no preamble.",
-          },
+          { role: "system", content: DESCRIBE_SYSTEM_PROMPT },
           {
             role: "user",
             content: [
-              { type: "text", text: "Describe this character's appearance:" },
-              { type: "image_url", image_url: { url: dataUrl } },
+              { type: "text", text: "Create the model-sheet description for this character:" },
+              { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
             ],
           },
         ],
-        temperature: 0.3,
-        max_tokens: 140,
+        // Deterministic so the same photo yields the same description every run.
+        temperature: 0,
+        max_tokens: 260,
       }),
     });
     if (!res.ok) return "";
@@ -399,34 +412,42 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
     }))
   );
 
-  // Caricature each unique player photo once, and ask a vision LLM to
-  // describe the caricature so we have both a visual AND textual fingerprint
-  // of every character to anchor identity across panels.
+  // STEP 1 — up front, lock in every named character's identity: caricature
+  // each unique player photo once and generate a detailed feature description
+  // from it. Descriptions are keyed by character id (which maps 1:1 to the
+  // story name) and reused verbatim in every panel so the look stays
+  // consistent. This is the single source of truth for how each person looks.
+  const storyCast = resolveStoryCast(story, scripted);
   const caricatureCache = new Map<string, string | null>();
   const descriptionCache = new Map<string, string>();
-  const uniqueAvatars = new Map<string, string>();
-  for (const panel of scripted) {
-    for (const c of panel.characters) {
-      if (c.imageUrl && !uniqueAvatars.has(c.id)) {
-        uniqueAvatars.set(c.id, c.imageUrl);
-      }
-    }
-  }
+
   await Promise.all(
-    [...uniqueAvatars.entries()].map(async ([id, url]) => {
-      const caricature = await generateCaricature(url);
-      caricatureCache.set(id, caricature);
-      if (caricature) {
-        descriptionCache.set(id, await describeCaricature(caricature));
-      }
-    })
+    storyCast
+      .filter((c) => c.imageUrl)
+      .map(async (c) => {
+        const caricature = await generateCaricature(c.imageUrl as string);
+        caricatureCache.set(c.id, caricature);
+        if (caricature) {
+          descriptionCache.set(c.id, await describeCaricature(caricature));
+        }
+      })
   );
+
+  // The cast list returned to the client for review: name + the exact
+  // description that will be handed to the image model (names are not).
+  const cast: ComicCharacter[] = storyCast.map((c) => ({
+    id: c.id,
+    name: c.name,
+    imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
+    description: descriptionCache.get(c.id) ?? "",
+  }));
 
   const panels: StoryPanel[] = await Promise.all(
     scripted.map(async (panel, i) => {
       const characters = panel.characters.map((c) => ({
         ...c,
         imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
+        description: descriptionCache.get(c.id) ?? c.description ?? "",
       }));
       const names = panel.characters.map((c) => c.name);
       let caption = safeCaptions[i] ?? panel.caption;
@@ -462,5 +483,28 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
 
   // If image generation failed across the board, present as a photo strip.
   const anyImages = panels.some((p) => p.imageUrl);
-  return { mode: anyImages ? "ai" : "photo", panels };
+  return { mode: anyImages ? "ai" : "photo", panels, cast };
+}
+
+/**
+ * The canonical cast for a story: prefer story.characters (the person1/person2
+ * names matched to players), falling back to the distinct characters that
+ * appear across the scripted panels.
+ */
+function resolveStoryCast(
+  story: Story,
+  scripted: Omit<StoryPanel, "imageUrl">[]
+): ComicCharacter[] {
+  const byId = new Map<string, ComicCharacter>();
+  for (const c of story.characters ?? []) {
+    if (!byId.has(c.id)) byId.set(c.id, c);
+  }
+  if (byId.size === 0) {
+    for (const panel of scripted) {
+      for (const c of panel.characters) {
+        if (!byId.has(c.id)) byId.set(c.id, c);
+      }
+    }
+  }
+  return [...byId.values()];
 }
