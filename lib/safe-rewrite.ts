@@ -13,63 +13,61 @@ const BASE_RULES =
   "rewrite spelled EXACTLY as given, in the same role/position it had in the " +
   "original caption. Do not replace names with pronouns, roles ('the man'), " +
   "or different names, and do not swap who is doing what.\n" +
-  "2. Preserve every setting and story beat, and the humour.\n" +
-  "3. Roughly the same length as the input, one caption per input.\n" +
-  "4. No moralising, apologies or explanations.\n";
+  "2. Preserve every setting, story beat and adult humour.\n" +
+  "3. KEEP AS MUCH OF THE ORIGINAL WORDING AS POSSIBLE. Only touch the " +
+  "specific phrase that would trip an image filter — everything else stays " +
+  "verbatim.\n" +
+  "4. Do NOT lengthen the caption. Keep it about the same length or shorter.\n" +
+  "5. No moralising, apologies, disclaimers or explanations.\n";
 
 const LEVEL_INSTRUCTIONS: Record<SanitizeLevel, string> = {
+  // Level 0 is the DEFAULT. We only reach this level for captions that a
+  // heuristic pre-filter flagged as likely to be refused. Everything else is
+  // passed through untouched by the sanitiser. So Level 0 can afford to stay
+  // spicy: we're already dealing with edgy captions and we want to preserve as
+  // much of the original punch as possible.
   0:
-    "You are the image-safety pass for an ADULT party game. The story is " +
-    "crude and cheeky and readers see the raw caption; you are only adjusting " +
-    "what the image model sees. DO NOT turn adult humour into a children's " +
-    "cartoon. If the caption is already image-safe, return it UNCHANGED.\n\n" +
-    "TECHNIQUE — IMPLY THROUGH AFTERMATH & CONTEXT.\n" +
-    "The reliable way to pass image safety is to describe the AFTERMATH, " +
-    "MOOD, or SURROUNDING CONTEXT that makes it OBVIOUS what happened — " +
-    "without showing the act itself. Keep it adult. Do not depict the " +
-    "moment of sex, nudity, drug use, or graphic violence directly.\n\n" +
-    "Examples of the RIGHT level of softening (aftermath / context style):\n" +
-    "  • 'Alice and Bob had sex' → 'Alice and Bob lying in bed together " +
-    "afterwards, tangled in the sheets, both sweating and looking blissfully " +
-    "satisfied, clothes strewn on the floor'\n" +
-    "  • 'Bob got completely naked' → 'Bob standing beside a heap of his " +
-    "own discarded clothes, holding a strategically placed potted plant in " +
-    "front of himself, bare shoulders and legs visible'\n" +
-    "  • 'Kim gave Sara oral sex' → 'Sara sitting on the sofa with a rapturous " +
-    "expression, biting her lip, Kim just visible below the frame, only the " +
-    "top of Kim's head showing above Sara's lap'\n" +
-    "  • 'Dave shot Kim with a rifle' → 'Kim collapsed dramatically on the " +
-    "ground with cartoon X-eyes and comic-book stars circling, Dave standing " +
-    "over her clutching a smoking cartoon rifle, wisps of smoke curling off'\n" +
-    "  • 'Sara did lines of cocaine' → 'Sara wild-eyed with spiral pupils and " +
-    "a manic grin, dust of glittery white powder on her nose, an empty mirror " +
-    "and rolled-up note on the table'\n" +
-    "  • 'They got smashed on tequila' → 'Alice and Bob slumped against each " +
-    "other on a stool, cheeks flushed, empty shot glasses stacked in a tower " +
-    "in front of them'\n" +
+    "You are the minimal image-safety pass for an ADULT party game. Players " +
+    "wrote something adult and it will show verbatim under the picture — you " +
+    "only tweak the phrase that would upset the image model, and leave " +
+    "everything else alone. Prefer surgically swapping ONE phrase for a " +
+    "cheeky adult euphemism of similar length.\n\n" +
+    "GOOD (surgical) rewrites — notice they keep the sentence structure:\n" +
+    "  • 'Alice and Bob had sex on the sofa'\n" +
+    "      → 'Alice and Bob got busy under a blanket on the sofa'\n" +
+    "  • 'Bob got completely naked in the kitchen'\n" +
+    "      → 'Bob stripped down to just an apron in the kitchen'\n" +
+    "  • 'Kim went down on Sara at the party'\n" +
+    "      → 'Kim disappeared under Sara\\'s skirt at the party'\n" +
+    "  • 'Dave shot Kim in the face with a rifle'\n" +
+    "      → 'Dave blasted Kim in the face with a cartoon pop-gun'\n" +
+    "  • 'Sara snorted a huge line of cocaine'\n" +
+    "      → 'Sara snorted a huge line of sherbet powder'\n" +
+    "  • 'They got absolutely wasted on tequila'\n" +
+    "      → 'They got absolutely plastered on tequila, empty glasses everywhere'\n" +
     "\n" +
-    "Rule of thumb: SHOW WHAT HAPPENED BEFORE OR AFTER, not the act itself. " +
-    "Use body language, expressions, environment and props to make the " +
-    "outcome unmistakable.",
+    "Bad — do NOT do this:\n" +
+    "  ✗ Turning a one-line caption into three sentences of aftermath.\n" +
+    "  ✗ Making it wholesome, kid-friendly, or generically 'whimsical'.\n" +
+    "  ✗ Dropping or paraphrasing the character names.\n" +
+    "  ✗ Rewriting phrases that are already fine (leave them exactly as they " +
+    "    are).\n" +
+    "If the caption already reads image-safe, RETURN IT UNCHANGED.",
   1:
-    "STRONGER RETRY. Your last attempt was still refused by the image " +
-    "model. Push the aftermath/context technique further — remove any " +
-    "residual reference to the explicit act itself and rely entirely on " +
-    "visible clues.\n\n" +
+    "STRONGER RETRY. The image model still refused. Move slightly further " +
+    "from the explicit act itself but stay adult in tone. Prefer describing " +
+    "the aftermath, mood or props (rumpled sheets, empty bottles, dramatic " +
+    "cartoon reactions) rather than the act itself. Keep the caption short " +
+    "and every required name must appear verbatim.\n\n" +
     "Examples:\n" +
-    "  • 'Alice and Bob had sex' → 'Alice and Bob sitting on the edge of a " +
-    "rumpled bed side by side, both wrapped in a single duvet, hair " +
-    "dishevelled, sharing a knowing satisfied smile'\n" +
-    "  • 'Bob got naked' → 'Bob in a skin-toned bodysuit with his entire " +
-    "body slightly blurred to imply he is naked, everyone around him " +
-    "reacting with shocked exaggerated expressions'\n" +
-    "  • 'Dave shot Kim' → 'Kim theatrically fainting backwards with " +
-    "cartoon X-eyes, Dave in a slapstick pose holding a comic-book pop-gun " +
-    "with a small \"BANG\" flag popping out (no letters/writing on flag)'\n" +
-    "  • 'Sara did cocaine' → 'Sara wild-eyed and buzzing with cartoon " +
-    "jitter-lines around her head, empty mirror on the table'\n" +
-    "\n" +
-    "Every required name MUST still appear verbatim.",
+    "  • 'Alice and Bob had sex'\n" +
+    "      → 'Alice and Bob tangled in the duvet afterwards, both flushed'\n" +
+    "  • 'Bob got naked'\n" +
+    "      → 'Bob wearing only a strategically placed cushion, clothes on the floor'\n" +
+    "  • 'Dave shot Kim'\n" +
+    "      → 'Kim collapsed with cartoon X-eyes and stars, Dave holding a smoking pop-gun'\n" +
+    "  • 'Sara did cocaine'\n" +
+    "      → 'Sara wild-eyed with spiral pupils, dust on her nose'\n",
   2:
     "LAST RETRY. Both previous attempts were rejected. Fall back to a very " +
     "gentle whimsical cartoon depiction of the same story beat that at " +
@@ -98,6 +96,79 @@ export function hasSafeRewriteProvider(): boolean {
 }
 
 export type SafeRewriteItem = { caption: string; names: string[] };
+
+/**
+ * Heuristic: is this caption likely to trip image-model moderation? We only
+ * touch obviously spicy captions so that mild ones (which are the majority)
+ * reach the image model untouched with all their original flavour intact.
+ */
+const TRIGGER_PATTERNS: RegExp[] = [
+  // Nudity / sex acts
+  /\bnaked\b/i,
+  /\bnude\b/i,
+  /\bstark naked\b/i,
+  /\bin the nude\b/i,
+  /\btopless\b/i,
+  /\bbottomless\b/i,
+  /\bstrip(ped|ping)?\b/i,
+  /\bsex\b/i,
+  /\bhad sex\b/i,
+  /\bhaving sex\b/i,
+  /\bmaking love\b/i,
+  /\bshag(ged|ging)?\b/i,
+  /\bbon(k|ked|king)\b/i,
+  /\bfuck(ed|ing|s)?\b/i,
+  /\bblowjob\b/i,
+  /\bblow job\b/i,
+  /\bhandjob\b/i,
+  /\bgoing down on\b/i,
+  /\bwent down on\b/i,
+  /\borgasm(s|ed|ing)?\b/i,
+  /\bmasturbat\w+/i,
+  /\bwank(ed|ing)?\b/i,
+  /\bboob(s|ies)?\b/i,
+  /\btits?\b/i,
+  /\bnipples?\b/i,
+  /\bpenis\b/i,
+  /\bcock\b/i,
+  /\bdick\b/i,
+  /\bvagina\b/i,
+  /\bpussy\b/i,
+  /\barse\b/i,
+  /\bass(hole)?\b/i,
+  /\bbutthole\b/i,
+
+  // Drugs
+  /\bcocaine\b/i,
+  /\bcoke\b/i,
+  /\bheroin\b/i,
+  /\bmeth\b/i,
+  /\bcrack\b/i,
+  /\becstasy\b/i,
+  /\bmdma\b/i,
+  /\bketamine\b/i,
+  /\bsnort(ed|ing)?\b/i,
+  /\binject(ed|ing)?\b/i,
+  /\bshoot(ing)? up\b/i,
+
+  // Weapons / gore
+  /\bshot(gun|s)?\b/i,
+  /\bshot\b/i,
+  /\brifle\b/i,
+  /\bpistol\b/i,
+  /\bstab(bed|bing)?\b/i,
+  /\bmurder(ed|ing)?\b/i,
+  /\bkill(ed|ing)?\b/i,
+  /\bhang(ed|ing)?\b/i,
+  /\bstrangle(d|s)?\b/i,
+  /\bslit\b.*\bthroat\b/i,
+  /\bblood(y|ied)?\b/i,
+  /\bgore\b/i,
+];
+
+function mayNeedSanitizing(caption: string): boolean {
+  return TRIGGER_PATTERNS.some((re) => re.test(caption));
+}
 
 /** All required names appear (case-insensitively) as whole-word matches. */
 function preservesNames(rewrite: string, names: string[]): boolean {
@@ -143,7 +214,7 @@ async function callSanitizer(
           { role: "system", content: systemPrompt(level, retryDueToNameDrop) },
           { role: "user", content: JSON.stringify({ items }) },
         ],
-        temperature: 0.6,
+        temperature: 0.5,
       }),
     });
     if (!res.ok) return null;
@@ -163,9 +234,11 @@ async function callSanitizer(
 /**
  * Rewrite each caption to an image-safe version at the given escalation
  * `level` (0 = mildest, matches raw text closely; 2 = safest whimsical).
- * At the given level we still do an internal name-preservation retry, and
- * finally synthesise a name-preserving safe caption so downstream code
- * always sees valid captions with every required name.
+ *
+ * At Level 0 we ALSO pre-filter with a keyword heuristic and skip the LLM
+ * entirely for captions that look fine — this preserves the original edgy
+ * wording of most captions. At higher levels every caption is rewritten
+ * because we've already learnt that the image model refused it.
  */
 export async function sanitizeCaptionsForImage(
   items: SafeRewriteItem[],
@@ -173,10 +246,20 @@ export async function sanitizeCaptionsForImage(
 ): Promise<string[]> {
   if (!OPENAI_API_KEY || items.length === 0) return items.map((i) => i.caption);
 
-  const finalResults: (string | null)[] = items.map(() => null);
-  let pendingIndices: number[] = items.map((_, i) => i);
+  const finalResults: (string | null)[] = items.map((it, i) => {
+    if (level === 0 && !mayNeedSanitizing(it.caption)) {
+      // Caption doesn't contain any obvious trigger words — leave it alone.
+      return it.caption;
+    }
+    // Marked for rewrite. Placeholder overwritten below.
+    void i;
+    return null;
+  });
 
-  // First attempt at the requested level; up to one retry if names went missing.
+  let pendingIndices: number[] = finalResults
+    .map((v, i) => (v === null ? i : -1))
+    .filter((i) => i >= 0);
+
   for (let attempt = 0; attempt < 2 && pendingIndices.length > 0; attempt++) {
     const attemptItems = pendingIndices.map((i) => items[i]);
     const rewrites = await callSanitizer(attemptItems, level, attempt > 0);
