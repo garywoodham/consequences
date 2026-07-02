@@ -652,8 +652,13 @@ export async function buildComic(
     descriptionSource: descriptionSource.get(c.id),
   }));
 
+  // Cap total time per panel so a single slow/refused panel can't hold up
+  // the whole comic past the browser/tunnel budget. When the budget is spent
+  // we return whatever we have and let the panel render as a photo fallback.
+  const PANEL_BUDGET_MS = 75_000;
+
   const panels: StoryPanel[] = await Promise.all(
-    scripted.map(async (panel) => {
+    scripted.map(async (panel, panelIdx) => {
       const characters = panel.characters.map((c) => ({
         ...c,
         imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
@@ -663,44 +668,63 @@ export async function buildComic(
         .filter((c) => mentionsName(panel.caption, c.name))
         .map((c) => c.name);
 
-      // Push the crudest version FIRST: attempt the raw player caption
-      // unchanged (only names→labels). gpt-image-1 at moderation:"low" allows
-      // a lot of risqué content, and image moderation is somewhat
-      // non-deterministic — so we try the raw text (twice, to ride out flaky
-      // refusals) before softening anything. Only if the model still refuses
-      // do we walk down the softening ladder (0 = surgical swap, 1 =
-      // aftermath, 2 = whimsical), keeping the least-softened version that the
-      // model actually accepts.
+      const started = Date.now();
+      const timeLeft = () => PANEL_BUDGET_MS - (Date.now() - started);
+
+      // Attempt the raw player caption first (only names→labels), then walk
+      // the softening ladder if the image model refuses:
+      //   0 = surgical swap · 1 = aftermath · 2 = whimsical.
+      // We keep the least-softened version the model actually accepts.
       let caption = panel.caption;
-      let result = await generatePanelImage(
-        caption,
-        characters,
-        descriptionCache,
-        caricatureCache
-      );
-      if (!result.imageUrl) {
+      let result: { imageUrl: string | null; prompt: string } = {
+        imageUrl: null,
+        prompt: "",
+      };
+
+      {
+        const t0 = Date.now();
         result = await generatePanelImage(
           caption,
           characters,
           descriptionCache,
           caricatureCache
+        );
+        console.log(
+          `[comic] panel ${panelIdx} attempt=raw ` +
+            `imageOk=${Boolean(result.imageUrl)} ` +
+            `took=${Date.now() - t0}ms budget=${timeLeft()}ms`
         );
       }
 
       const levels: SanitizeLevel[] = [0, 1, 2];
       for (const level of levels) {
         if (result.imageUrl) break;
+        if (timeLeft() <= 0) break;
         const [softer] = await sanitizeCaptionsForImage(
           [{ caption: panel.caption, names }],
           level
         );
         if (!softer || softer === caption) continue;
         caption = softer;
+        const t0 = Date.now();
         result = await generatePanelImage(
           caption,
           characters,
           descriptionCache,
           caricatureCache
+        );
+        console.log(
+          `[comic] panel ${panelIdx} attempt=level${level} ` +
+            `imageOk=${Boolean(result.imageUrl)} ` +
+            `took=${Date.now() - t0}ms budget=${timeLeft()}ms`
+        );
+      }
+
+      if (!result.imageUrl) {
+        console.warn(
+          `[comic] panel ${panelIdx} exhausted attempts, ` +
+            `total=${Date.now() - started}ms ` +
+            `caption=${JSON.stringify(panel.caption.slice(0, 60))}`
         );
       }
 
