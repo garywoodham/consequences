@@ -1,5 +1,6 @@
 // Server-only module: reads OPENAI_API_KEY and calls external image APIs.
 import type { ComicCharacter, ComicStripData, Story, StoryLine, StoryPanel } from "./types";
+import { sanitizeCaptionsForImage } from "./safe-rewrite";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const CARICATURE_STYLE =
@@ -49,15 +50,23 @@ export function scriptPanels(story: Story): Omit<StoryPanel, "imageUrl">[] {
       }
     }
 
-    const sceneDescription =
-      `Illustrate this story moment: ${caption}` +
-      (characters.length
-        ? ` Featuring ${characters.map((c) => c.name).join(" and ")}.`
-        : "") +
-      ` Style: ${PANEL_STYLE}.`;
-
-    return { index, caption, sceneDescription, characters };
+    return {
+      index,
+      caption,
+      sceneDescription: buildSceneDescription(caption, characters),
+      characters,
+    };
   });
+}
+
+function buildSceneDescription(caption: string, characters: ComicCharacter[]): string {
+  return (
+    `Illustrate this story moment: ${caption}` +
+    (characters.length
+      ? ` Featuring ${characters.map((c) => c.name).join(" and ")}.`
+      : "") +
+    ` Style: ${PANEL_STYLE}.`
+  );
 }
 
 async function fetchAsBlob(url: string): Promise<Blob | null> {
@@ -211,6 +220,10 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
     };
   }
 
+  // Sanitise per-panel captions for the image model in one batched call.
+  // The original captions are kept for display below the panels.
+  const safeCaptions = await sanitizeCaptionsForImage(scripted.map((p) => p.caption));
+
   // Caricature each unique player photo once, reuse across panels.
   const caricatureCache = new Map<string, string | null>();
   const uniqueAvatars = new Map<string, string>();
@@ -228,12 +241,14 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
   );
 
   const panels: StoryPanel[] = await Promise.all(
-    scripted.map(async (panel) => {
+    scripted.map(async (panel, i) => {
       const characters = panel.characters.map((c) => ({
         ...c,
         imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
       }));
-      const imageUrl = await generatePanelImage(panel.sceneDescription, characters);
+      const safeCaption = safeCaptions[i] ?? panel.caption;
+      const imageScene = buildSceneDescription(safeCaption, characters);
+      const imageUrl = await generatePanelImage(imageScene, characters);
       return { ...panel, characters, imageUrl: imageUrl ?? undefined };
     })
   );
