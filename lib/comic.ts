@@ -95,13 +95,18 @@ export function scriptPanels(story: Story): Omit<StoryPanel, "imageUrl">[] {
       .replace(/\s+/g, " ")
       .trim();
 
-    // ALWAYS include every named story character in every panel, so each
-    // character's description is passed to the image model for all panels
-    // (keeps the whole cast consistent, never dropping anyone). Only legacy
-    // stories with no resolved cast fall back to the panel's line authors.
+    // Draw exactly the characters NAMED in this panel's caption. Anchoring by
+    // mention (rather than forcing the whole cast into every panel) is what
+    // keeps multiplayer comics coherent: a panel about two people shows just
+    // those two, each drawn from their own photo/description, instead of the
+    // model inventing or swapping in everyone else. When a panel names no one
+    // (e.g. a scene-setting line), fall back to the story's leads so the
+    // protagonists still appear. Legacy stories with no resolved cast fall
+    // back to the panel's line authors.
     let characters: ComicCharacter[];
     if (storyCast.length > 0) {
-      characters = storyCast;
+      const mentioned = storyCast.filter((c) => mentionsName(caption, c.name));
+      characters = mentioned.length > 0 ? mentioned : storyCast.slice(0, 2);
     } else {
       characters = [];
       for (const line of group) {
