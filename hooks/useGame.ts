@@ -75,6 +75,7 @@ export function useGame({ roomId, session }: UseGameOptions) {
         avatarUrl: session.avatarUrl,
         isHost: session.isHost,
         templateId: session.templateId,
+        tidyEnabled: session.tidyEnabled,
       } satisfies ClientMessage)
     );
 
@@ -98,6 +99,11 @@ export function useGame({ roomId, session }: UseGameOptions) {
     [send]
   );
   const playAgain = useCallback(() => send({ type: "play-again" }), [send]);
+  const submitTidy = useCallback(
+    (tidied: { id: string; tidyProse: string }[]) =>
+      send({ type: "set-tidy", stories: tidied }),
+    [send]
+  );
 
   return {
     state,
@@ -106,5 +112,6 @@ export function useGame({ roomId, session }: UseGameOptions) {
     startGame,
     submitAnswers,
     playAgain,
+    submitTidy,
   };
 }

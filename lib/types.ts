@@ -27,6 +27,17 @@ export type ComicCharacter = {
   name: string;
   /** Image used to represent the character (caricature, else avatar). */
   imageUrl?: string;
+  /**
+   * Detailed physical description generated once up front. This — not the
+   * name — is what anchors the character's look in the image prompts, and it's
+   * surfaced in the UI for review.
+   */
+  description?: string;
+  /**
+   * Where the description came from: "photo" (from an uploaded picture) or
+   * "web" (looked up online for a recognised public figure typed as a name).
+   */
+  descriptionSource?: "photo" | "web";
 };
 
 export type StoryPanel = {
@@ -37,18 +48,39 @@ export type StoryPanel = {
   characters: ComicCharacter[];
   /** Generated panel illustration (filled when an image provider is configured). */
   imageUrl?: string;
+  /**
+   * The full text prompt actually sent to the image model for this panel
+   * (after safe-rewrite + name→label substitution). Surfaced in the UI so the
+   * exact instruction behind each image can be reviewed.
+   */
+  imagePrompt?: string;
 };
 
 export type ComicStripData = {
   panels: StoryPanel[];
   /** "ai" when illustrated by an image model, "photo" for the no-key fallback. */
   mode: "ai" | "photo";
+  /**
+   * The full story cast with the feature descriptions passed to the image
+   * model (names are NOT sent to the image model, but are kept here so the
+   * descriptions can be reviewed against who they belong to in the UI).
+   */
+  cast?: ComicCharacter[];
 };
 
 export type Story = {
   id: string;
   lines: StoryLine[];
   prose: string;
+  /**
+   * The named characters mentioned by name in the story text (typically
+   * "Person 1" and "Person 2" from the name prompts). Each carries an avatar
+   * if the typed name matched a player in the game — this is what the comic
+   * generator uses to draw the right people in each panel.
+   */
+  characters: ComicCharacter[];
+  /** AI-polished version of the prose (when the polish toggle is on). */
+  tidyProse?: string;
   comic?: ComicStripData;
 };
 
@@ -56,6 +88,8 @@ export type GameState = {
   roomCode: string;
   hostId: string;
   templateId: string;
+  /** When true, stories are polished into readable sentences by AI on reveal. */
+  tidyEnabled: boolean;
   phase: GamePhase;
   players: Player[];
   submissions: Record<string, Record<string, string>>;
@@ -70,11 +104,13 @@ export type ClientMessage =
       avatarUrl?: string;
       isHost?: boolean;
       templateId?: string;
+      tidyEnabled?: boolean;
     }
   | { type: "start" }
   | { type: "submit"; answers: Record<string, string> }
   | { type: "play-again" }
-  | { type: "seed-sample" };
+  | { type: "seed-sample" }
+  | { type: "set-tidy"; stories: { id: string; tidyProse: string }[] };
 
 export type ServerMessage =
   | { type: "state"; state: GameState }
@@ -84,6 +120,7 @@ export const EMPTY_GAME_STATE: GameState = {
   roomCode: "",
   hostId: "",
   templateId: "classic",
+  tidyEnabled: false,
   phase: "lobby",
   players: [],
   submissions: {},

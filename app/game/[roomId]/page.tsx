@@ -34,10 +34,11 @@ export default function GamePage() {
     }
   }, [session, roomId, router]);
 
-  const { state, error, connected, startGame, submitAnswers, playAgain } = useGame({
-    roomId,
-    session,
-  });
+  const { state, error, connected, startGame, submitAnswers, playAgain, submitTidy } =
+    useGame({
+      roomId,
+      session,
+    });
 
   if (!session) {
     return (
@@ -96,6 +97,7 @@ export default function GamePage() {
           state={state}
           isHost={isHost}
           onPlayAgain={playAgain}
+          onSubmitTidy={submitTidy}
         />
       )}
     </div>

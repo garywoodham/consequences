@@ -7,6 +7,8 @@ export type GameSession = {
   roomCode: string;
   /** When true, the room is auto-populated with sample players + stories. */
   sample?: boolean;
+  /** Host preference: polish story wording with AI on reveal. */
+  tidyEnabled?: boolean;
 };
 
 const SESSION_KEY = "consequences-session";

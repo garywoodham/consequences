@@ -1,5 +1,5 @@
 import { getTemplateById } from "./prompts";
-import type { Player, Story, StoryLine } from "./types";
+import type { ComicCharacter, Player, Story, StoryLine } from "./types";
 
 function shuffle<T>(array: T[]): T[] {
   const result = [...array];
@@ -15,43 +15,30 @@ function capitalizeFirst(text: string): string {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
-function formatLine(text: string, prefix?: string): string {
-  const trimmed = text.trim();
-  if (!prefix) return capitalizeFirst(trimmed);
+type NameValues = { person1?: string; person2?: string };
 
-  const lowerPrefix = prefix.toLowerCase();
-  if (lowerPrefix === "met" || lowerPrefix === "at" || lowerPrefix === "to") {
-    return `${prefix} ${trimmed}`;
-  }
-
-  return `${prefix} ${trimmed.charAt(0).toLowerCase() + trimmed.slice(1)}`;
+/** Render a prompt's answer into its story segment, filling in name placeholders. */
+function renderSegment(segment: string, answer: string, names: NameValues): string {
+  return segment
+    .replace(/\{answer\}/g, answer.trim())
+    .replace(/\{person1\}/g, names.person1 ?? "they")
+    .replace(/\{person2\}/g, names.person2 ?? "they")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-const CONNECTOR_PREFIXES = ["met", "at", "to"];
-
-/** Format a single segment as it appears within the flowing story. */
-function buildSegment(text: string, prefix: string | undefined, index: number): string {
-  const formatted = formatLine(text, prefix);
-
-  if (index <= 1) {
-    return formatted;
-  }
-  if (prefix && CONNECTOR_PREFIXES.includes(prefix.toLowerCase())) {
-    return formatted;
-  }
-  if (prefix) {
-    return formatted + ".";
-  }
-  return capitalizeFirst(text.trim()) + ".";
-}
-
+/** Join rendered segments into a single, readable paragraph. */
 function buildProse(lines: StoryLine[]): string {
-  return lines
+  const joined = lines
     .map((line) => line.display)
     .join(" ")
     .replace(/\s+/g, " ")
-    .replace(/\.\./g, ".")
+    .replace(/\s+([.,!?])/g, "$1") // no space before punctuation
+    .replace(/([.!?])\1+/g, "$1") // collapse repeated terminators (".." -> ".")
+    .replace(/([”"'’])\./g, "$1") // drop a stray period right after a closing quote
+    .replace(/\.\s*\./g, ".")
     .trim();
+  return capitalizeFirst(joined);
 }
 
 function pickPlayerOrder(players: Player[], storyIndex: number): Player[] {
@@ -76,24 +63,70 @@ export function buildMixedStories(
 
   return Array.from({ length: storyCount }, (_, storyIndex) => {
     const playerOrder = pickPlayerOrder(activePlayers, storyIndex);
-    const lines: StoryLine[] = template.prompts.map((prompt, promptIndex) => {
+
+    // First pass: assign a contributing player (and their answer) to each prompt.
+    const assigned = template.prompts.map((prompt, promptIndex) => {
       const player = playerOrder[promptIndex % playerOrder.length];
-      const text = submissions[player.id]?.[prompt.id] ?? "...";
-      return {
-        promptId: prompt.id,
-        promptLabel: prompt.label,
-        text,
-        display: buildSegment(text, prompt.prefix, promptIndex),
-        playerId: player.id,
-        playerName: player.name,
-        playerAvatarUrl: player.avatarUrl,
-      };
+      const rawText = submissions[player.id]?.[prompt.id] ?? "...";
+      const text = prompt.type === "name" ? capitalizeFirst(rawText.trim()) : rawText;
+      return { prompt, player, text };
     });
+
+    // Resolve the two character names from the name prompts (in order).
+    const nameTexts = assigned.filter((a) => a.prompt.type === "name").map((a) => a.text);
+    const names: NameValues = {
+      person1: nameTexts[0] ? capitalizeFirst(nameTexts[0]) : undefined,
+      person2: nameTexts[1] ? capitalizeFirst(nameTexts[1]) : undefined,
+    };
+
+    // Second pass: render each segment, substituting names where needed.
+    const lines: StoryLine[] = assigned.map(({ prompt, player, text }) => ({
+      promptId: prompt.id,
+      promptLabel: prompt.label,
+      text,
+      display: renderSegment(prompt.segment ?? "{answer}", text, names),
+      playerId: player.id,
+      playerName: player.name,
+      playerAvatarUrl: player.avatarUrl,
+    }));
+
+    const characters = buildStoryCharacters(names, activePlayers);
 
     return {
       id: `story-${storyIndex + 1}`,
       lines,
       prose: buildProse(lines),
+      characters,
     };
   });
+}
+
+/**
+ * Resolve the character names that appear in the story (person1/person2) into
+ * `ComicCharacter` entries carrying their photo when a name matches a player
+ * in the game (case-insensitive whole-name match). This is what the comic
+ * generator needs so every image actually shows the right people.
+ */
+function buildStoryCharacters(
+  names: NameValues,
+  players: Player[]
+): ComicCharacter[] {
+  const uniqueNames = [names.person1, names.person2].filter(
+    (n): n is string => Boolean(n && n.trim())
+  );
+  const seen = new Set<string>();
+  const characters: ComicCharacter[] = [];
+  for (const rawName of uniqueNames) {
+    const name = rawName.trim();
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const match = players.find((p) => p.name.trim().toLowerCase() === key);
+    characters.push({
+      id: match?.id ?? `character-${key}`,
+      name,
+      imageUrl: match?.avatarUrl,
+    });
+  }
+  return characters;
 }

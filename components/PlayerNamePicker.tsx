@@ -21,7 +21,8 @@ export function PlayerNamePicker({
   placeholder,
 }: PlayerNamePickerProps) {
   const [mode, setMode] = useState<"player" | "manual">("player");
-  const otherPlayers = players.filter((p) => p.id !== currentPlayerId);
+  // Everyone is selectable, including yourself.
+  const selectablePlayers = players;
 
   return (
     <div className="space-y-2">
@@ -48,10 +49,10 @@ export function PlayerNamePicker({
 
       {mode === "player" ? (
         <div className="grid gap-2">
-          {otherPlayers.length === 0 ? (
-            <p className="text-sm text-white/60">No other players yet — type a name instead.</p>
+          {selectablePlayers.length === 0 ? (
+            <p className="text-sm text-white/60">No players yet — type a name instead.</p>
           ) : (
-            otherPlayers.map((player) => (
+            selectablePlayers.map((player) => (
               <button
                 key={player.id}
                 type="button"
@@ -63,7 +64,12 @@ export function PlayerNamePicker({
                 }`}
               >
                 <PlayerAvatar name={player.name} avatarUrl={player.avatarUrl} size="sm" />
-                <span className="text-sm text-white">{player.name}</span>
+                <span className="text-sm text-white">
+                  {player.name}
+                  {player.id === currentPlayerId && (
+                    <span className="ml-1 text-white/50">(you)</span>
+                  )}
+                </span>
               </button>
             ))
           )}

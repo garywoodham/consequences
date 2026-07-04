@@ -13,6 +13,7 @@ export function CreateGameForm() {
   const [name, setName] = useState("");
   const [templateId, setTemplateId] = useState("classic");
   const [avatarUrl, setAvatarUrl] = useState<string | undefined>();
+  const [tidyEnabled, setTidyEnabled] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
@@ -43,6 +44,7 @@ export function CreateGameForm() {
         isHost: true,
         templateId,
         roomCode,
+        tidyEnabled,
       });
 
       window.location.href = `/game/${roomCode}`;
@@ -92,6 +94,25 @@ export function CreateGameForm() {
             ))}
           </select>
         </div>
+        <label
+          htmlFor="create-tidy"
+          className="flex cursor-pointer items-start gap-3 rounded-xl border border-white/15 bg-white/5 p-3"
+        >
+          <input
+            id="create-tidy"
+            type="checkbox"
+            checked={tidyEnabled}
+            onChange={(e) => setTidyEnabled(e.target.checked)}
+            className="mt-0.5 h-4 w-4 accent-violet-500"
+          />
+          <span className="text-sm">
+            <span className="font-medium text-white">Polish wording with AI</span>
+            <span className="mt-0.5 block text-xs text-white/50">
+              Tidies everyone&apos;s answers into smooth, readable sentences on the reveal.
+            </span>
+          </span>
+        </label>
+
         {error && (
           <p className="rounded-lg border border-red-400/30 bg-red-500/20 px-3 py-2 text-sm text-red-200">
             {error}

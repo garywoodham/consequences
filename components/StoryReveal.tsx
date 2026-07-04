@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { ChevronLeft, ChevronRight, Check, Copy, Maximize2, Sparkles, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ChevronLeft, ChevronRight, Check, Copy, Maximize2, Sparkles, Wand2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardTitle } from "@/components/ui/card";
 import type { ComicStripData, GameState, Story } from "@/lib/types";
@@ -12,9 +12,17 @@ type StoryRevealProps = {
   state: GameState;
   isHost: boolean;
   onPlayAgain: () => void;
+  onSubmitTidy?: (stories: { id: string; tidyProse: string }[]) => void;
 };
 
-export function StoryReveal({ state, isHost, onPlayAgain }: StoryRevealProps) {
+function splitSentences(text: string): string[] {
+  return text
+    .split(/(?<=[.!?]["'”’]?)\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryRevealProps) {
   const [index, setIndex] = useState(0);
   const [readAloud, setReadAloud] = useState(false);
   const [lineIndex, setLineIndex] = useState(0);
@@ -22,9 +30,44 @@ export function StoryReveal({ state, isHost, onPlayAgain }: StoryRevealProps) {
   const [comics, setComics] = useState<Record<string, ComicStripData>>({});
   const [comicLoading, setComicLoading] = useState(false);
   const [comicError, setComicError] = useState<string | null>(null);
+  const [tidying, setTidying] = useState(false);
+  const tidyAttemptRef = useRef<string>("");
 
   const stories = state.stories;
   const story = stories[index];
+
+  // Host polishes the stories once and broadcasts the result to everyone.
+  useEffect(() => {
+    if (!isHost || !state.tidyEnabled || !onSubmitTidy) return;
+    const signature = stories.map((s) => s.id).join(",");
+    if (!signature) return;
+    if (!stories.some((s) => !s.tidyProse)) return; // all already polished
+    if (tidyAttemptRef.current === signature) return; // already attempted this round
+    tidyAttemptRef.current = signature;
+
+    setTidying(true);
+    (async () => {
+      try {
+        const res = await fetch("/api/tidy-stories", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            stories: stories.map((s) => ({ id: s.id, prose: s.prose })),
+          }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as {
+            stories?: { id: string; tidyProse: string }[];
+          };
+          if (data.stories?.length) onSubmitTidy(data.stories);
+        }
+      } catch {
+        // Leave the original prose in place on failure.
+      } finally {
+        setTidying(false);
+      }
+    })();
+  }, [isHost, state.tidyEnabled, stories, onSubmitTidy]);
 
   if (!story) {
     return (
@@ -67,15 +110,22 @@ export function StoryReveal({ state, isHost, onPlayAgain }: StoryRevealProps) {
     }
   }
 
+  const displayProse = story.tidyProse ?? story.prose;
+  // Polish requested for this story but not back yet (non-host or in flight).
+  const awaitingTidy = state.tidyEnabled && !story.tidyProse;
+
   async function copyStory() {
-    await navigator.clipboard.writeText(story.prose);
+    await navigator.clipboard.writeText(displayProse);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   }
 
   if (readAloud) {
-    const line = story.lines[lineIndex];
-    const isLastLine = lineIndex >= story.lines.length - 1;
+    // When polished, reveal by sentence; otherwise by contributor line.
+    const usingTidy = Boolean(story.tidyProse);
+    const segments = usingTidy ? splitSentences(story.tidyProse!) : story.lines.map((l) => l.display);
+    const line = usingTidy ? null : story.lines[lineIndex];
+    const isLastLine = lineIndex >= segments.length - 1;
 
     return (
       <div className="fixed inset-0 z-50 flex flex-col bg-gradient-to-br from-violet-950 via-purple-900 to-fuchsia-900 p-6">
@@ -89,9 +139,9 @@ export function StoryReveal({ state, isHost, onPlayAgain }: StoryRevealProps) {
         </div>
         <div className="flex flex-1 flex-col items-center justify-center text-center">
           <p className="max-w-3xl text-2xl font-medium leading-relaxed text-white md:text-4xl">
-            {story.lines.slice(0, lineIndex + 1).map((l, i) => (
-              <span key={l.promptId} className={i === lineIndex ? "text-white" : "text-white/35"}>
-                {l.display}{" "}
+            {segments.slice(0, lineIndex + 1).map((seg, i) => (
+              <span key={i} className={i === lineIndex ? "text-white" : "text-white/35"}>
+                {seg}{" "}
               </span>
             ))}
           </p>
@@ -146,7 +196,18 @@ export function StoryReveal({ state, isHost, onPlayAgain }: StoryRevealProps) {
       </div>
 
       <div className="mb-6 rounded-2xl bg-white/5 p-6">
-        <p className="text-lg leading-relaxed text-white md:text-xl">{story.prose}</p>
+        {awaitingTidy && (
+          <p className="mb-3 flex items-center gap-2 text-xs text-violet-300">
+            <Wand2 className="h-3.5 w-3.5" />
+            {tidying ? "Polishing the wording with AI..." : "Waiting for the host to polish the wording..."}
+          </p>
+        )}
+        {story.tidyProse && (
+          <p className="mb-3 flex items-center gap-1.5 text-xs text-violet-300">
+            <Wand2 className="h-3.5 w-3.5" /> AI-polished
+          </p>
+        )}
+        <p className="text-lg leading-relaxed text-white md:text-xl">{displayProse}</p>
       </div>
 
       <details className="mb-6 rounded-xl border border-white/10 bg-white/5 p-4">
