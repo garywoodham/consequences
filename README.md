@@ -6,7 +6,7 @@ An online multiplayer version of the classic **Consequences** parlour game. Play
 
 - **Create or join** games with a 6-character room code
 - **Profile photos** — upload a selfie when joining (optional)
-- **4 story templates** — Classic, Short, Adventure, and Gender-neutral
+- **4 story templates** — Classic, Short, Adventure, and Simple
 - **Name picker** — choose a fellow player's name or type your own for name prompts
 - **Real-time multiplayer** via PartyKit WebSockets
 - **Story reveal** — navigate mixed-up stories with read-aloud mode
