@@ -45,14 +45,19 @@ const LEVEL_INSTRUCTIONS: Record<SanitizeLevel, string> = {
     "      → 'Alice on the sofa wrapped in a thin sheet from the shoulders " +
     "down, looking shocked'\n" +
     "  • 'Alice and Bob had sex on the sofa'\n" +
-    "      → 'Alice and Bob tangled under a rumpled duvet on the sofa, both " +
-    "flushed'\n" +
+    "      → 'Alice and Bob cuddled and kissed on the sofa, wrapped in a " +
+    "rumpled duvet'\n" +
+    "  • 'They were having sex'\n" +
+    "      → 'They cuddled and kissed passionately under the covers'\n" +
     "  • 'Kim went down on Sara at the party'\n" +
     "      → 'Kim disappeared under Sara\\'s skirt at the party'\n" +
     "  • 'Dave shot Kim in the face with a rifle'\n" +
     "      → 'Dave blasted Kim in the face with a cartoon pop-gun'\n" +
     "  • 'Sara snorted a huge line of cocaine'\n" +
     "      → 'Sara snorted a huge line of sherbet powder'\n" +
+    "\n" +
+    "When the caption has two named people, BOTH names must stay and refer to " +
+    "the SAME two people — do not invent a third person or swap who is who.\n" +
     "\n" +
     "Bad — do NOT do this:\n" +
     "  ✗ Leaving the trigger word in (naked/nude/sex/cock/etc.).\n" +
@@ -62,14 +67,15 @@ const LEVEL_INSTRUCTIONS: Record<SanitizeLevel, string> = {
   1:
     "STRONGER RETRY. The image model still refused. Soften further while " +
     "keeping the same story beat and adult tone. Lean harder on aftermath, " +
-    "framing, and props that IMPLY what happened without showing it.\n\n" +
+    "framing, and romantic implication (cuddling, kissing, flushed faces, " +
+    "rumpled sheets) without showing the act.\n\n" +
     "Examples:\n" +
     "  • 'Bob got naked'\n" +
     "      → 'Bob covering himself with a cushion, clothes piled on the floor, " +
     "framed from the waist up'\n" +
     "  • 'Alice and Bob had sex'\n" +
-    "      → 'Alice and Bob tangled in the duvet afterwards, both flushed and " +
-    "giggling'\n" +
+    "      → 'Alice and Bob cuddled and kissed under the duvet afterwards, " +
+    "both flushed and giggling'\n" +
     "  • 'Dave shot Kim'\n" +
     "      → 'Kim collapsed with cartoon X-eyes and stars, Dave holding a " +
     "smoking pop-gun'\n" +
@@ -78,9 +84,9 @@ const LEVEL_INSTRUCTIONS: Record<SanitizeLevel, string> = {
   2:
     "LAST RETRY. Keep the SAME characters, setting and joke intent, but " +
     "depict it as a cheeky PG-13 cartoon beat — still recognisably the same " +
-    "moment (rumpled bed, empty glasses, shocked faces, steam), never a " +
-    "generic unrelated whimsical scene. Every required name MUST appear " +
-    "verbatim.",
+    "moment (cuddling, kissing, rumpled bed, empty glasses, shocked faces), " +
+    "never a generic unrelated whimsical scene. Every required name MUST " +
+    "appear verbatim as the same people.",
 };
 
 function systemPrompt(level: SanitizeLevel, retryDueToNameDrop = false): string {
@@ -128,7 +134,13 @@ const TRIGGER_PATTERNS: RegExp[] = [
   /\bsex\b/i,
   /\bhad sex\b/i,
   /\bhaving sex\b/i,
+  /\bhave sex\b/i,
   /\bmaking love\b/i,
+  /\bmade love\b/i,
+  /\bslept together\b/i,
+  /\bsleeping together\b/i,
+  /\bhooked up\b/i,
+  /\bhooking up\b/i,
   /\bshag(ged|ging)?\b/i,
   /\bbon(k|ked|king)\b/i,
   /\bfuck(ed|ing|s)?\b/i,
@@ -196,12 +208,52 @@ function preservesNames(rewrite: string, names: string[]): boolean {
 }
 
 /**
+ * If a rewrite dropped the required names (common when the caption said
+ * "they had sex"), put the SAME people back in — replace "they" with the
+ * name pair, or prepend the names. Never invent a third person.
+ */
+function ensureNamesPresent(caption: string, names: string[]): string {
+  const needed = names.map((n) => n.trim()).filter(Boolean);
+  if (needed.length === 0 || preservesNames(caption, needed)) return caption;
+
+  if (needed.length === 1) {
+    if (/\bthey\b/i.test(caption)) {
+      return caption.replace(/\bthey\b/i, needed[0]);
+    }
+    return `${needed[0]} — ${caption}`;
+  }
+
+  const pair = `${needed[0]} and ${needed[1]}`;
+  if (/\bthey\b/i.test(caption)) {
+    return caption.replace(/\bthey\b/i, pair);
+  }
+  // Already has one of the names — append the missing one beside it if possible.
+  if (preservesNames(caption, [needed[0]]) && !preservesNames(caption, [needed[1]])) {
+    return caption.replace(
+      new RegExp(`(?<!\\p{L})${needed[0].replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?!\\p{L})`, "iu"),
+      pair
+    );
+  }
+  if (preservesNames(caption, [needed[1]]) && !preservesNames(caption, [needed[0]])) {
+    return caption.replace(
+      new RegExp(`(?<!\\p{L})${needed[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?!\\p{L})`, "iu"),
+      pair
+    );
+  }
+  return `${pair} — ${caption}`;
+}
+
+/**
  * Deterministic local softener for common trigger phrases. Used as a
  * guaranteed first soft pass so we don't depend solely on the LLM, and as a
  * last resort that still keeps the story beat instead of a generic whimsical
  * scene. Returns null if nothing matched.
  */
-export function localSoften(caption: string, level: SanitizeLevel = 0): string | null {
+export function localSoften(
+  caption: string,
+  level: SanitizeLevel = 0,
+  names: string[] = []
+): string | null {
   let out = caption;
   let changed = false;
 
@@ -229,19 +281,24 @@ export function localSoften(caption: string, level: SanitizeLevel = 0): string |
       stronger: "wrapped in a sheet, clothes piled nearby",
     },
     {
-      re: /\b(?:had sex|having sex|have sex|made love|making love)\b/gi,
-      mild: "got busy under a rumpled duvet",
-      stronger: "tangled under a rumpled duvet afterwards, both flushed",
+      re: /\b(?:were |was |are |is )?(?:had sex|having sex|have sex|made love|making love)\b/gi,
+      mild: "cuddled and kissed under a rumpled duvet",
+      stronger: "cuddled and kissed passionately under the covers afterwards, both flushed",
     },
     {
       re: /\b(?:shagged|shagging|shag|bonked|bonking|bonk)\b/gi,
-      mild: "got busy under a blanket",
-      stronger: "tangled in the sheets afterwards, both flushed",
+      mild: "cuddled and kissed under a blanket",
+      stronger: "cuddled and kissed under the sheets afterwards, both flushed",
     },
     {
       re: /\bfuck(?:ed|ing|s)?\b/gi,
-      mild: "got busy under a blanket",
-      stronger: "tangled in the sheets afterwards",
+      mild: "cuddled and kissed",
+      stronger: "cuddled and kissed under the covers",
+    },
+    {
+      re: /\b(?:slept together|sleeping together|hooked up|hooking up)\b/gi,
+      mild: "cuddled and kissed",
+      stronger: "cuddled up together under a rumpled duvet",
     },
     {
       re: /\b(?:went down on|going down on)\b/gi,
@@ -250,8 +307,8 @@ export function localSoften(caption: string, level: SanitizeLevel = 0): string |
     },
     {
       re: /\b(?:blow ?job|handjob)\b/gi,
-      mild: "a very private favour under the table",
-      stronger: "a mischievous moment under the tablecloth",
+      mild: "a very private cuddle under the table",
+      stronger: "a mischievous cuddle under the tablecloth",
     },
     {
       re: /\b(?:boobs?|tits?|nipples?)\b/gi,
@@ -291,7 +348,8 @@ export function localSoften(caption: string, level: SanitizeLevel = 0): string |
   }
 
   out = out.replace(/\s+/g, " ").trim();
-  return changed && out !== caption.trim() ? out : null;
+  if (!changed || out === caption.trim()) return null;
+  return ensureNamesPresent(out, names);
 }
 
 /**
@@ -299,7 +357,7 @@ export function localSoften(caption: string, level: SanitizeLevel = 0): string |
  * and a hint of the original caption rather than inventing a whimsical scene.
  */
 function synthesizeFallback(item: SafeRewriteItem): string {
-  const local = localSoften(item.caption, 2);
+  const local = localSoften(item.caption, 2, item.names);
   if (local && preservesNames(local, item.names)) return local;
 
   // Strip triggers from the original for a lightweight context keep.
@@ -406,7 +464,7 @@ export async function sanitizeCaptionsForImage(
   if (!OPENAI_API_KEY || items.length === 0) {
     return items.map((it) => {
       if (!force && level === 0 && !mayNeedSanitizing(it.caption)) return it.caption;
-      return localSoften(it.caption, level) ?? synthesizeFallback(it);
+      return localSoften(it.caption, level, it.names) ?? synthesizeFallback(it);
     });
   }
 
@@ -418,8 +476,8 @@ export async function sanitizeCaptionsForImage(
     // At higher levels (or when we need a fresh rewrite after a local pass
     // already failed), leave null so the LLM gets a chance.
     if (level === 0) {
-      const local = localSoften(it.caption, level);
-      if (local && preservesNames(local, it.names) && local !== it.caption.trim()) {
+      const local = localSoften(it.caption, level, it.names);
+      if (local && local !== it.caption.trim()) {
         return local;
       }
     }
@@ -439,15 +497,19 @@ export async function sanitizeCaptionsForImage(
       const rw = rewrites?.[k];
       const original = items[origIdx].caption.trim();
       const spicy = mayNeedSanitizing(original);
+      if (!rw) {
+        stillPending.push(origIdx);
+        return;
+      }
+      const withNames = ensureNamesPresent(rw, items[origIdx].names);
       if (
-        rw &&
-        preservesNames(rw, items[origIdx].names) &&
+        preservesNames(withNames, items[origIdx].names) &&
         // Spicy captions must change; clean ones may stay as-is.
-        (!spicy || rw !== original) &&
+        (!spicy || withNames !== original) &&
         // Prefer rewrites that actually removed triggers when the original had them.
-        (!spicy || !mayNeedSanitizing(rw) || level >= 1)
+        (!spicy || !mayNeedSanitizing(withNames) || level >= 1)
       ) {
-        finalResults[origIdx] = rw;
+        finalResults[origIdx] = withNames;
       } else {
         stillPending.push(origIdx);
       }
@@ -456,14 +518,13 @@ export async function sanitizeCaptionsForImage(
   }
 
   pendingIndices.forEach((i) => {
-    const local = localSoften(items[i].caption, level);
-    finalResults[i] =
-      (local && preservesNames(local, items[i].names) ? local : null) ??
-      synthesizeFallback(items[i]);
+    const local = localSoften(items[i].caption, level, items[i].names);
+    finalResults[i] = local ?? synthesizeFallback(items[i]);
   });
 
   return finalResults.map((r, i) => {
-    const result = r ?? synthesizeFallback(items[i]);
+    let result = r ?? synthesizeFallback(items[i]);
+    result = ensureNamesPresent(result, items[i].names);
     // On the refusal path for spicy captions, never return the identical
     // original — that wastes an image attempt. Clean captions can stay as-is
     // (the caller already tried them).
@@ -472,7 +533,10 @@ export async function sanitizeCaptionsForImage(
       mayNeedSanitizing(items[i].caption) &&
       result.trim() === items[i].caption.trim()
     ) {
-      return localSoften(items[i].caption, level) ?? synthesizeFallback(items[i]);
+      return (
+        localSoften(items[i].caption, level, items[i].names) ??
+        synthesizeFallback(items[i])
+      );
     }
     return result;
   });

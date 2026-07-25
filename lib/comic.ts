@@ -99,18 +99,19 @@ export function scriptPanels(story: Story): Omit<StoryPanel, "imageUrl">[] {
       .replace(/\s+/g, " ")
       .trim();
 
-    // Draw exactly the characters NAMED in this panel's caption. Anchoring by
-    // mention (rather than forcing the whole cast into every panel) is what
-    // keeps multiplayer comics coherent: a panel about two people shows just
-    // those two, each drawn from their own photo/description, instead of the
-    // model inventing or swapping in everyone else. When a panel names no one
-    // (e.g. a scene-setting line), fall back to the story's leads so the
-    // protagonists still appear. Legacy stories with no resolved cast fall
-    // back to the panel's line authors.
+    // Default every panel to the story's two leads (person1/person2). Those
+    // are the same people throughout unless a free-text answer explicitly
+    // names someone else (via the person-insert dropdown). Extra named people
+    // are ADDED; leads are never dropped just because a line only mentions one
+    // of them — that was swapping/dropping faces across panels.
+    // Legacy stories with no resolved cast fall back to the panel's line authors.
     let characters: ComicCharacter[];
     if (storyCast.length > 0) {
-      const mentioned = storyCast.filter((c) => mentionsName(caption, c.name));
-      characters = mentioned.length > 0 ? mentioned : storyCast.slice(0, 2);
+      const leads = storyCast.slice(0, 2);
+      const extras = storyCast
+        .slice(2)
+        .filter((c) => mentionsName(caption, c.name));
+      characters = [...leads, ...extras];
     } else {
       characters = [];
       for (const line of group) {
@@ -740,9 +741,10 @@ export async function buildComic(
         imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
         description: descriptionCache.get(c.id) ?? c.description ?? "",
       }));
-      const names = panel.characters
-        .filter((c) => mentionsName(panel.caption, c.name))
-        .map((c) => c.name);
+      // Always pass the panel's people (the two leads, plus any explicitly
+      // selected extra) into the softener so "they had sex" keeps the SAME
+      // two names rather than dropping or inventing people.
+      const names = panel.characters.map((c) => c.name);
 
       // Crudest first: try the raw caption, then on ANY failure walk the
       // soften ladder. Softening ALWAYS produces a different caption
@@ -790,9 +792,10 @@ export async function buildComic(
       }
 
       // Guaranteed local framing softener first — cheap, deterministic, and
-      // matches the user's preferred "hide the nudity with framing" approach.
+      // matches the preferred "hide nudity / imply sex via cuddle+kiss" approach.
+      // Always keep the same two lead names in the softened caption.
       if (!result.imageUrl && canAttempt()) {
-        const local = localSoften(panel.caption, 0);
+        const local = localSoften(panel.caption, 0, names);
         if (local) {
           await runAttempt({ label: "local0", caption: local });
         }
@@ -819,7 +822,7 @@ export async function buildComic(
 
       // Last local pass at stronger level if LLM softenings also failed.
       if (!result.imageUrl && canAttempt()) {
-        const localStrong = localSoften(panel.caption, 2);
+        const localStrong = localSoften(panel.caption, 2, names);
         if (localStrong && !tried.has(localStrong.trim())) {
           await runAttempt({ label: "local2", caption: localStrong });
         }
