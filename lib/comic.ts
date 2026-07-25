@@ -7,7 +7,11 @@ import type {
   StoryLine,
   StoryPanel,
 } from "./types";
-import { sanitizeCaptionsForImage, type SanitizeLevel } from "./safe-rewrite";
+import {
+  localSoften,
+  sanitizeCaptionsForImage,
+  type SanitizeLevel,
+} from "./safe-rewrite";
 import { buildCastSheet } from "./cast-sheet";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -466,7 +470,29 @@ function buildCharacterGuide(cast: PanelCharacter[], withCastSheet: boolean): st
  * Text-to-image fallback (no reference photos). Characters are still described
  * by features + neutral labels so we get consistent lookalikes, not real people.
  */
-type PanelResult = { imageUrl: string | null; prompt: string };
+type PanelResult = {
+  imageUrl: string | null;
+  prompt: string;
+  /** True when the image API refused for safety/moderation. */
+  blocked?: boolean;
+};
+
+function looksLikeModerationBlock(status: number, body: string): boolean {
+  if (status === 400 || status === 403 || status === 451) {
+    const lower = body.toLowerCase();
+    return (
+      lower.includes("moderation") ||
+      lower.includes("safety") ||
+      lower.includes("refus") ||
+      lower.includes("not allowed") ||
+      lower.includes("content policy") ||
+      lower.includes("violat") ||
+      lower.includes("blocked") ||
+      lower.includes("sensitive")
+    );
+  }
+  return false;
+}
 
 async function generatePanelFromTextCast(
   sceneWithLabels: string,
@@ -500,7 +526,15 @@ async function generatePanelFromTextCast(
         n: 1,
       }),
     });
-    if (!res.ok) return { imageUrl: null, prompt };
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      const blocked = looksLikeModerationBlock(res.status, body);
+      console.warn(
+        `[comic] text-to-image failed status=${res.status} blocked=${blocked} ` +
+          `body=${body.slice(0, 200)}`
+      );
+      return { imageUrl: null, prompt, blocked };
+    }
     const data = await res.json();
     const b64 = data?.data?.[0]?.b64_json;
     return { imageUrl: b64 ? `data:image/png;base64,${b64}` : null, prompt };
@@ -571,6 +605,7 @@ async function generatePanelImage(
     `re-style of the reference sheet.\n\n` +
     `${NO_TEXT}`;
 
+  let editBlocked = false;
   try {
     const form = new FormData();
     form.append("model", "gpt-image-1");
@@ -589,6 +624,13 @@ async function generatePanelImage(
       const data = await res.json();
       const b64 = data?.data?.[0]?.b64_json;
       if (b64) return { imageUrl: `data:image/png;base64,${b64}`, prompt };
+    } else {
+      const body = await res.text().catch(() => "");
+      editBlocked = looksLikeModerationBlock(res.status, body);
+      console.warn(
+        `[comic] image-edit failed status=${res.status} blocked=${editBlocked} ` +
+          `body=${body.slice(0, 200)}`
+      );
     }
   } catch {
     // fall through to text generation below
@@ -597,7 +639,11 @@ async function generatePanelImage(
   // Fall back to text-to-image, but keep the richer cast-sheet prompt as the
   // record of what we asked for (it's the more descriptive instruction).
   const fallback = await generatePanelFromTextCast(sceneWithLabels, cast);
-  return { imageUrl: fallback.imageUrl, prompt: fallback.imageUrl ? fallback.prompt : prompt };
+  return {
+    imageUrl: fallback.imageUrl,
+    prompt: fallback.imageUrl ? fallback.prompt : prompt,
+    blocked: editBlocked || fallback.blocked,
+  };
 }
 
 /**
@@ -698,27 +744,25 @@ export async function buildComic(
         .filter((c) => mentionsName(panel.caption, c.name))
         .map((c) => c.name);
 
-      // Build the ordered list of caption variants to try. Crudest first:
-      //   raw (twice — image moderation is non-deterministic, so a flaky
-      //   refusal on the first pass often succeeds on a retry), then the
-      //   softening ladder (0 = surgical swap · 1 = aftermath · 2 = whimsical).
-      // Each softened variant is only added if it actually differs from what
-      // we've already tried, so a clean caption doesn't waste attempts on
-      // no-op "softenings".
+      // Crudest first: try the raw caption, then on ANY failure walk the
+      // soften ladder. Softening ALWAYS produces a different caption
+      // (force:true) so we never waste an attempt on a no-op rewrite.
+      //   raw → raw-retry (only if not clearly a moderation block)
+      //   → local framing softener
+      //   → level 0 / 1 / 2 LLM soften (framing → aftermath → PG-13)
       type Attempt = { label: string; caption: string };
-      const attempts: Attempt[] = [
-        { label: "raw", caption: panel.caption },
-        { label: "raw-retry", caption: panel.caption },
-      ];
-
-      let result: { imageUrl: string | null; prompt: string } = {
-        imageUrl: null,
-        prompt: "",
-      };
+      let result: {
+        imageUrl: string | null;
+        prompt: string;
+        blocked?: boolean;
+      } = { imageUrl: null, prompt: "" };
       const tried = new Set<string>();
+      let lastRefusedCaption = panel.caption;
 
       const runAttempt = async (a: Attempt) => {
-        tried.add(a.caption);
+        const key = a.caption.trim();
+        if (tried.has(key)) return;
+        tried.add(key);
         const t0 = Date.now();
         result = await generatePanelImage(
           a.caption,
@@ -726,17 +770,32 @@ export async function buildComic(
           descriptionCache,
           caricatureCache
         );
+        if (!result.imageUrl) lastRefusedCaption = a.caption;
         console.log(
           `[comic] panel ${panelIdx} attempt=${a.label} ` +
-            `imageOk=${Boolean(result.imageUrl)} ` +
-            `took=${Date.now() - t0}ms remaining=${deadline - Date.now()}ms`
+            `imageOk=${Boolean(result.imageUrl)} blocked=${Boolean(result.blocked)} ` +
+            `took=${Date.now() - t0}ms remaining=${deadline - Date.now()}ms ` +
+            `caption=${JSON.stringify(a.caption.slice(0, 80))}`
         );
       };
 
-      for (const attempt of attempts) {
-        if (result.imageUrl) break;
-        if (!canAttempt()) break;
-        await runAttempt(attempt);
+      if (canAttempt()) {
+        await runAttempt({ label: "raw", caption: panel.caption });
+      }
+      // One raw retry only when the first failure wasn't a clear moderation
+      // block (flaky network / model blip). If it was blocked, skip straight
+      // to softening so we don't burn budget on a prompt we already know fails.
+      if (!result.imageUrl && !result.blocked && canAttempt()) {
+        await runAttempt({ label: "raw-retry", caption: panel.caption });
+      }
+
+      // Guaranteed local framing softener first — cheap, deterministic, and
+      // matches the user's preferred "hide the nudity with framing" approach.
+      if (!result.imageUrl && canAttempt()) {
+        const local = localSoften(panel.caption, 0);
+        if (local) {
+          await runAttempt({ label: "local0", caption: local });
+        }
       }
 
       const levels: SanitizeLevel[] = [0, 1, 2];
@@ -744,11 +803,26 @@ export async function buildComic(
         if (result.imageUrl) break;
         if (!canAttempt()) break;
         const [softer] = await sanitizeCaptionsForImage(
-          [{ caption: panel.caption, names }],
-          level
+          [
+            {
+              caption: panel.caption,
+              names,
+              refusedCaption: lastRefusedCaption,
+            },
+          ],
+          level,
+          { force: true }
         );
-        if (!softer || tried.has(softer)) continue;
+        if (!softer || tried.has(softer.trim())) continue;
         await runAttempt({ label: `level${level}`, caption: softer });
+      }
+
+      // Last local pass at stronger level if LLM softenings also failed.
+      if (!result.imageUrl && canAttempt()) {
+        const localStrong = localSoften(panel.caption, 2);
+        if (localStrong && !tried.has(localStrong.trim())) {
+          await runAttempt({ label: "local2", caption: localStrong });
+        }
       }
 
       if (!result.imageUrl) {
