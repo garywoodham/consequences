@@ -56,6 +56,16 @@ export type ComicCharacter = {
   descriptionSource?: "photo" | "web";
 };
 
+export type PanelImageAttempt = {
+  /** raw / raw-retry / local0 / level0 / level1 / level2 / local2 */
+  attempt: string;
+  ok: boolean;
+  /** Human-readable reason when the attempt failed. */
+  reason?: string;
+  /** Caption variant tried (already name→label substituted for image use). */
+  caption?: string;
+};
+
 export type StoryPanel = {
   index: number;
   caption: string;
@@ -70,6 +80,14 @@ export type StoryPanel = {
    * exact instruction behind each image can be reviewed.
    */
   imagePrompt?: string;
+  /**
+   * Why this panel has no image (or why generation struggled). Surfaced under
+   * the panel when imageUrl is missing, and as a summary when an image was
+   * only obtained after retries.
+   */
+  imageFailureReason?: string;
+  /** Per-attempt log so you can see exactly why each try failed. */
+  imageAttempts?: PanelImageAttempt[];
 };
 
 export type ComicStripData = {

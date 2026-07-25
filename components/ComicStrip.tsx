@@ -73,6 +73,44 @@ export function ComicStrip({ comic }: ComicStripProps) {
             <figcaption className="border-t-2 border-white/80 bg-white px-3 py-2 text-sm font-medium leading-snug text-zinc-900">
               {panel.caption}
             </figcaption>
+            {!panel.imageUrl && panel.imageFailureReason && (
+              <div className="border-t border-amber-200 bg-amber-50 px-3 py-2">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-amber-800">
+                  Image failed
+                </p>
+                <p className="mt-1 text-[12px] leading-snug text-amber-900">
+                  {panel.imageFailureReason}
+                </p>
+              </div>
+            )}
+            {panel.imageAttempts && panel.imageAttempts.length > 0 && (
+              <details className="border-t border-zinc-200 bg-zinc-50 px-3 py-2">
+                <summary className="cursor-pointer text-[11px] font-medium text-zinc-500">
+                  Image attempt log ({panel.imageAttempts.length})
+                  {panel.imageUrl ? " — recovered after retries" : " — all failed"}
+                </summary>
+                <ul className="mt-2 space-y-2">
+                  {panel.imageAttempts.map((a, i) => (
+                    <li
+                      key={`${a.attempt}-${i}`}
+                      className="rounded-lg border border-zinc-200 bg-white px-2 py-1.5 text-[11px] leading-snug"
+                    >
+                      <p className="font-medium text-zinc-800">
+                        {a.ok ? "✓" : "✗"} {a.attempt}
+                      </p>
+                      {a.reason && (
+                        <p className="mt-0.5 text-amber-800">{a.reason}</p>
+                      )}
+                      {a.caption && (
+                        <p className="mt-0.5 text-zinc-500">
+                          Caption tried: {a.caption}
+                        </p>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
             {panel.imagePrompt && (
               <details className="border-t border-zinc-200 bg-zinc-50 px-3 py-2">
                 <summary className="cursor-pointer text-[11px] font-medium text-zinc-500">

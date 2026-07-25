@@ -3,6 +3,7 @@ import type {
   CaricatureStyle,
   ComicCharacter,
   ComicStripData,
+  PanelImageAttempt,
   Story,
   StoryLine,
   StoryPanel,
@@ -143,11 +144,12 @@ function mentionsName(text: string, name: string): boolean {
 }
 
 function buildSceneDescription(caption: string, characters: ComicCharacter[]): string {
+  // Use neutral labels here too — this field is review/debug only and must
+  // not reintroduce real names into anything that might reach an image model.
+  const labels = characters.map((_, i) => `Character ${i + 1}`);
   return (
     `Illustrate this story moment: ${caption}` +
-    (characters.length
-      ? ` Featuring ${characters.map((c) => c.name).join(" and ")}.`
-      : "") +
+    (labels.length ? ` Featuring ${labels.join(" and ")}.` : "") +
     ` Style: ${PANEL_STYLE}.`
   );
 }
@@ -476,6 +478,8 @@ type PanelResult = {
   prompt: string;
   /** True when the image API refused for safety/moderation. */
   blocked?: boolean;
+  /** Human-readable explanation of why generation failed (when imageUrl is null). */
+  reason?: string;
 };
 
 function looksLikeModerationBlock(status: number, body: string): boolean {
@@ -495,6 +499,62 @@ function looksLikeModerationBlock(status: number, body: string): boolean {
   return false;
 }
 
+/** Turn an OpenAI image API error into a short, user-facing reason. */
+function explainImageApiFailure(status: number, body: string): string {
+  const lower = body.toLowerCase();
+  let apiMessage = "";
+  try {
+    const parsed = JSON.parse(body) as {
+      error?: { message?: string; code?: string; type?: string };
+    };
+    apiMessage = parsed?.error?.message?.trim() || "";
+  } catch {
+    apiMessage = body.replace(/\s+/g, " ").trim().slice(0, 180);
+  }
+
+  if (looksLikeModerationBlock(status, body)) {
+    return apiMessage
+      ? `Blocked by image moderation: ${apiMessage}`
+      : "Blocked by image moderation (content filter refused the prompt).";
+  }
+  if (status === 401 || status === 403) {
+    return apiMessage || "OpenAI API key rejected (unauthorized).";
+  }
+  if (status === 429 || lower.includes("rate_limit") || lower.includes("quota")) {
+    return apiMessage || "OpenAI rate limit / quota exceeded — try again shortly.";
+  }
+  if (status === 402 || lower.includes("billing") || lower.includes("insufficient")) {
+    return apiMessage || "OpenAI billing/credits issue — check your account balance.";
+  }
+  if (status >= 500) {
+    return apiMessage || `OpenAI server error (HTTP ${status}).`;
+  }
+  if (status > 0) {
+    return apiMessage || `Image API error (HTTP ${status}).`;
+  }
+  return apiMessage || "Image API request failed.";
+}
+
+/**
+ * Final safety net: replace any leftover real character names in a prompt
+ * with their Character N labels so the image model never sees real identities.
+ */
+function scrubRealNamesFromPrompt(
+  prompt: string,
+  people: { name: string; label: string }[]
+): string {
+  let out = prompt;
+  // Longer names first so "Mary Anne" wins over "Mary".
+  const sorted = [...people].sort((a, b) => b.name.length - a.name.length);
+  for (const { name, label } of sorted) {
+    const needle = name.trim();
+    if (!needle) continue;
+    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out.replace(new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "giu"), label);
+  }
+  return out;
+}
+
 async function generatePanelFromTextCast(
   sceneWithLabels: string,
   cast: PanelCharacter[]
@@ -507,9 +567,11 @@ async function generatePanelFromTextCast(
       `exactly what the scene says; do not swap or omit anyone.\n\n`
     : "";
   const scene = ensureAllPresent(sceneWithLabels, cast);
-  const prompt =
+  const prompt = scrubRealNamesFromPrompt(
     `${NO_TEXT}\n\n${guideBlock}SCENE: ${scene}\n\n` +
-    `STYLE: ${PANEL_STYLE}.\n\n${NO_TEXT}`;
+      `STYLE: ${PANEL_STYLE}.\n\n${NO_TEXT}`,
+    cast
+  );
 
   try {
     const res = await fetch("https://api.openai.com/v1/images/generations", {
@@ -530,17 +592,31 @@ async function generatePanelFromTextCast(
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       const blocked = looksLikeModerationBlock(res.status, body);
+      const reason = explainImageApiFailure(res.status, body);
       console.warn(
         `[comic] text-to-image failed status=${res.status} blocked=${blocked} ` +
-          `body=${body.slice(0, 200)}`
+          `reason=${reason}`
       );
-      return { imageUrl: null, prompt, blocked };
+      return { imageUrl: null, prompt, blocked, reason };
     }
     const data = await res.json();
     const b64 = data?.data?.[0]?.b64_json;
-    return { imageUrl: b64 ? `data:image/png;base64,${b64}` : null, prompt };
-  } catch {
-    return { imageUrl: null, prompt };
+    if (!b64) {
+      return {
+        imageUrl: null,
+        prompt,
+        reason: "Image API returned success but no image data.",
+      };
+    }
+    return { imageUrl: `data:image/png;base64,${b64}`, prompt };
+  } catch (err) {
+    return {
+      imageUrl: null,
+      prompt,
+      reason: `Network error calling image API: ${
+        err instanceof Error ? err.message : "unknown"
+      }`,
+    };
   }
 }
 
@@ -558,55 +634,66 @@ async function generatePanelImage(
   descriptions: Map<string, string>,
   caricatures: Map<string, string | null>
 ): Promise<PanelResult> {
-  if (!OPENAI_API_KEY) return { imageUrl: null, prompt: "" };
+  if (!OPENAI_API_KEY) {
+    return {
+      imageUrl: null,
+      prompt: "",
+      reason: "No OpenAI API key configured on the server.",
+    };
+  }
 
   const { cast, sceneCaptionRewriter } = buildPanelCast(
     characters,
     descriptions,
     caricatures
   );
-  const sceneWithLabels = sceneCaptionRewriter(caption);
+  // Caption may already be label-substituted by the caller; run again so any
+  // leftover real names become Character N before the prompt is built.
+  const labeledScene = sceneCaptionRewriter(caption);
   const withRefs = cast.filter((c) => c.image);
 
   // No reference images at all → text-to-image using feature descriptions.
   if (withRefs.length === 0) {
-    return generatePanelFromTextCast(sceneWithLabels, cast);
+    return generatePanelFromTextCast(labeledScene, cast);
   }
 
   const castSheetBuf = await buildCastSheet(
     withRefs.map((c) => ({ name: c.label, imageUrl: c.image as string }))
   );
   if (!castSheetBuf) {
-    return generatePanelFromTextCast(sceneWithLabels, cast);
+    return generatePanelFromTextCast(labeledScene, cast);
   }
 
   const castSheetBlob = new Blob([new Uint8Array(castSheetBuf)], { type: "image/png" });
   const guide = buildCharacterGuide(cast, true);
   const labelList = cast.map((c) => c.label).join(", ");
-  const scene = ensureAllPresent(sceneWithLabels, cast);
+  const scene = ensureAllPresent(labeledScene, cast);
 
-  const prompt =
+  const prompt = scrubRealNamesFromPrompt(
     `${NO_TEXT}\n\n` +
-    `TASK: draw ONE brand-new comic panel illustrating the scene below.\n\n` +
-    `${FICTIONAL_NOTE}\n\n` +
-    `CHARACTER GUIDE (match these features precisely):\n${guide}\n\n` +
-    `A cast sheet is attached: each tile shows one character with their label ` +
-    `printed beneath. Use it together with the feature descriptions above.\n\n` +
-    `IDENTITY RULES (highest priority):\n` +
-    `  • Draw each character to match BOTH their cast-sheet tile AND their ` +
-    `feature description exactly (age/build, skin tone, hair, facial hair, ` +
-    `glasses, notable clothing). Keep them consistent across panels.\n` +
-    `  • Do NOT swap features between characters, do NOT merge them, do NOT ` +
-    `replace anyone with a random or famous-looking person.\n` +
-    `  • EVERY character listed MUST appear in the panel, even if the scene ` +
-    `sentence only names some of them: ${labelList}.\n` +
-    `  • Prefer a wider composition over leaving anyone out.\n\n` +
-    `SCENE: ${scene}\n\n` +
-    `STYLE: ${PANEL_STYLE}. This is a NEW illustration, not a re-crop or ` +
-    `re-style of the reference sheet.\n\n` +
-    `${NO_TEXT}`;
+      `TASK: draw ONE brand-new comic panel illustrating the scene below.\n\n` +
+      `${FICTIONAL_NOTE}\n\n` +
+      `CHARACTER GUIDE (match these features precisely):\n${guide}\n\n` +
+      `A cast sheet is attached: each tile shows one character with their label ` +
+      `printed beneath. Use it together with the feature descriptions above.\n\n` +
+      `IDENTITY RULES (highest priority):\n` +
+      `  • Draw each character to match BOTH their cast-sheet tile AND their ` +
+      `feature description exactly (age/build, skin tone, hair, facial hair, ` +
+      `glasses, notable clothing). Keep them consistent across panels.\n` +
+      `  • Do NOT swap features between characters, do NOT merge them, do NOT ` +
+      `replace anyone with a random or famous-looking person.\n` +
+      `  • EVERY character listed MUST appear in the panel, even if the scene ` +
+      `sentence only names some of them: ${labelList}.\n` +
+      `  • Prefer a wider composition over leaving anyone out.\n\n` +
+      `SCENE: ${scene}\n\n` +
+      `STYLE: ${PANEL_STYLE}. This is a NEW illustration, not a re-crop or ` +
+      `re-style of the reference sheet.\n\n` +
+      `${NO_TEXT}`,
+    cast
+  );
 
   let editBlocked = false;
+  let editReason: string | undefined;
   try {
     const form = new FormData();
     form.append("model", "gpt-image-1");
@@ -625,25 +712,42 @@ async function generatePanelImage(
       const data = await res.json();
       const b64 = data?.data?.[0]?.b64_json;
       if (b64) return { imageUrl: `data:image/png;base64,${b64}`, prompt };
+      editReason = "Image-edit API returned success but no image data.";
     } else {
       const body = await res.text().catch(() => "");
       editBlocked = looksLikeModerationBlock(res.status, body);
+      editReason = explainImageApiFailure(res.status, body);
       console.warn(
         `[comic] image-edit failed status=${res.status} blocked=${editBlocked} ` +
-          `body=${body.slice(0, 200)}`
+          `reason=${editReason}`
       );
     }
-  } catch {
-    // fall through to text generation below
+  } catch (err) {
+    editReason = `Network error calling image-edit API: ${
+      err instanceof Error ? err.message : "unknown"
+    }`;
   }
 
   // Fall back to text-to-image, but keep the richer cast-sheet prompt as the
   // record of what we asked for (it's the more descriptive instruction).
-  const fallback = await generatePanelFromTextCast(sceneWithLabels, cast);
+  const fallback = await generatePanelFromTextCast(labeledScene, cast);
+  if (fallback.imageUrl) {
+    return {
+      imageUrl: fallback.imageUrl,
+      prompt: fallback.prompt,
+      blocked: editBlocked || fallback.blocked,
+    };
+  }
   return {
-    imageUrl: fallback.imageUrl,
-    prompt: fallback.imageUrl ? fallback.prompt : prompt,
+    imageUrl: null,
+    prompt,
     blocked: editBlocked || fallback.blocked,
+    reason: [
+      editReason ? `Edit: ${editReason}` : null,
+      fallback.reason ? `Text fallback: ${fallback.reason}` : null,
+    ]
+      .filter(Boolean)
+      .join(" → ") || "Image generation failed for an unknown reason.",
   };
 }
 
@@ -741,25 +845,26 @@ export async function buildComic(
         imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
         description: descriptionCache.get(c.id) ?? c.description ?? "",
       }));
-      // Always pass the panel's people (the two leads, plus any explicitly
-      // selected extra) into the softener so "they had sex" keeps the SAME
-      // two names rather than dropping or inventing people.
-      const names = panel.characters.map((c) => c.name);
 
-      // Crudest first: try the raw caption, then on ANY failure walk the
+      // Convert real names → Character N labels BEFORE any image attempt or
+      // softening. Softening must preserve labels (not real names) so the
+      // image model never sees player/celebrity names.
+      const { cast: panelCast, sceneCaptionRewriter } = buildPanelCast(
+        characters,
+        descriptionCache,
+        caricatureCache
+      );
+      const labeledCaption = sceneCaptionRewriter(panel.caption);
+      const labelNames = panelCast.map((c) => c.label);
+
+      // Crudest first: try the labeled caption, then on ANY failure walk the
       // soften ladder. Softening ALWAYS produces a different caption
       // (force:true) so we never waste an attempt on a no-op rewrite.
-      //   raw → raw-retry (only if not clearly a moderation block)
-      //   → local framing softener
-      //   → level 0 / 1 / 2 LLM soften (framing → aftermath → PG-13)
       type Attempt = { label: string; caption: string };
-      let result: {
-        imageUrl: string | null;
-        prompt: string;
-        blocked?: boolean;
-      } = { imageUrl: null, prompt: "" };
+      let result: PanelResult = { imageUrl: null, prompt: "" };
       const tried = new Set<string>();
-      let lastRefusedCaption = panel.caption;
+      const attemptLog: PanelImageAttempt[] = [];
+      let lastRefusedCaption = labeledCaption;
 
       const runAttempt = async (a: Attempt) => {
         const key = a.caption.trim();
@@ -772,30 +877,49 @@ export async function buildComic(
           descriptionCache,
           caricatureCache
         );
+        const reason = result.imageUrl
+          ? undefined
+          : result.reason ||
+            (result.blocked
+              ? "Blocked by image moderation."
+              : "Image generation failed.");
         if (!result.imageUrl) lastRefusedCaption = a.caption;
+        attemptLog.push({
+          attempt: a.label,
+          ok: Boolean(result.imageUrl),
+          reason,
+          caption: a.caption.slice(0, 160),
+        });
         console.log(
           `[comic] panel ${panelIdx} attempt=${a.label} ` +
             `imageOk=${Boolean(result.imageUrl)} blocked=${Boolean(result.blocked)} ` +
             `took=${Date.now() - t0}ms remaining=${deadline - Date.now()}ms ` +
+            `reason=${reason ?? "ok"} ` +
             `caption=${JSON.stringify(a.caption.slice(0, 80))}`
         );
       };
 
       if (canAttempt()) {
-        await runAttempt({ label: "raw", caption: panel.caption });
+        await runAttempt({ label: "raw", caption: labeledCaption });
+      } else {
+        attemptLog.push({
+          attempt: "raw",
+          ok: false,
+          reason: "Skipped — overall comic time budget already exhausted.",
+        });
       }
+
       // One raw retry only when the first failure wasn't a clear moderation
       // block (flaky network / model blip). If it was blocked, skip straight
       // to softening so we don't burn budget on a prompt we already know fails.
       if (!result.imageUrl && !result.blocked && canAttempt()) {
-        await runAttempt({ label: "raw-retry", caption: panel.caption });
+        await runAttempt({ label: "raw-retry", caption: labeledCaption });
       }
 
-      // Guaranteed local framing softener first — cheap, deterministic, and
-      // matches the preferred "hide nudity / imply sex via cuddle+kiss" approach.
-      // Always keep the same two lead names in the softened caption.
+      // Guaranteed local framing softener first — works on labeled captions
+      // and preserves Character 1 / Character 2 (never real names).
       if (!result.imageUrl && canAttempt()) {
-        const local = localSoften(panel.caption, 0, names);
+        const local = localSoften(labeledCaption, 0, labelNames);
         if (local) {
           await runAttempt({ label: "local0", caption: local });
         }
@@ -804,12 +928,19 @@ export async function buildComic(
       const levels: SanitizeLevel[] = [0, 1, 2];
       for (const level of levels) {
         if (result.imageUrl) break;
-        if (!canAttempt()) break;
+        if (!canAttempt()) {
+          attemptLog.push({
+            attempt: `level${level}`,
+            ok: false,
+            reason: "Skipped — overall comic time budget exhausted.",
+          });
+          break;
+        }
         const [softer] = await sanitizeCaptionsForImage(
           [
             {
-              caption: panel.caption,
-              names,
+              caption: labeledCaption,
+              names: labelNames,
               refusedCaption: lastRefusedCaption,
             },
           ],
@@ -822,17 +953,26 @@ export async function buildComic(
 
       // Last local pass at stronger level if LLM softenings also failed.
       if (!result.imageUrl && canAttempt()) {
-        const localStrong = localSoften(panel.caption, 2, names);
+        const localStrong = localSoften(labeledCaption, 2, labelNames);
         if (localStrong && !tried.has(localStrong.trim())) {
           await runAttempt({ label: "local2", caption: localStrong });
         }
       }
 
+      const failureReason = result.imageUrl
+        ? undefined
+        : attemptLog
+            .filter((a) => !a.ok && a.reason)
+            .map((a) => `${a.attempt}: ${a.reason}`)
+            .join(" | ") ||
+          result.reason ||
+          "All image attempts failed.";
+
       if (!result.imageUrl) {
         console.warn(
           `[comic] panel ${panelIdx} produced no image, ` +
             `total=${Date.now() - buildStart}ms ` +
-            `caption=${JSON.stringify(panel.caption.slice(0, 60))}`
+            `reason=${failureReason}`
         );
       }
 
@@ -841,6 +981,8 @@ export async function buildComic(
         characters,
         imageUrl: result.imageUrl ?? undefined,
         imagePrompt: result.prompt || undefined,
+        imageFailureReason: failureReason,
+        imageAttempts: attemptLog,
       };
     })
   );

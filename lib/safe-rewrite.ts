@@ -37,24 +37,27 @@ const LEVEL_INSTRUCTIONS: Record<SanitizeLevel, string> = {
     "just REFUSED this caption. Soften ONLY the blocked phrase so a comic " +
     "panel can still be drawn that matches the joke. Prefer framing tricks " +
     "and implication over changing the story.\n\n" +
-    "GOOD rewrites (same beat, image-safe framing):\n" +
-    "  • 'Bob got completely naked in the kitchen'\n" +
-    "      → 'Bob in the kitchen seen from the shoulders up, covering himself " +
-    "with his arms, clothes on the floor'\n" +
-    "  • 'Alice was naked on the sofa'\n" +
-    "      → 'Alice on the sofa wrapped in a thin sheet from the shoulders " +
-    "down, looking shocked'\n" +
-    "  • 'Alice and Bob had sex on the sofa'\n" +
-    "      → 'Alice and Bob cuddled and kissed on the sofa, wrapped in a " +
-    "rumpled duvet'\n" +
+    "GOOD rewrites (same beat, image-safe framing). Names below are often " +
+    "neutral labels like 'Character 1' — keep whatever names you are given " +
+    "verbatim, never invent real-person names:\n" +
+    "  • 'Character 2 got completely naked in the kitchen'\n" +
+    "      → 'Character 2 in the kitchen seen from the shoulders up, covering " +
+    "himself with his arms, clothes on the floor'\n" +
+    "  • 'Character 1 was naked on the sofa'\n" +
+    "      → 'Character 1 on the sofa wrapped in a thin sheet from the " +
+    "shoulders down, looking shocked'\n" +
+    "  • 'Character 1 and Character 2 had sex on the sofa'\n" +
+    "      → 'Character 1 and Character 2 cuddled and kissed on the sofa, " +
+    "wrapped in a rumpled duvet'\n" +
     "  • 'They were having sex'\n" +
-    "      → 'They cuddled and kissed passionately under the covers'\n" +
-    "  • 'Kim went down on Sara at the party'\n" +
-    "      → 'Kim disappeared under Sara\\'s skirt at the party'\n" +
-    "  • 'Dave shot Kim in the face with a rifle'\n" +
-    "      → 'Dave blasted Kim in the face with a cartoon pop-gun'\n" +
-    "  • 'Sara snorted a huge line of cocaine'\n" +
-    "      → 'Sara snorted a huge line of sherbet powder'\n" +
+    "      → 'Character 1 and Character 2 cuddled and kissed passionately " +
+    "under the covers'\n" +
+    "  • 'Character 1 went down on Character 2 at the party'\n" +
+    "      → 'Character 1 disappeared under Character 2\\'s skirt at the party'\n" +
+    "  • 'Character 1 shot Character 2 in the face with a rifle'\n" +
+    "      → 'Character 1 blasted Character 2 in the face with a cartoon pop-gun'\n" +
+    "  • 'Character 1 snorted a huge line of cocaine'\n" +
+    "      → 'Character 1 snorted a huge line of sherbet powder'\n" +
     "\n" +
     "When the caption has two named people, BOTH names must stay and refer to " +
     "the SAME two people — do not invent a third person or swap who is who.\n" +
@@ -69,18 +72,18 @@ const LEVEL_INSTRUCTIONS: Record<SanitizeLevel, string> = {
     "keeping the same story beat and adult tone. Lean harder on aftermath, " +
     "framing, and romantic implication (cuddling, kissing, flushed faces, " +
     "rumpled sheets) without showing the act.\n\n" +
-    "Examples:\n" +
-    "  • 'Bob got naked'\n" +
-    "      → 'Bob covering himself with a cushion, clothes piled on the floor, " +
-    "framed from the waist up'\n" +
-    "  • 'Alice and Bob had sex'\n" +
-    "      → 'Alice and Bob cuddled and kissed under the duvet afterwards, " +
-    "both flushed and giggling'\n" +
-    "  • 'Dave shot Kim'\n" +
-    "      → 'Kim collapsed with cartoon X-eyes and stars, Dave holding a " +
-    "smoking pop-gun'\n" +
-    "  • 'Sara did cocaine'\n" +
-    "      → 'Sara wild-eyed with spiral pupils, white dust on her nose'\n",
+    "Examples (keep given labels/names verbatim):\n" +
+    "  • 'Character 2 got naked'\n" +
+    "      → 'Character 2 covering himself with a cushion, clothes piled on " +
+    "the floor, framed from the waist up'\n" +
+    "  • 'Character 1 and Character 2 had sex'\n" +
+    "      → 'Character 1 and Character 2 cuddled and kissed under the duvet " +
+    "afterwards, both flushed and giggling'\n" +
+    "  • 'Character 1 shot Character 2'\n" +
+    "      → 'Character 2 collapsed with cartoon X-eyes and stars, Character 1 " +
+    "holding a smoking pop-gun'\n" +
+    "  • 'Character 1 did cocaine'\n" +
+    "      → 'Character 1 wild-eyed with spiral pupils, white dust on her nose'\n",
   2:
     "LAST RETRY. Keep the SAME characters, setting and joke intent, but " +
     "depict it as a cheeky PG-13 cartoon beat — still recognisably the same " +
