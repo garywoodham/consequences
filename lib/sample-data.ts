@@ -8,7 +8,7 @@ import {
 export const SAMPLE_PLAYER_NAMES = ["Sam", "Jordan", "Riley", "Casey"];
 
 /**
- * Choose a funny/rude preset answer for a prompt from the celebrity story
+ * Choose a funny/rude preset answer for a prompt from the famous-names story
  * library. Falls back to a short placeholder if a prompt id is unknown.
  */
 export function pickSampleAnswer(prompt: Prompt, templateId = "classic"): string {
@@ -20,7 +20,7 @@ export function pickSampleAnswer(prompt: Prompt, templateId = "classic"): string
 
 /**
  * Build full submissions for each player. Each player gets a complete random
- * preset story for the active template (funny → crude celebrity scenarios).
+ * preset story for the active template (funny → filthy famous-name scenarios).
  */
 export function buildSampleSubmissions(
   prompts: Prompt[],

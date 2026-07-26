@@ -10,7 +10,7 @@ export type GameSession = {
   /** Host preference: polish story wording with AI on reveal. */
   tidyEnabled?: boolean;
   /**
-   * When true, the answer form highlights preset celebrity fills and sample
+   * When true, the answer form highlights preset famous-name fills and sample
    * games draw from that library by default.
    */
   usePresets?: boolean;

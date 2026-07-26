@@ -18,7 +18,7 @@ type PromptFormProps = {
   state: GameState;
   currentPlayerId: string;
   onSubmit: (answers: Record<string, string>) => void;
-  /** When true (host default), random celebrity fills are featured. */
+  /** When true (host default), random famous-name fills are featured. */
   usePresets?: boolean;
 };
 
@@ -89,7 +89,7 @@ export function PromptForm({
     });
   }
 
-  /** Fill one prompt from the celebrity preset library. */
+  /** Fill one prompt from the famous-names preset library. */
   function fillRandomAnswer(promptId: string) {
     const picked = pickRandomPresetAnswer(state.templateId, promptId);
     if (!picked) return;
@@ -102,7 +102,7 @@ export function PromptForm({
   function fillRandomStory() {
     const filled = pickRandomPresetAnswers(state.templateId);
     setAnswers(filled);
-    setLastPresetTitle("Random celebrity preset loaded — edit anything you like");
+    setLastPresetTitle("Random preset loaded — edit anything you like");
     setError(null);
   }
 
@@ -152,7 +152,8 @@ export function PromptForm({
         <div className="mb-4 rounded-xl border border-white/15 bg-white/5 p-3">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <p className="text-xs text-white/60">
-              Stuck? Pull a random celebrity answer (funny → crude) instead of typing.
+              Stuck? Pull a random answer (funny → filthy) — celebrities,
+              historical figures and infamous criminals.
             </p>
             <Button
               type="button"
@@ -175,7 +176,7 @@ export function PromptForm({
         <div className="mb-4 flex justify-end">
           <Button type="button" variant="ghost" size="sm" onClick={fillRandomStory}>
             <Shuffle className="h-4 w-4" />
-            Random celebrity story
+            Random famous-name story
           </Button>
         </div>
       )}

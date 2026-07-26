@@ -109,11 +109,12 @@ export function CreateGameForm() {
           />
           <span className="text-sm">
             <span className="font-medium text-white">
-              Use celebrity preset stories by default
+              Use famous-name preset stories by default
             </span>
             <span className="mt-0.5 block text-xs text-white/50">
-              Shows random-fill buttons during the game (funny → crude presets with
-              famous names). On by default.
+              Shows random-fill buttons during the game (funny → filthy presets
+              with celebrities, historical figures and notorious criminals). On
+              by default.
             </span>
           </span>
         </label>
