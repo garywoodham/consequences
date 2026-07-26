@@ -24,8 +24,8 @@ import type {
 import { PlayerAvatar } from "./PlayerAvatar";
 import { ComicStrip, ComicStripSkeleton } from "./ComicStrip";
 
-/** Safety cap so a stuck panel can't loop forever. */
-const MAX_COMIC_CHUNKS = 8;
+/** Safety cap so a stuck panel can't loop forever (~2 images per chunk). */
+const MAX_COMIC_CHUNKS = 12;
 
 type StoryRevealProps = {
   state: GameState;
@@ -139,6 +139,7 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
     // keep carrying the in-progress comic forward.
     let previousComic: ComicStripData | undefined;
     let chunk = 0;
+    let networkRetries = 0;
 
     try {
       while (chunk < MAX_COMIC_CHUNKS) {
@@ -149,15 +150,34 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
             : `Drawing comic (pass ${chunk})…`
         );
 
-        const res = await fetch("/api/generate-comic", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            story: target,
-            style: caricatureStyle,
-            previousComic,
-          }),
-        });
+        let res: Response;
+        try {
+          res = await fetch("/api/generate-comic", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              story: target,
+              style: caricatureStyle,
+              previousComic,
+            }),
+          });
+        } catch {
+          // Tunnel/proxy often aborts long requests. Retry the same chunk a
+          // couple of times (with whatever progress we already have).
+          networkRetries += 1;
+          if (networkRetries <= 3) {
+            chunk -= 1;
+            setComicProgress(
+              `Connection dropped — retrying pass ${chunk + 1}…`
+            );
+            await new Promise((r) => setTimeout(r, 1500));
+            continue;
+          }
+          throw new Error(
+            "Connection dropped while drawing the comic. Tap Regenerate to continue."
+          );
+        }
+
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
           throw new Error(data.error ?? "Comic generation failed");
@@ -165,6 +185,7 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
 
         const data = (await res.json()) as ComicBuildResult;
         previousComic = data.comic;
+        networkRetries = 0;
         setComics((prev) => ({ ...prev, [target.id]: data.comic }));
 
         const doneCount = data.comic.panels.filter((p) => p.imageUrl).length;

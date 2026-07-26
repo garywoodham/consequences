@@ -926,15 +926,20 @@ export async function buildComic(
     descriptionSource: descriptionSource.get(c.id),
   }));
 
-  // Per-chunk budget. Incomplete comics are resumed by the client with a
-  // fresh budget while keeping finished panels + cast continuity.
-  const OVERALL_DEADLINE_MS = 280_000;
-  const MIN_ATTEMPT_MS = 18_000;
+  // Per-chunk budget. Cloudflare quick tunnels cancel long HTTP requests
+  // (~100s), so each chunk must finish and return well under that. The client
+  // resumes with previousComic until every panel is done.
+  const OVERALL_DEADLINE_MS = 75_000;
+  const MIN_ATTEMPT_MS = 20_000;
+  // Cap images per request so the JSON payload (base64 PNGs) stays small
+  // enough to return through the tunnel reliably.
+  const MAX_NEW_PANELS_PER_CHUNK = 2;
   const deadline = buildStart + OVERALL_DEADLINE_MS;
-  const canAttempt = () => Date.now() < deadline - MIN_ATTEMPT_MS;
-
   const panels: StoryPanel[] = [];
   let generatedThisChunk = 0;
+  const canAttempt = () =>
+    generatedThisChunk < MAX_NEW_PANELS_PER_CHUNK &&
+    Date.now() < deadline - MIN_ATTEMPT_MS;
   const continuity: ContinuityMap = emptyContinuity();
   const baseDescriptions = new Map(descriptionCache);
 
