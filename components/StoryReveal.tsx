@@ -680,7 +680,7 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
             </div>
             <p className="mt-2 text-xs text-white/50">
               {imageProvider === "flux"
-                ? "FLUX (fal.ai) — fewer content restrictions. Uses the cast sheet + a fixed seed for consistent characters; falls back to description-only for blocked scenes."
+                ? "FLUX.2 (fal.ai) — fewer content restrictions. Each character's caricature is passed as a reference image with full descriptions and a fixed seed for consistency."
                 : "OpenAI gpt-image-1 — stricter moderation, but uses the cast sheet for stronger likenesses."}
             </p>
           </div>

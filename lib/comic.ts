@@ -682,27 +682,6 @@ function stableSeedFromId(id: string): number {
   return h % 2147483647;
 }
 
-/**
- * Compress a model-sheet description so it survives FLUX's short prompt
- * window: keep the leading feature sentences, always keep the STORY WARDROBE
- * clause (continuity), and trim at a word boundary.
- */
-function compactDescriptionForFlux(desc: string, maxChars = 420): string {
-  const cleaned = desc.replace(/\s+/g, " ").trim();
-  if (cleaned.length <= maxChars) return cleaned;
-
-  const wardrobeMatch = cleaned.match(/STORY WARDROBE\b[\s\S]*$/i);
-  const wardrobe = wardrobeMatch ? ` ${wardrobeMatch[0].trim()}` : "";
-  const budget = Math.max(80, maxChars - wardrobe.length);
-  const base = wardrobeMatch
-    ? cleaned.slice(0, wardrobeMatch.index).trim()
-    : cleaned;
-  let head = base.slice(0, budget);
-  const lastSpace = head.lastIndexOf(" ");
-  if (lastSpace > 40) head = head.slice(0, lastSpace);
-  return `${head.replace(/[,;.\s]+$/, "")}.${wardrobe}`;
-}
-
 /** POST to a fal.ai endpoint, inline the resulting image as a data URL. */
 async function callFluxEndpoint(
   endpoint: string,
@@ -768,130 +747,89 @@ async function callFluxEndpoint(
   }
 }
 
-/** Shared compact prompt body for both FLUX paths (short encoder window). */
-function buildFluxPromptBody(
+/**
+ * Full-detail prompt body shared by the FLUX.2 paths. FLUX.2 accepts prompts
+ * up to 32K tokens, so nothing is compressed: complete feature descriptions
+ * (including the STORY WARDROBE continuity clause) all pass through.
+ *
+ * `refIndex` maps character id → 1-based reference-image index for the edit
+ * path; characters present there are anchored as "the person in @imageN".
+ */
+function buildFlux2PromptBody(
   sceneWithLabels: string,
-  cast: PanelCharacter[]
+  cast: PanelCharacter[],
+  refIndex?: Map<string, number>
 ): string {
-  const labelList = cast.map((c) => c.label).join(" and ");
-  const headcount =
-    cast.length > 1
-      ? `The panel MUST show ALL ${cast.length} people together, every one ` +
-        `fully visible: ${labelList}. Do not leave anyone out or merge them.\n\n`
-      : "";
+  const labelList = cast.map((c) => c.label).join(", ");
   const castLines = cast
     .map((pc) => {
+      const anchor = refIndex?.get(pc.id)
+        ? ` — this is the person shown in @image${refIndex.get(pc.id)}; draw ` +
+          `them with the IDENTICAL face, hair, build and skin tone as that ` +
+          `reference image`
+        : "";
       const features = pc.description
-        ? compactDescriptionForFlux(pc.description)
-        : "an original cartoon character with a distinct, consistent look";
-      return `${pc.label}: ${features}`;
+        ? pc.description
+        : "an original cartoon character — invent a distinct look and keep it consistent";
+      const wardrobeNote = /STORY WARDROBE/i.test(features)
+        ? " Honour the STORY WARDROBE clause in this description — it overrides " +
+          "the clothing shown in the reference image for this panel."
+        : "";
+      return `  • ${pc.label}${anchor}: ${features}.${wardrobeNote}`;
     })
     .join("\n");
+
   return (
-    headcount +
-    `SCENE: ${sceneWithLabels}\n\n` +
-    (castLines ? `WHO THEY ARE (fictional cartoon characters):\n${castLines}` : "")
+    `SCENE TO ILLUSTRATE: ${sceneWithLabels}\n\n` +
+    `${FICTIONAL_NOTE}\n\n` +
+    `CHARACTER GUIDE (match these features precisely):\n${castLines}\n\n` +
+    `COMPOSITION RULES (highest priority):\n` +
+    `  • EVERY character listed MUST appear in the panel (${labelList}) — ` +
+    `do not drop, merge or duplicate anyone. Prefer a wider composition ` +
+    `over leaving anyone out.\n` +
+    `  • Each character does exactly what the scene says they do.\n` +
+    `  • Keep every character's look identical to their description and ` +
+    `reference image so they stay consistent across the whole comic strip.\n` +
+    `  • This is ONE brand-new illustration with a full background setting — ` +
+    `NOT a copy, collage or side-by-side line-up of the reference images.\n` +
+    `  • STYLE: ${PANEL_STYLE}.\n` +
+    `  • ${NO_TEXT}`
   );
 }
 
-/** Ordinal tile references ("first/leftmost", ...) for unlabelled sheets. */
-const TILE_ORDINALS = [
-  "first (leftmost)",
-  "second",
-  "third",
-  "fourth",
-  "fifth",
-  "sixth",
-];
-
 /**
- * FLUX Kontext (via fal.ai) panel drawn FROM an UNLABELLED cast sheet, so the
- * same faces carry across panels. The sheet must carry no printed labels —
- * Kontext copies visible text into its output — so characters are referenced
- * by tile order instead. The scene action leads the prompt; identity comes
- * from the image, so the long feature descriptions are omitted (only a short
- * wardrobe line is kept for continuity).
- *
- * Kontext caps safety tolerance lower when an input image is attached; if it
- * refuses, the caller falls back to the text-only path below.
+ * FLUX.2 [pro] edit (via fal.ai): each character's caricature is passed as
+ * its own reference image and anchored in the prompt as @imageN, with the
+ * full uncompressed descriptions + scene. Higher safety tolerance than the
+ * old Kontext path even with reference images attached.
  */
-async function generatePanelWithFluxKontext(
+async function generatePanelWithFlux2Edit(
   sceneWithLabels: string,
   cast: PanelCharacter[],
   refCast: PanelCharacter[],
-  castSheetDataUrl: string,
   seed: number
 ): Promise<PanelResult> {
-  // Rewrite "Character N" mentions to tile references so the scene sentence
-  // itself tells Kontext who does what. Only characters actually on the
-  // sheet get tile ordinals; any without a reference keep a described role.
-  let scene = sceneWithLabels;
-  const nameFor = new Map<string, string>();
-  refCast.forEach((pc, i) => {
-    nameFor.set(pc.id, `the ${TILE_ORDINALS[i] ?? `${i + 1}th`} person`);
-  });
-  const offSheet = cast.filter((pc) => !nameFor.has(pc.id));
-  for (const pc of cast) {
-    const tile = nameFor.get(pc.id);
-    if (tile) {
-      scene = scene.replace(wordBoundaryRegex(pc.label, "giu"), tile);
-    }
-  }
-
-  // Continuity: wardrobe lives in the descriptions as a STORY WARDROBE
-  // clause — surface just that (short) so outfits persist across panels.
-  const wardrobeLines = cast
-    .map((pc) => {
-      const m = pc.description?.match(/STORY WARDROBE\b[:\s-]*([\s\S]*)$/i);
-      if (!m?.[1]?.trim()) return null;
-      const ref = nameFor.get(pc.id) ?? pc.label;
-      return `${ref} is ${m[1].trim().replace(/\.\s*$/, "")}`;
-    })
-    .filter(Boolean)
-    .join("; ");
-
-  // Characters with no photo/caricature still need a text identity.
-  const extraCast = offSheet
-    .map(
-      (pc) =>
-        `${pc.label}: ${
-          pc.description
-            ? compactDescriptionForFlux(pc.description, 200)
-            : "an original cartoon character"
-        }`
-    )
-    .join("\n");
-
-  const who =
-    refCast.length > 1
-      ? `The input image shows ${refCast.length} separate people side by side. `
-      : `The input image shows one person. `;
+  // FLUX.2 edit accepts up to 9 reference images.
+  const refs = refCast.slice(0, 9);
+  const refIndex = new Map<string, number>();
+  refs.forEach((pc, i) => refIndex.set(pc.id, i + 1));
 
   const prompt = scrubRealNamesFromPrompt(
-    `Create ONE brand-new comic panel of this scene: ${scene}\n\n` +
-      who +
-      `Redraw these EXACT same people — identical faces, hair, builds and ` +
-      `outfits — now actively doing the scene above together in a full ` +
-      `background setting. All ${cast.length} character(s) must appear. ` +
-      (wardrobeLines ? `${wardrobeLines}. ` : "") +
-      (extraCast ? `Also include:\n${extraCast}\n` : "") +
-      `Style: ${PANEL_STYLE}. ` +
-      `Do NOT reproduce the side-by-side line-up of the input image. ` +
-      `ABSOLUTELY NO text, no words, no letters, no captions, no speech ` +
-      `bubbles, no signs anywhere in the image.`,
+    `Create ONE brand-new comic panel.\n\n` +
+      buildFlux2PromptBody(sceneWithLabels, cast, refIndex),
     cast
   );
 
   return callFluxEndpoint(
-    "fal-ai/flux-pro/kontext",
+    "fal-ai/flux-2-pro/edit",
     {
       prompt,
-      image_url: castSheetDataUrl,
-      aspect_ratio: "1:1",
-      num_images: 1,
+      image_urls: refs.map((pc) => pc.image as string),
+      image_size: "square_hd",
       output_format: "png",
-      // Kontext allows at most 2 when an input image is attached.
-      safety_tolerance: "2",
+      // Most permissive settings this endpoint exposes.
+      safety_tolerance: "5",
+      enable_safety_checker: false,
       seed,
     },
     prompt
@@ -899,14 +837,8 @@ async function generatePanelWithFluxKontext(
 }
 
 /**
- * FLUX Pro text-to-image panel with fal's safety filters at their most
- * permissive settings — used when no cast references exist or when the
- * Kontext/soften ladder falls back to text-only.
- *
- * FLUX truncates long prompts (short text-encoder window), so unlike the
- * OpenAI path this uses a COMPACT prompt: headcount + scene first, then
- * shortened character descriptions. Otherwise the second character's
- * description falls off the end and only one person gets drawn.
+ * FLUX.2 [pro] text-to-image with full-detail descriptions — used when no
+ * cast references exist or when the soften ladder falls back to text-only.
  */
 async function generatePanelFromFlux(
   sceneWithLabels: string,
@@ -914,21 +846,19 @@ async function generatePanelFromFlux(
   seed?: number
 ): Promise<PanelResult> {
   const prompt = scrubRealNamesFromPrompt(
-    `${PANEL_STYLE}. No text, no words, no letters, no speech bubbles, ` +
-      `no signs anywhere in the image.\n\n` +
-      buildFluxPromptBody(sceneWithLabels, cast),
+    `Create ONE comic panel.\n\n` + buildFlux2PromptBody(sceneWithLabels, cast),
     cast
   );
 
   return callFluxEndpoint(
-    "fal-ai/flux-pro/v1.1",
+    "fal-ai/flux-2-pro",
     {
       prompt,
       image_size: "square_hd",
       num_images: 1,
       output_format: "png",
-      // Most permissive settings fal exposes for this model.
-      safety_tolerance: "6",
+      // Most permissive settings this endpoint exposes.
+      safety_tolerance: "5",
       enable_safety_checker: false,
       ...(seed != null ? { seed } : {}),
     },
@@ -971,36 +901,25 @@ async function generatePanelImage(
   // leftover real names become Character N before the prompt is built.
   const labeledScene = sceneCaptionRewriter(caption);
 
-  // FLUX path: anchor identity with the labelled cast sheet via Kontext when
-  // references exist; otherwise (or on soften retries / Kontext refusal) use
-  // seeded text-to-image with the fewest content restrictions.
+  // FLUX path: FLUX.2 [pro] edit with each caricature as its own reference
+  // image (@imageN) and full uncompressed descriptions; soften retries and
+  // refusals fall back to seeded FLUX.2 text-to-image.
   if (provider === "flux") {
     const seed = options.seed ?? 0;
     const fluxRefs = cast.filter((c) => c.image);
     if (!options.textOnly && fluxRefs.length > 0) {
-      // Unlabelled: Kontext copies any printed text into its output.
-      const sheetBuf = await buildCastSheet(
-        fluxRefs.map((c) => ({ name: c.label, imageUrl: c.image as string })),
-        { labels: false }
+      const viaEdit = await generatePanelWithFlux2Edit(
+        labeledScene,
+        cast,
+        fluxRefs,
+        seed
       );
-      if (sheetBuf) {
-        const sheetDataUrl = `data:image/png;base64,${Buffer.from(
-          sheetBuf
-        ).toString("base64")}`;
-        const viaKontext = await generatePanelWithFluxKontext(
-          labeledScene,
-          cast,
-          fluxRefs,
-          sheetDataUrl,
-          seed
-        );
-        if (viaKontext.imageUrl) return viaKontext;
-        if (viaKontext.rateLimited) return viaKontext;
-        console.warn(
-          `[comic] flux kontext failed (${viaKontext.reason}); ` +
-            `falling back to seeded text-to-image`
-        );
-      }
+      if (viaEdit.imageUrl) return viaEdit;
+      if (viaEdit.rateLimited) return viaEdit;
+      console.warn(
+        `[comic] flux-2 edit failed (${viaEdit.reason}); ` +
+          `falling back to seeded text-to-image`
+      );
     }
     return generatePanelFromFlux(labeledScene, cast, seed);
   }
