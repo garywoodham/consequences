@@ -1,6 +1,10 @@
 "use client";
 
+import { useState } from "react";
+import { Download } from "lucide-react";
 import type { ComicStripData } from "@/lib/types";
+import { downloadComicImages } from "@/lib/download-comic";
+import { Button } from "@/components/ui/button";
 import { PlayerAvatar } from "./PlayerAvatar";
 
 const PANEL_TINTS = [
@@ -17,12 +21,57 @@ type ComicStripProps = {
 };
 
 export function ComicStrip({ comic }: ComicStripProps) {
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const imageCount = comic.panels.filter((p) => p.imageUrl).length;
+
+  const handleDownload = async () => {
+    if (downloading || imageCount === 0) return;
+    setDownloading(true);
+    setDownloadError(null);
+    try {
+      await downloadComicImages(comic.panels);
+    } catch (err) {
+      setDownloadError(
+        err instanceof Error ? err.message : "Could not download images"
+      );
+    } finally {
+      setDownloading(false);
+    }
+  };
+
   return (
     <div className="space-y-4">
       {comic.mode === "photo" && (
         <p className="text-center text-xs text-white/50">
           Photo comic — add an image API key to generate AI caricature art.
         </p>
+      )}
+      {imageCount > 0 && (
+        <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:justify-end">
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={handleDownload}
+            disabled={downloading}
+            aria-label={
+              imageCount === 1
+                ? "Download comic image"
+                : `Download all ${imageCount} comic images as a zip`
+            }
+          >
+            <Download className="h-4 w-4" />
+            {downloading
+              ? "Preparing download…"
+              : imageCount === 1
+                ? "Download image"
+                : `Download all images (${imageCount})`}
+          </Button>
+          {downloadError && (
+            <p className="text-xs text-rose-300 sm:text-right">{downloadError}</p>
+          )}
+        </div>
       )}
       <div className="grid gap-4 sm:grid-cols-2" data-testid="comic-panels">
         {comic.panels.map((panel) => (
