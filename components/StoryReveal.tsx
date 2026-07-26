@@ -14,9 +14,18 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardTitle } from "@/components/ui/card";
-import type { CaricatureStyle, ComicStripData, GameState, Story } from "@/lib/types";
+import type {
+  CaricatureStyle,
+  ComicBuildResult,
+  ComicStripData,
+  GameState,
+  Story,
+} from "@/lib/types";
 import { PlayerAvatar } from "./PlayerAvatar";
 import { ComicStrip, ComicStripSkeleton } from "./ComicStrip";
+
+/** Safety cap so a stuck panel can't loop forever. */
+const MAX_COMIC_CHUNKS = 8;
 
 type StoryRevealProps = {
   state: GameState;
@@ -53,6 +62,7 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
   const [copied, setCopied] = useState(false);
   const [comics, setComics] = useState<Record<string, ComicStripData>>({});
   const [comicLoading, setComicLoading] = useState(false);
+  const [comicProgress, setComicProgress] = useState<string | null>(null);
   const [comicError, setComicError] = useState<string | null>(null);
   const [tidying, setTidying] = useState(false);
   const [caricatureStyle, setCaricatureStyle] = useState<CaricatureStyle>("balanced");
@@ -124,22 +134,72 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
   async function generateComic(target: Story) {
     setComicError(null);
     setComicLoading(true);
+    setComicProgress("Starting comic…");
+    // Fresh generate clears any prior strip for this story; resume chunks
+    // keep carrying the in-progress comic forward.
+    let previousComic: ComicStripData | undefined;
+    let chunk = 0;
+
     try {
-      const res = await fetch("/api/generate-comic", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ story: target, style: caricatureStyle }),
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error ?? "Comic generation failed");
+      while (chunk < MAX_COMIC_CHUNKS) {
+        chunk += 1;
+        setComicProgress(
+          previousComic
+            ? `Continuing comic (pass ${chunk}) — keeping finished panels & looks…`
+            : `Drawing comic (pass ${chunk})…`
+        );
+
+        const res = await fetch("/api/generate-comic", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            story: target,
+            style: caricatureStyle,
+            previousComic,
+          }),
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.error ?? "Comic generation failed");
+        }
+
+        const data = (await res.json()) as ComicBuildResult;
+        previousComic = data.comic;
+        setComics((prev) => ({ ...prev, [target.id]: data.comic }));
+
+        const doneCount = data.comic.panels.filter((p) => p.imageUrl).length;
+        const total = data.comic.panels.length;
+        setComicProgress(
+          data.complete
+            ? null
+            : `Drawn ${doneCount}/${total} panels — starting another pass for the rest…`
+        );
+
+        if (data.complete) break;
+
+        // Nothing new this chunk and still incomplete → stop rather than spin.
+        if (data.generatedThisChunk === 0 && chunk > 1) {
+          setComicError(
+            `Stopped after ${doneCount}/${total} panels — remaining panels could not be drawn.`
+          );
+          break;
+        }
       }
-      const data = (await res.json()) as { comic: ComicStripData };
-      setComics((prev) => ({ ...prev, [target.id]: data.comic }));
+
+      if (chunk >= MAX_COMIC_CHUNKS && previousComic) {
+        const doneCount = previousComic.panels.filter((p) => p.imageUrl).length;
+        const total = previousComic.panels.length;
+        if (doneCount < total) {
+          setComicError(
+            `Reached the pass limit with ${doneCount}/${total} panels drawn. Tap Regenerate to retry the rest.`
+          );
+        }
+      }
     } catch (err) {
       setComicError(err instanceof Error ? err.message : "Comic generation failed");
     } finally {
       setComicLoading(false);
+      setComicProgress(null);
     }
   }
 
@@ -405,7 +465,9 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
           <ComicStrip comic={currentComic} />
         ) : comicLoading ? (
           <div className="space-y-3">
-            <p className="text-center text-sm text-white/60">Drawing your comic strip...</p>
+            <p className="text-center text-sm text-white/60">
+              {comicProgress ?? "Drawing your comic strip…"}
+            </p>
             <ComicStripSkeleton />
           </div>
         ) : (
@@ -418,6 +480,9 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
             Generate comic strip
           </Button>
         )}
+        {comicLoading && currentComic && comicProgress && (
+          <p className="mt-2 text-center text-sm text-violet-300">{comicProgress}</p>
+        )}
         {comicError && (
           <p className="mt-2 text-center text-sm text-red-300">{comicError}</p>
         )}
@@ -427,7 +492,7 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
               variant="secondary"
               size="sm"
               onClick={openComicSlideshow}
-              disabled={currentComic.panels.length === 0}
+              disabled={currentComic.panels.length === 0 || comicLoading}
             >
               <Images className="h-4 w-4" />
               Present panels

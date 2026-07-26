@@ -1,6 +1,7 @@
 // Server-only module: reads OPENAI_API_KEY and calls external image APIs.
 import type {
   CaricatureStyle,
+  ComicBuildResult,
   ComicCharacter,
   ComicStripData,
   PanelImageAttempt,
@@ -810,58 +811,104 @@ async function generatePanelImage(
   };
 }
 
+/** Strip baked-in wardrobe so resume can rebuild continuity from captions. */
+function stripWardrobeSuffix(description: string): string {
+  return description.replace(/\.\s*STORY WARDROBE\b[\s\S]*$/i, "").trim();
+}
+
+function lastSuccessfulAttemptCaption(
+  attempts: PanelImageAttempt[] | undefined
+): string | undefined {
+  if (!attempts?.length) return undefined;
+  for (let i = attempts.length - 1; i >= 0; i--) {
+    if (attempts[i].ok && attempts[i].caption?.trim()) {
+      return attempts[i].caption;
+    }
+  }
+  return undefined;
+}
+
 /**
- * Build a comic strip from a finished story. When an image provider is
- * configured each player photo is caricatured and every panel is illustrated;
- * otherwise it falls back to a photo-based strip rendered on the client.
+ * Build (or resume) a comic strip from a finished story.
+ *
+ * Each call has a ~280s budget. Pass `previousComic` from an incomplete chunk
+ * to skip finished panels and reuse cast/caricatures/wardrobe continuity.
+ * The client should keep calling until `complete` is true.
  */
 export async function buildComic(
   story: Story,
-  style: CaricatureStyle = "balanced"
-): Promise<ComicStripData> {
+  style: CaricatureStyle = "balanced",
+  previousComic?: ComicStripData | null
+): Promise<ComicBuildResult> {
   const buildStart = Date.now();
   const scripted = scriptPanels(story);
 
   if (!hasAiProvider()) {
-    return {
+    const comic: ComicStripData = {
       mode: "photo",
       panels: scripted.map((p) => ({ ...p })),
     };
+    return { comic, complete: true, pendingPanelIndexes: [], generatedThisChunk: 0 };
   }
 
-  // STEP 1 — up front, lock in every named character's identity: caricature
-  // each unique player photo once and generate a detailed feature description
-  // from it. Descriptions are keyed by character id (which maps 1:1 to the
-  // story name) and reused verbatim in every panel so the look stays
-  // consistent. This is the single source of truth for how each person looks.
+  const previousByIndex = new Map<number, StoryPanel>();
+  for (const p of previousComic?.panels ?? []) {
+    previousByIndex.set(p.index, p);
+  }
+
+  // STEP 1 — lock character identity (reuse prior cast on resume).
   const storyCast = resolveStoryCast(story, scripted);
   const caricatureCache = new Map<string, string | null>();
   const descriptionCache = new Map<string, string>();
   const descriptionSource = new Map<string, "photo" | "web">();
-  // Prefer the generated caricature over the original uploaded photo.
   const resolveImage = (c: ComicCharacter): string | undefined =>
     caricatureCache.get(c.id) ?? c.imageUrl;
 
+  // Seed caches from a previous chunk so we don't re-caricature / re-lookup.
+  for (const prev of previousComic?.cast ?? []) {
+    if (prev.imageUrl) caricatureCache.set(prev.id, prev.imageUrl);
+    const base = stripWardrobeSuffix(prev.description ?? "");
+    if (base) descriptionCache.set(prev.id, base);
+    if (prev.descriptionSource) {
+      descriptionSource.set(prev.id, prev.descriptionSource);
+    }
+  }
+
   await Promise.all(
     storyCast.map(async (c) => {
-      if (c.imageUrl) {
-        // Photo uploaded → caricature it (retry once), then describe it. If
-        // the caricature never comes through, still describe the ORIGINAL
-        // photo so this character ALWAYS has a feature description to
-        // anchor every panel.
-        const caricature = await generateCaricatureWithRetry(c.imageUrl as string, style);
-        caricatureCache.set(c.id, caricature);
+      // Already have a likeness description from a prior chunk — keep it.
+      if (descriptionCache.has(c.id) || caricatureCache.has(c.id)) {
+        if (!descriptionCache.has(c.id) && c.imageUrl) {
+          const desc = await describeCaricature(
+            (caricatureCache.get(c.id) || c.imageUrl) as string
+          );
+          if (desc) {
+            descriptionCache.set(c.id, desc);
+            descriptionSource.set(c.id, "photo");
+          }
+        }
+        return;
+      }
 
-        const desc = await describeCaricature(caricature ?? (c.imageUrl as string));
+      if (c.imageUrl) {
+        const caricature = await generateCaricatureWithRetry(
+          c.imageUrl as string,
+          style
+        );
+        caricatureCache.set(c.id, caricature);
+        const desc = await describeCaricature(
+          caricature ?? (c.imageUrl as string)
+        );
         if (desc) {
           descriptionCache.set(c.id, desc);
           descriptionSource.set(c.id, "photo");
         }
         if (!caricature) {
-          console.warn(`[comic] caricature failed for "${c.name}", using original photo + description`);
+          console.warn(
+            `[comic] caricature failed for "${c.name}", using original photo + description`
+          );
         }
       } else {
-        // No photo → search online for a matching public-figure description.
         const desc = await lookupPersonDescription(c.name);
         if (desc) {
           descriptionCache.set(c.id, desc);
@@ -871,8 +918,6 @@ export async function buildComic(
     })
   );
 
-  // The cast list returned to the client for review: name + the exact
-  // description that will be handed to the image model (names are not).
   const cast: ComicCharacter[] = storyCast.map((c) => ({
     id: c.id,
     name: c.name,
@@ -881,29 +926,22 @@ export async function buildComic(
     descriptionSource: descriptionSource.get(c.id),
   }));
 
-  // Panels run SEQUENTIALLY — gpt-image-1 allows only ~5 input-images/min,
-  // so parallel panels + soften retries were burning the quota and later
-  // rounds failed in <1s. Soften retries use text-only (no cast sheet) to
-  // avoid that limit. Each soften round is a DISTINCT strategy applied to
-  // the ORIGINAL caption: 0 framing → 1 covering → 2 underwear.
+  // Per-chunk budget. Incomplete comics are resumed by the client with a
+  // fresh budget while keeping finished panels + cast continuity.
   const OVERALL_DEADLINE_MS = 280_000;
   const MIN_ATTEMPT_MS = 18_000;
   const deadline = buildStart + OVERALL_DEADLINE_MS;
   const canAttempt = () => Date.now() < deadline - MIN_ATTEMPT_MS;
 
   const panels: StoryPanel[] = [];
-  // Carry clothing / appearance across panels. Wardrobe is baked into each
-  // character's FEATURE description (CHARACTER GUIDE) — not only scene text —
-  // so props from dialogue like "nice hat" stick to the right person.
+  let generatedThisChunk = 0;
   const continuity: ContinuityMap = emptyContinuity();
-  // Photo/web likeness descriptions stay immutable; wardrobe is merged per panel.
   const baseDescriptions = new Map(descriptionCache);
 
   for (let panelIdx = 0; panelIdx < scripted.length; panelIdx++) {
     const panel = scripted[panelIdx];
+    const previousPanel = previousByIndex.get(panel.index);
 
-    // Convert real names → Character N labels BEFORE any image attempt or
-    // softening so the image model never sees player/celebrity names.
     const labelingCharacters = panel.characters.map((c) => ({
       ...c,
       imageUrl: resolveImage(c),
@@ -917,19 +955,43 @@ export async function buildComic(
     const labeledCaption = sceneCaptionRewriter(panel.caption);
     const labelNames = panelCast.map((c) => c.label);
 
-    // Learn wardrobe from THIS panel's story text BEFORE drawing, so
-    // "Character 1 said nice hat" immediately updates Character 2's
-    // feature description for this panel and every later one. Trait regexes
-    // match a cast member by label OR real name, so scanning the labeled
-    // caption once is sufficient (no need to also scan the raw caption).
+    // Always advance wardrobe from this panel's story text so later panels
+    // (including after a resume) stay consistent.
     updateContinuityFromCaption(continuity, labeledCaption, panelCast);
+
+    // Finished in a prior chunk — keep the image and fold any softened caption
+    // into continuity, then move on (no API calls).
+    if (previousPanel?.imageUrl) {
+      const softCaption = lastSuccessfulAttemptCaption(
+        previousPanel.imageAttempts
+      );
+      if (softCaption && softCaption.trim() !== labeledCaption.trim()) {
+        updateContinuityFromCaption(continuity, softCaption, panelCast);
+      }
+      const liveDescriptions = descriptionsWithContinuity(
+        baseDescriptions,
+        continuity,
+        [...baseDescriptions.keys(), ...panelCast.map((c) => c.id)]
+      );
+      for (const [id, desc] of liveDescriptions) {
+        descriptionCache.set(id, desc);
+      }
+      panels.push({
+        ...previousPanel,
+        characters: previousPanel.characters.map((c) => ({
+          ...c,
+          imageUrl: resolveImage(c) ?? c.imageUrl,
+          description: descriptionCache.get(c.id) ?? c.description,
+        })),
+      });
+      continue;
+    }
 
     const liveDescriptions = descriptionsWithContinuity(
       baseDescriptions,
       continuity,
       [...baseDescriptions.keys(), ...panelCast.map((c) => c.id)]
     );
-    // Keep descriptionCache in sync so the returned cast review shows wardrobe.
     for (const [id, desc] of liveDescriptions) {
       descriptionCache.set(id, desc);
     }
@@ -940,7 +1002,6 @@ export async function buildComic(
       description: liveDescriptions.get(c.id) ?? c.description ?? "",
     }));
 
-    // Also keep a scene-level reminder for anything established earlier.
     const withContinuity = applyContinuity(
       labeledCaption,
       panelCast,
@@ -960,6 +1021,34 @@ export async function buildComic(
       );
     }
 
+    // Out of time for this chunk — leave panel unfinished for the next resume.
+    if (!canAttempt()) {
+      console.warn(
+        `[comic] panel ${panelIdx} deferred — chunk time budget exhausted ` +
+          `(will resume in a follow-up request)`
+      );
+      panels.push({
+        ...panel,
+        characters,
+        imageFailureReason:
+          "Deferred — comic time budget reached; continuing in next pass.",
+        imageAttempts: [
+          {
+            attempt: "deferred",
+            ok: false,
+            reason: "Skipped — overall comic time budget exhausted.",
+          },
+        ],
+        continuityNote:
+          [
+            ...wardrobe.map((w) => `In character sheet: ${w}`),
+            ...withContinuity.notes,
+          ].join("; ") || undefined,
+      });
+      // Still walk remaining panels to keep continuity + stubs consistent.
+      continue;
+    }
+
     type Attempt = { label: string; caption: string; textOnly?: boolean };
     let result: PanelResult = { imageUrl: null, prompt: "" };
     const tried = new Set<string>();
@@ -973,8 +1062,6 @@ export async function buildComic(
       if (tried.has(key)) return;
       tried.add(key);
 
-      // On rate-limit, wait and retry the SAME caption up to twice before
-      // escalating the soften ladder.
       for (let rateTry = 0; rateTry < 3; rateTry++) {
         if (!canAttempt()) {
           attemptLog.push({
@@ -1047,16 +1134,8 @@ export async function buildComic(
       }
     };
 
-    // 1) Continuity-aware raw caption (with cast sheet when photos exist)
-    if (canAttempt()) {
-      await runAttempt({ label: "raw", caption: baseCaption });
-    }
+    await runAttempt({ label: "raw", caption: baseCaption });
 
-    // 2–4) Progressive soften rounds from the continuity-aware caption — each
-    // is a different strategy: framing → covering → underwear. Soften retries
-    // are text-only so they don't burn the cast-sheet input-image quota.
-    // Softening the continuity clause too keeps carried state (e.g. prior
-    // "naked") from re-blocking after an earlier panel already softened.
     const levels: SanitizeLevel[] = [0, 1, 2];
     for (const level of levels) {
       if (result.imageUrl) break;
@@ -1069,9 +1148,12 @@ export async function buildComic(
         break;
       }
 
-      // Prefer deterministic local soften for this distinct strategy.
       let softer = localSoften(baseCaption, level, labelNames);
-      if (!softer || tried.has(`t:${softer.trim()}`) || tried.has(`e:${softer.trim()}`)) {
+      if (
+        !softer ||
+        tried.has(`t:${softer.trim()}`) ||
+        tried.has(`e:${softer.trim()}`)
+      ) {
         const [llmSoft] = await sanitizeCaptionsForImage(
           [
             {
@@ -1088,7 +1170,9 @@ export async function buildComic(
         }
       }
       if (!softer || softer.trim() === baseCaption.trim()) continue;
-      if (tried.has(`t:${softer.trim()}`) || tried.has(`e:${softer.trim()}`)) continue;
+      if (tried.has(`t:${softer.trim()}`) || tried.has(`e:${softer.trim()}`)) {
+        continue;
+      }
 
       await runAttempt({
         label: `soft${level}`,
@@ -1097,8 +1181,6 @@ export async function buildComic(
       });
     }
 
-    // If soften changed body/covering state, fold that into wardrobe so later
-    // panels match what was actually drawn (e.g. naked → underwear).
     if (
       successfulCaption &&
       successfulCaption.trim() !== labeledCaption.trim()
@@ -1114,16 +1196,23 @@ export async function buildComic(
       }
     }
 
+    const budgetExhausted = attemptLog.some(
+      (a) => a.reason?.includes("time budget exhausted")
+    );
     const failureReason = result.imageUrl
       ? undefined
-      : attemptLog
-          .filter((a) => !a.ok && a.reason)
-          .map((a) => `${a.attempt}: ${a.reason}`)
-          .join(" | ") ||
-        result.reason ||
-        "All image attempts failed.";
+      : budgetExhausted
+        ? "Deferred — comic time budget reached; continuing in next pass."
+        : attemptLog
+            .filter((a) => !a.ok && a.reason)
+            .map((a) => `${a.attempt}: ${a.reason}`)
+            .join(" | ") ||
+          result.reason ||
+          "All image attempts failed.";
 
-    if (!result.imageUrl) {
+    if (result.imageUrl) {
+      generatedThisChunk += 1;
+    } else {
       console.warn(
         `[comic] panel ${panelIdx} produced no image, ` +
           `total=${Date.now() - buildStart}ms reason=${failureReason}`
@@ -1149,7 +1238,6 @@ export async function buildComic(
     });
   }
 
-  // Final cast review: base likeness + wardrobe accumulated across the story.
   const finalDescriptions = descriptionsWithContinuity(
     baseDescriptions,
     continuity,
@@ -1160,9 +1248,35 @@ export async function buildComic(
     description: finalDescriptions.get(c.id) ?? c.description,
   }));
 
-  // If image generation failed across the board, present as a photo strip.
   const anyImages = panels.some((p) => p.imageUrl);
-  return { mode: anyImages ? "ai" : "photo", panels, cast: castWithWardrobe };
+  const pendingPanelIndexes = panels
+    .filter((p) => !p.imageUrl)
+    .map((p) => p.index);
+  // "complete" means every panel that still needs an image either has one, or
+  // failed for a non-budget reason (so another chunk won't help). Budget
+  // deferrals keep complete=false so the client resumes.
+  const pendingBudget = panels.some(
+    (p) =>
+      !p.imageUrl &&
+      (p.imageFailureReason?.includes("continuing in next pass") ||
+        p.imageAttempts?.some((a) =>
+          a.reason?.includes("time budget exhausted")
+        ))
+  );
+  const complete = !pendingBudget;
+
+  const comic: ComicStripData = {
+    mode: anyImages ? "ai" : "photo",
+    panels,
+    cast: castWithWardrobe,
+  };
+
+  console.log(
+    `[comic] chunk done complete=${complete} generated=${generatedThisChunk} ` +
+      `pending=[${pendingPanelIndexes.join(",")}] total=${Date.now() - buildStart}ms`
+  );
+
+  return { comic, complete, pendingPanelIndexes, generatedThisChunk };
 }
 
 /**

@@ -107,6 +107,20 @@ export type ComicStripData = {
   cast?: ComicCharacter[];
 };
 
+/**
+ * Result of one comic-generation chunk. When `complete` is false the client
+ * should call again with `comic` as `previousComic` to resume — cast,
+ * caricatures, wardrobe/continuity, and finished panels are reused.
+ */
+export type ComicBuildResult = {
+  comic: ComicStripData;
+  complete: boolean;
+  /** Panel indexes still missing an image after this chunk. */
+  pendingPanelIndexes: number[];
+  /** How many panel images were newly generated in this chunk. */
+  generatedThisChunk: number;
+};
+
 export type Story = {
   id: string;
   lines: StoryLine[];
