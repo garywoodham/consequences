@@ -22,7 +22,7 @@ import type {
   Story,
 } from "@/lib/types";
 import { PlayerAvatar } from "./PlayerAvatar";
-import { ComicStrip, ComicStripSkeleton } from "./ComicStrip";
+import { ComicStrip } from "./ComicStrip";
 
 /** Setup call + one call per panel (+ a few retries). */
 const MAX_COMIC_CHUNKS = 20;
@@ -193,8 +193,9 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
 
   function progressLabel(done: number, total: number | undefined, preparing: boolean) {
     if (preparing || !total) return "Preparing characters…";
-    if (done <= 0) return `Generating image 1 of ${total}…`;
-    return `Image ${done} of ${total} generated`;
+    if (done <= 0) return `Generating all ${total} images…`;
+    if (done >= total) return `Image ${total} of ${total} generated`;
+    return `Image ${done} of ${total} generated — finishing the rest…`;
   }
 
   async function generateComic(target: Story) {
@@ -211,8 +212,9 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
       return next;
     });
 
-    // One API call prepares the cast; each later call draws exactly one panel.
-    // Keep the in-progress comic local — only publish when complete.
+    // One API call prepares the cast; later calls draw remaining panels in
+    // parallel (continuity baked into each prompt up front). Keep the
+    // in-progress comic local — only publish when complete.
     let previousComic: ComicStripData | undefined;
     let chunk = 0;
     let networkRetries = 0;
@@ -355,11 +357,11 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
           <p className="mt-3 max-w-lg text-3xl font-semibold tracking-tight text-white md:text-5xl">
             {comicProgress ?? "Drawing your comic strip…"}
           </p>
-          <p className="mt-4 max-w-md text-base text-white/55">
-            {total
-              ? `Drawing panel images one by one. The strip appears when all ${total} are ready.`
-              : "Setting up characters, then drawing each panel image."}
-          </p>
+            <p className="mt-4 max-w-md text-base text-white/55">
+              {total
+                ? `Drawing up to ${total} panel images in parallel. The strip appears when all are ready.`
+                : "Setting up characters, then drawing panel images in parallel."}
+            </p>
 
           <div className="mt-10 w-full max-w-md">
             <div className="h-2.5 overflow-hidden rounded-full bg-white/15">

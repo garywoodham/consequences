@@ -110,7 +110,8 @@ export type ComicStripData = {
 /**
  * Result of one comic-generation chunk. When `complete` is false the client
  * should call again with `comic` as `previousComic` to resume — cast,
- * caricatures, wardrobe/continuity, and finished panels are reused.
+ * caricatures, baked wardrobe/continuity, and finished panels are reused.
+ * After cast setup, a chunk may generate multiple panel images in parallel.
  */
 export type ComicBuildResult = {
   comic: ComicStripData;

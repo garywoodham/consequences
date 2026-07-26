@@ -828,12 +828,48 @@ function lastSuccessfulAttemptCaption(
   return undefined;
 }
 
+/** Run async work over items with a fixed concurrency limit. */
+async function mapPool<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from(
+    { length: Math.min(Math.max(1, concurrency), Math.max(1, items.length)) },
+    async () => {
+      while (next < items.length) {
+        const index = next;
+        next += 1;
+        results[index] = await fn(items[index], index);
+      }
+    }
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+type PlannedPanel = {
+  panelIdx: number;
+  panel: Omit<StoryPanel, "imageUrl">;
+  characters: ComicCharacter[];
+  liveDescriptions: Map<string, string>;
+  baseCaption: string;
+  labeledCaption: string;
+  labelNames: string[];
+  wardrobe: string[];
+  continuityNotes: string[];
+  panelCast: PanelCharacter[];
+};
+
 /**
  * Build (or resume) a comic strip from a finished story.
  *
- * One HTTP call = at most one new panel image (plus a cast-only setup call
- * first). Pass `previousComic` to reuse cast/caricatures/wardrobe and keep
- * finished panels. The client loops until `complete` is true.
+ * Call 1 prepares the cast only. Later calls bake wardrobe continuity into
+ * every pending panel up front, then draw those panels in parallel. Pass
+ * `previousComic` to reuse cast/caricatures and keep finished panels. The
+ * client loops until `complete` is true.
  */
 export async function buildComic(
   story: Story,
@@ -991,19 +1027,18 @@ export async function buildComic(
     descriptionSource: descriptionSource.get(c.id),
   }));
 
-  // One panel image per HTTP request (tunnel-safe). Soften retries for that
-  // single panel still share this budget.
-  const OVERALL_DEADLINE_MS = 90_000;
+  // Bake continuity from story order first, then draw pending panels in
+  // parallel. Wall-clock ≈ slowest panel (plus soften retries), not the sum.
+  const OVERALL_DEADLINE_MS = 150_000;
   const MIN_ATTEMPT_MS = 12_000;
-  const MAX_NEW_PANELS_PER_CHUNK = 1;
+  const PARALLEL_CONCURRENCY = 4;
   const deadline = buildStart + OVERALL_DEADLINE_MS;
-  const panels: StoryPanel[] = [];
-  let generatedThisChunk = 0;
-  const canAttempt = () =>
-    generatedThisChunk < MAX_NEW_PANELS_PER_CHUNK &&
-    Date.now() < deadline - MIN_ATTEMPT_MS;
+  const canAttempt = () => Date.now() < deadline - MIN_ATTEMPT_MS;
+
   const continuity: ContinuityMap = emptyContinuity();
   const baseDescriptions = new Map(descriptionCache);
+  const keptPanels = new Map<number, StoryPanel>();
+  const planned: PlannedPanel[] = [];
 
   for (let panelIdx = 0; panelIdx < scripted.length; panelIdx++) {
     const panel = scripted[panelIdx];
@@ -1023,11 +1058,11 @@ export async function buildComic(
     const labelNames = panelCast.map((c) => c.label);
 
     // Always advance wardrobe from this panel's story text so later panels
-    // (including after a resume) stay consistent.
+    // (including after a resume) stay consistent — done before any draws.
     updateContinuityFromCaption(continuity, labeledCaption, panelCast);
 
-    // Finished in a prior chunk — keep the image (or a slim "done" marker)
-    // and fold any softened caption into continuity, then move on.
+    // Finished in a prior chunk — keep the image and fold any softened caption
+    // into continuity for later panels' baked prompts.
     if (previousPanel?.imageUrl) {
       const softCaption = lastSuccessfulAttemptCaption(
         previousPanel.imageAttempts
@@ -1043,7 +1078,7 @@ export async function buildComic(
       for (const [id, desc] of liveDescriptions) {
         descriptionCache.set(id, desc);
       }
-      panels.push({
+      keptPanels.set(panel.index, {
         ...previousPanel,
         characters: previousPanel.characters.map((c) => ({
           ...c,
@@ -1074,237 +1109,274 @@ export async function buildComic(
       panelCast,
       continuity
     );
-    const baseCaption = withContinuity.caption;
     const wardrobe = wardrobeNotes(continuity, panelCast);
     if (wardrobe.length > 0) {
       console.log(
-        `[comic] panel ${panelIdx} wardrobe in character descriptions: ` +
+        `[comic] panel ${panelIdx} wardrobe baked upfront: ` +
           wardrobe.join("; ")
       );
     }
     if (withContinuity.notes.length > 0) {
       console.log(
-        `[comic] panel ${panelIdx} scene continuity: ${withContinuity.notes.join("; ")}`
+        `[comic] panel ${panelIdx} scene continuity baked upfront: ` +
+          withContinuity.notes.join("; ")
       );
     }
 
-    // Out of time for this chunk — leave panel unfinished for the next resume.
-    if (!canAttempt()) {
-      console.warn(
-        `[comic] panel ${panelIdx} deferred — chunk time budget exhausted ` +
-          `(will resume in a follow-up request)`
-      );
-      panels.push({
-        ...panel,
+    planned.push({
+      panelIdx,
+      panel,
+      characters,
+      liveDescriptions,
+      baseCaption: withContinuity.caption,
+      labeledCaption,
+      labelNames,
+      wardrobe,
+      continuityNotes: withContinuity.notes,
+      panelCast,
+    });
+  }
+
+  console.log(
+    `[comic] drawing ${planned.length} panels in parallel ` +
+      `(concurrency=${PARALLEL_CONCURRENCY}, kept=${keptPanels.size})`
+  );
+
+  const drawnPanels: StoryPanel[] = await mapPool(
+    planned,
+    PARALLEL_CONCURRENCY,
+    async (plan): Promise<StoryPanel> => {
+      const {
+        panelIdx,
+        panel,
         characters,
-        imageFailureReason:
-          "Deferred — comic time budget reached; continuing in next pass.",
-        imageAttempts: [
-          {
-            attempt: "deferred",
-            ok: false,
-            reason: "Skipped — overall comic time budget exhausted.",
-          },
-        ],
-        continuityNote:
-          [
-            ...wardrobe.map((w) => `In character sheet: ${w}`),
-            ...withContinuity.notes,
-          ].join("; ") || undefined,
-      });
-      // Still walk remaining panels to keep continuity + stubs consistent.
-      continue;
-    }
+        liveDescriptions,
+        baseCaption,
+        labelNames,
+        wardrobe,
+        continuityNotes,
+      } = plan;
 
-    type Attempt = { label: string; caption: string; textOnly?: boolean };
-    let result: PanelResult = { imageUrl: null, prompt: "" };
-    const tried = new Set<string>();
-    const attemptLog: PanelImageAttempt[] = [];
-    let lastRefusedCaption = baseCaption;
-    let successfulCaption: string | undefined;
-    let useTextOnly = false;
+      const noteParts = [
+        ...wardrobe.map((w) => `In character sheet: ${w}`),
+        ...continuityNotes,
+      ];
+      const continuityNote =
+        noteParts.length > 0 ? noteParts.join("; ") : undefined;
 
-    const runAttempt = async (a: Attempt) => {
-      const key = `${a.textOnly ? "t:" : "e:"}${a.caption.trim()}`;
-      if (tried.has(key)) return;
-      tried.add(key);
-
-      for (let rateTry = 0; rateTry < 3; rateTry++) {
-        if (!canAttempt()) {
-          attemptLog.push({
-            attempt: a.label,
-            ok: false,
-            reason: "Skipped — overall comic time budget exhausted.",
-            caption: a.caption.slice(0, 160),
-          });
-          return;
-        }
-        const t0 = Date.now();
-        result = await generatePanelImage(
-          a.caption,
-          characters,
-          liveDescriptions,
-          caricatureCache,
-          { textOnly: a.textOnly || useTextOnly }
+      if (!canAttempt()) {
+        console.warn(
+          `[comic] panel ${panelIdx} deferred — chunk time budget exhausted ` +
+            `(will resume in a follow-up request)`
         );
-        if (result.imageUrl) {
-          successfulCaption = a.caption;
+        return {
+          ...panel,
+          characters,
+          imageFailureReason:
+            "Deferred — comic time budget reached; continuing in next pass.",
+          imageAttempts: [
+            {
+              attempt: "deferred",
+              ok: false,
+              reason: "Skipped — overall comic time budget exhausted.",
+            },
+          ],
+          continuityNote,
+        };
+      }
+
+      type Attempt = { label: string; caption: string; textOnly?: boolean };
+      let result: PanelResult = { imageUrl: null, prompt: "" };
+      const tried = new Set<string>();
+      const attemptLog: PanelImageAttempt[] = [];
+      let lastRefusedCaption = baseCaption;
+      let useTextOnly = false;
+
+      const runAttempt = async (a: Attempt) => {
+        const key = `${a.textOnly ? "t:" : "e:"}${a.caption.trim()}`;
+        if (tried.has(key)) return;
+        tried.add(key);
+
+        for (let rateTry = 0; rateTry < 3; rateTry++) {
+          if (!canAttempt()) {
+            attemptLog.push({
+              attempt: a.label,
+              ok: false,
+              reason: "Skipped — overall comic time budget exhausted.",
+              caption: a.caption.slice(0, 160),
+            });
+            return;
+          }
+          const t0 = Date.now();
+          result = await generatePanelImage(
+            a.caption,
+            characters,
+            liveDescriptions,
+            caricatureCache,
+            { textOnly: a.textOnly || useTextOnly }
+          );
+          if (result.imageUrl) {
+            attemptLog.push({
+              attempt: a.label,
+              ok: true,
+              caption: a.caption.slice(0, 160),
+            });
+            console.log(
+              `[comic] panel ${panelIdx} attempt=${a.label} imageOk=true ` +
+                `took=${Date.now() - t0}ms remaining=${deadline - Date.now()}ms ` +
+                `caption=${JSON.stringify(a.caption.slice(0, 80))}`
+            );
+            return;
+          }
+
+          if (result.rateLimited && rateTry < 1) {
+            const waitMs = 8_000;
+            console.warn(
+              `[comic] panel ${panelIdx} rate-limited on ${a.label}, ` +
+                `waiting ${waitMs}ms then retrying same caption`
+            );
+            attemptLog.push({
+              attempt: `${a.label}-ratewait`,
+              ok: false,
+              reason: `Rate limited — waiting ${waitMs / 1000}s then retrying.`,
+              caption: a.caption.slice(0, 160),
+            });
+            await sleep(waitMs);
+            continue;
+          }
+
+          const reason =
+            result.reason ||
+            (result.blocked
+              ? "Blocked by image moderation."
+              : "Image generation failed.");
+          lastRefusedCaption = a.caption;
+          if (result.blocked) useTextOnly = true;
           attemptLog.push({
             attempt: a.label,
-            ok: true,
+            ok: false,
+            reason,
             caption: a.caption.slice(0, 160),
           });
           console.log(
-            `[comic] panel ${panelIdx} attempt=${a.label} imageOk=true ` +
+            `[comic] panel ${panelIdx} attempt=${a.label} imageOk=false ` +
+              `blocked=${Boolean(result.blocked)} ` +
               `took=${Date.now() - t0}ms remaining=${deadline - Date.now()}ms ` +
-              `caption=${JSON.stringify(a.caption.slice(0, 80))}`
+              `reason=${reason} caption=${JSON.stringify(a.caption.slice(0, 80))}`
           );
           return;
         }
+      };
 
-        // Single short wait only — long rate-limit loops blow the per-panel
-        // request budget through the public tunnel.
-        if (result.rateLimited && rateTry < 1) {
-          const waitMs = 8_000;
-          console.warn(
-            `[comic] panel ${panelIdx} rate-limited on ${a.label}, ` +
-              `waiting ${waitMs}ms then retrying same caption`
-          );
+      await runAttempt({ label: "raw", caption: baseCaption });
+
+      const levels: SanitizeLevel[] = [0, 1, 2];
+      for (const level of levels) {
+        if (result.imageUrl) break;
+        if (!canAttempt()) {
           attemptLog.push({
-            attempt: `${a.label}-ratewait`,
+            attempt: `soft${level}`,
             ok: false,
-            reason: `Rate limited — waiting ${waitMs / 1000}s then retrying.`,
-            caption: a.caption.slice(0, 160),
+            reason: "Skipped — overall comic time budget exhausted.",
           });
-          await sleep(waitMs);
+          break;
+        }
+
+        let softer = localSoften(baseCaption, level, labelNames);
+        if (
+          !softer ||
+          tried.has(`t:${softer.trim()}`) ||
+          tried.has(`e:${softer.trim()}`)
+        ) {
+          const [llmSoft] = await sanitizeCaptionsForImage(
+            [
+              {
+                caption: baseCaption,
+                names: labelNames,
+                refusedCaption: lastRefusedCaption,
+              },
+            ],
+            level,
+            { force: true }
+          );
+          if (llmSoft && llmSoft.trim() !== baseCaption.trim()) {
+            softer = llmSoft;
+          }
+        }
+        if (!softer || softer.trim() === baseCaption.trim()) continue;
+        if (tried.has(`t:${softer.trim()}`) || tried.has(`e:${softer.trim()}`)) {
           continue;
         }
 
-        const reason =
-          result.reason ||
-          (result.blocked
-            ? "Blocked by image moderation."
-            : "Image generation failed.");
-        lastRefusedCaption = a.caption;
-        if (result.blocked) useTextOnly = true;
-        attemptLog.push({
-          attempt: a.label,
-          ok: false,
-          reason,
-          caption: a.caption.slice(0, 160),
+        await runAttempt({
+          label: `soft${level}`,
+          caption: softer,
+          textOnly: true,
         });
-        console.log(
-          `[comic] panel ${panelIdx} attempt=${a.label} imageOk=false ` +
-            `blocked=${Boolean(result.blocked)} ` +
-            `took=${Date.now() - t0}ms remaining=${deadline - Date.now()}ms ` +
-            `reason=${reason} caption=${JSON.stringify(a.caption.slice(0, 80))}`
-        );
-        return;
-      }
-    };
-
-    await runAttempt({ label: "raw", caption: baseCaption });
-
-    const levels: SanitizeLevel[] = [0, 1, 2];
-    for (const level of levels) {
-      if (result.imageUrl) break;
-      if (!canAttempt()) {
-        attemptLog.push({
-          attempt: `soft${level}`,
-          ok: false,
-          reason: "Skipped — overall comic time budget exhausted.",
-        });
-        break;
       }
 
-      let softer = localSoften(baseCaption, level, labelNames);
-      if (
-        !softer ||
-        tried.has(`t:${softer.trim()}`) ||
-        tried.has(`e:${softer.trim()}`)
-      ) {
-        const [llmSoft] = await sanitizeCaptionsForImage(
-          [
-            {
-              caption: baseCaption,
-              names: labelNames,
-              refusedCaption: lastRefusedCaption,
-            },
-          ],
-          level,
-          { force: true }
-        );
-        if (llmSoft && llmSoft.trim() !== baseCaption.trim()) {
-          softer = llmSoft;
-        }
-      }
-      if (!softer || softer.trim() === baseCaption.trim()) continue;
-      if (tried.has(`t:${softer.trim()}`) || tried.has(`e:${softer.trim()}`)) {
-        continue;
-      }
-
-      await runAttempt({
-        label: `soft${level}`,
-        caption: softer,
-        textOnly: true,
-      });
-    }
-
-    if (
-      successfulCaption &&
-      successfulCaption.trim() !== labeledCaption.trim()
-    ) {
-      updateContinuityFromCaption(continuity, successfulCaption, panelCast);
-      const afterSoft = descriptionsWithContinuity(
-        baseDescriptions,
-        continuity,
-        descriptionCache.keys()
+      const budgetExhausted = attemptLog.some(
+        (a) => a.reason?.includes("time budget exhausted")
       );
-      for (const [id, desc] of afterSoft) {
-        descriptionCache.set(id, desc);
+      const failureReason = result.imageUrl
+        ? undefined
+        : budgetExhausted
+          ? "Deferred — comic time budget reached; continuing in next pass."
+          : attemptLog
+              .filter((a) => !a.ok && a.reason)
+              .map((a) => `${a.attempt}: ${a.reason}`)
+              .join(" | ") ||
+            result.reason ||
+            "All image attempts failed.";
+
+      if (!result.imageUrl) {
+        console.warn(
+          `[comic] panel ${panelIdx} produced no image, ` +
+            `total=${Date.now() - buildStart}ms reason=${failureReason}`
+        );
       }
+
+      return {
+        ...panel,
+        characters: characters.map((c) => ({
+          ...c,
+          description: liveDescriptions.get(c.id) ?? c.description,
+        })),
+        imageUrl: result.imageUrl ?? undefined,
+        imagePrompt: result.prompt || undefined,
+        imageFailureReason: failureReason,
+        imageAttempts: attemptLog,
+        continuityNote,
+      };
     }
+  );
 
-    const budgetExhausted = attemptLog.some(
-      (a) => a.reason?.includes("time budget exhausted")
-    );
-    const failureReason = result.imageUrl
-      ? undefined
-      : budgetExhausted
-        ? "Deferred — comic time budget reached; continuing in next pass."
-        : attemptLog
-            .filter((a) => !a.ok && a.reason)
-            .map((a) => `${a.attempt}: ${a.reason}`)
-            .join(" | ") ||
-          result.reason ||
-          "All image attempts failed.";
-
-    if (result.imageUrl) {
-      generatedThisChunk += 1;
-    } else {
-      console.warn(
-        `[comic] panel ${panelIdx} produced no image, ` +
-          `total=${Date.now() - buildStart}ms reason=${failureReason}`
-      );
-    }
-
-    const noteParts = [
-      ...wardrobe.map((w) => `In character sheet: ${w}`),
-      ...withContinuity.notes,
-    ];
-
-    panels.push({
+  const drawnByIndex = new Map(drawnPanels.map((p) => [p.index, p]));
+  const panels: StoryPanel[] = scripted.map((panel) => {
+    const kept = keptPanels.get(panel.index);
+    if (kept) return kept;
+    const drawn = drawnByIndex.get(panel.index);
+    if (drawn) return drawn;
+    return {
       ...panel,
-      characters: characters.map((c) => ({
+      characters: panel.characters.map((c) => ({
         ...c,
-        description: descriptionCache.get(c.id) ?? c.description,
+        imageUrl: resolveImage(c),
+        description: descriptionCache.get(c.id) ?? c.description ?? "",
       })),
-      imageUrl: result.imageUrl ?? undefined,
-      imagePrompt: result.prompt || undefined,
-      imageFailureReason: failureReason,
-      imageAttempts: attemptLog,
-      continuityNote: noteParts.length > 0 ? noteParts.join("; ") : undefined,
-    });
+      imageFailureReason: "Panel was not planned for this pass.",
+    };
+  });
+
+  // Fold successful softened captions into the exported cast wardrobe so the
+  // next resume pass (if any) sees them during the upfront bake.
+  for (const p of panels) {
+    const softCaption = lastSuccessfulAttemptCaption(p.imageAttempts);
+    if (!softCaption) continue;
+    const plan = planned.find((pl) => pl.panel.index === p.index);
+    if (!plan) continue;
+    if (softCaption.trim() === plan.labeledCaption.trim()) continue;
+    updateContinuityFromCaption(continuity, softCaption, plan.panelCast);
   }
 
   const finalDescriptions = descriptionsWithContinuity(
@@ -1317,6 +1389,7 @@ export async function buildComic(
     description: finalDescriptions.get(c.id) ?? c.description,
   }));
 
+  const generatedThisChunk = drawnPanels.filter((p) => p.imageUrl).length;
   const anyImages = panels.some((p) => p.imageUrl);
   const pendingPanelIndexes = panels
     .filter((p) => !p.imageUrl)
