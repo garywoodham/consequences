@@ -66,8 +66,12 @@ function wearingPhrase(item: string): string {
   if (!s) return "wearing something distinctive";
 
   const lastWord = s.split(/\s+/).pop() ?? "";
-  const plural = /s$/i.test(lastWord) || /^(?:crocs|glasses|sunglasses|jeans|trousers|pants|clothes|overalls)\b/i.test(s);
-  s = s.replace(/^(?:a|an)\s+/i, plural ? "" : (m) => m);
+  const plural =
+    /s$/i.test(lastWord) ||
+    /^(?:crocs|glasses|sunglasses|jeans|trousers|pants|clothes|overalls)\b/i.test(
+      s
+    );
+  if (plural) s = s.replace(/^(?:a|an)\s+/i, "");
 
   if (/^(?:a|an|the|his|her|their|your)\b/i.test(s)) return `wearing ${s}`;
   if (plural) return `wearing ${s}`;
@@ -273,12 +277,14 @@ function extractComplimentTraits(
   if (!text || cast.length === 0) return out;
 
   for (const speaker of cast) {
+    // Match "X said …" / "X replied …" including quoted answers and
+    // punctuation ("Nice hat!"). Speech runs to the sentence end.
     const saidRe = new RegExp(
-      `(?<!\\p{L})(?:${escapeRegExp(speaker.label)}|${escapeRegExp(speaker.name)})(?!\\p{L})\\s+(?:said|replied|whispered|shouted|yelled|asked)\\s+([^.!?]+)`,
+      `(?<!\\p{L})(?:${escapeRegExp(speaker.label)}|${escapeRegExp(speaker.name)})(?!\\p{L})\\s+(?:said|replied|whispered|shouted|yelled|asked|answered)\\s+(.+?)(?=(?:[.!?](?:\\s|$))|$)`,
       "giu"
     );
     for (const m of text.matchAll(saidRe)) {
-      const speech = (m[1] ?? "").replace(/["'“”]/g, " ").trim();
+      const speech = (m[1] ?? "").replace(/["'“”‘’]/g, " ").trim();
       if (!speech) continue;
 
       const traits: Trait[] = [];
@@ -467,6 +473,85 @@ export function updateContinuityFromCaption(
       extractDirectTraits(caption, member)
     );
   }
+}
+
+/** Current wardrobe/body trait phrases for one character. */
+export function traitPhrasesFor(
+  continuity: ContinuityMap,
+  id: string
+): string[] {
+  const bag = continuity.get(id);
+  if (!bag || bag.size === 0) return [];
+  const phrases: string[] = [];
+  const seen = new Set<string>();
+  for (const [slot, phrase] of bag) {
+    const key = phrase.toLowerCase();
+    if (seen.has(key)) continue;
+    if (
+      slot === "outfit" &&
+      [...bag.entries()].some(
+        ([s, p]) => s !== "outfit" && p.toLowerCase() === key
+      )
+    ) {
+      continue;
+    }
+    seen.add(key);
+    phrases.push(phrase);
+  }
+  return phrases;
+}
+
+/**
+ * Bake continuity into the character FEATURE description used by the image
+ * model's CHARACTER GUIDE. This is what actually sticks across panels —
+ * scene footnotes alone are too easy for the model to ignore.
+ */
+export function descriptionWithContinuity(
+  baseDescription: string,
+  continuity: ContinuityMap,
+  id: string
+): string {
+  const traits = traitPhrasesFor(continuity, id);
+  if (traits.length === 0) return baseDescription;
+  const wardrobe = traits.join("; ");
+  const base = baseDescription.trim().replace(/\.\s*$/, "");
+  const suffix =
+    `STORY WARDROBE — must appear in EVERY panel exactly like this: ${wardrobe}`;
+  return base ? `${base}. ${suffix}` : suffix;
+}
+
+/** Build a description map with wardrobe baked into every character that has traits. */
+export function descriptionsWithContinuity(
+  baseDescriptions: Map<string, string>,
+  continuity: ContinuityMap,
+  ids: Iterable<string>
+): Map<string, string> {
+  const live = new Map<string, string>();
+  for (const id of ids) {
+    live.set(
+      id,
+      descriptionWithContinuity(baseDescriptions.get(id) ?? "", continuity, id)
+    );
+  }
+  // Keep any base entries not in ids.
+  for (const [id, desc] of baseDescriptions) {
+    if (!live.has(id)) live.set(id, desc);
+  }
+  return live;
+}
+
+/** Human-readable wardrobe lines for UI / logs. */
+export function wardrobeNotes(
+  continuity: ContinuityMap,
+  cast: CastMember[]
+): string[] {
+  const notes: string[] = [];
+  for (const member of cast) {
+    const traits = traitPhrasesFor(continuity, member.id);
+    if (traits.length === 0) continue;
+    notes.push(`${member.label} ${traits.join(", and ")}`);
+  }
+  return notes;
 }
 
 /**

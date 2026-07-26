@@ -16,8 +16,10 @@ import {
 import { buildCastSheet } from "./cast-sheet";
 import {
   applyContinuity,
+  descriptionsWithContinuity,
   emptyContinuity,
   updateContinuityFromCaption,
+  wardrobeNotes,
   type ContinuityMap,
 } from "./continuity";
 
@@ -472,7 +474,12 @@ function buildCharacterGuide(cast: PanelCharacter[], withCastSheet: boolean): st
       const features = pc.description
         ? pc.description
         : "an original cartoon character — invent a distinct, consistent look";
-      return `  • ${pc.label}${tile}: ${features}.`;
+      // Wardrobe baked into the description is the source of truth for props
+      // like hats — call it out so the model doesn't drop it between panels.
+      const wardrobeNote = /STORY WARDROBE/i.test(features)
+        ? " Honour the STORY WARDROBE in this description in this panel."
+        : "";
+      return `  • ${pc.label}${tile}: ${features}.${wardrobeNote}`;
     })
     .join("\n");
 }
@@ -866,39 +873,70 @@ export async function buildComic(
   const canAttempt = () => Date.now() < deadline - MIN_ATTEMPT_MS;
 
   const panels: StoryPanel[] = [];
-  // Carry clothing / appearance across panels so visuals stay consistent
-  // (e.g. naked in beat 1 stays until a later caption changes the outfit).
+  // Carry clothing / appearance across panels. Wardrobe is baked into each
+  // character's FEATURE description (CHARACTER GUIDE) — not only scene text —
+  // so props from dialogue like "nice hat" stick to the right person.
   const continuity: ContinuityMap = emptyContinuity();
+  // Photo/web likeness descriptions stay immutable; wardrobe is merged per panel.
+  const baseDescriptions = new Map(descriptionCache);
 
   for (let panelIdx = 0; panelIdx < scripted.length; panelIdx++) {
     const panel = scripted[panelIdx];
-    const characters = panel.characters.map((c) => ({
-      ...c,
-      imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
-      description: descriptionCache.get(c.id) ?? c.description ?? "",
-    }));
 
     // Convert real names → Character N labels BEFORE any image attempt or
     // softening so the image model never sees player/celebrity names.
+    const labelingCharacters = panel.characters.map((c) => ({
+      ...c,
+      imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
+      description: baseDescriptions.get(c.id) ?? c.description ?? "",
+    }));
     const { cast: panelCast, sceneCaptionRewriter } = buildPanelCast(
-      characters,
-      descriptionCache,
+      labelingCharacters,
+      baseDescriptions,
       caricatureCache
     );
     const labeledCaption = sceneCaptionRewriter(panel.caption);
     const labelNames = panelCast.map((c) => c.label);
 
-    // Inject prior visual state for anyone who reappears without a new
-    // appearance description in this caption.
+    // Learn wardrobe from THIS panel's story text BEFORE drawing, so
+    // "Character 1 said nice hat" immediately updates Character 2's
+    // feature description for this panel and every later one.
+    updateContinuityFromCaption(continuity, labeledCaption, panelCast);
+    updateContinuityFromCaption(continuity, panel.caption, panelCast);
+
+    const liveDescriptions = descriptionsWithContinuity(
+      baseDescriptions,
+      continuity,
+      [...baseDescriptions.keys(), ...panelCast.map((c) => c.id)]
+    );
+    // Keep descriptionCache in sync so the returned cast review shows wardrobe.
+    for (const [id, desc] of liveDescriptions) {
+      descriptionCache.set(id, desc);
+    }
+
+    const characters = panel.characters.map((c) => ({
+      ...c,
+      imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
+      description: liveDescriptions.get(c.id) ?? c.description ?? "",
+    }));
+
+    // Also keep a scene-level reminder for anything established earlier.
     const withContinuity = applyContinuity(
       labeledCaption,
       panelCast,
       continuity
     );
     const baseCaption = withContinuity.caption;
+    const wardrobe = wardrobeNotes(continuity, panelCast);
+    if (wardrobe.length > 0) {
+      console.log(
+        `[comic] panel ${panelIdx} wardrobe in character descriptions: ` +
+          wardrobe.join("; ")
+      );
+    }
     if (withContinuity.notes.length > 0) {
       console.log(
-        `[comic] panel ${panelIdx} continuity: ${withContinuity.notes.join("; ")}`
+        `[comic] panel ${panelIdx} scene continuity: ${withContinuity.notes.join("; ")}`
       );
     }
 
@@ -931,7 +969,7 @@ export async function buildComic(
         result = await generatePanelImage(
           a.caption,
           characters,
-          descriptionCache,
+          liveDescriptions,
           caricatureCache,
           { textOnly: a.textOnly || useTextOnly }
         );
@@ -1039,13 +1077,22 @@ export async function buildComic(
       });
     }
 
-    // Update continuity from what was drawn (successful softened caption),
-    // else from the continuity-aware story caption so later panels still match.
-    updateContinuityFromCaption(
-      continuity,
-      successfulCaption ?? baseCaption,
-      panelCast
-    );
+    // If soften changed body/covering state, fold that into wardrobe so later
+    // panels match what was actually drawn (e.g. naked → underwear).
+    if (
+      successfulCaption &&
+      successfulCaption.trim() !== labeledCaption.trim()
+    ) {
+      updateContinuityFromCaption(continuity, successfulCaption, panelCast);
+      const afterSoft = descriptionsWithContinuity(
+        baseDescriptions,
+        continuity,
+        descriptionCache.keys()
+      );
+      for (const [id, desc] of afterSoft) {
+        descriptionCache.set(id, desc);
+      }
+    }
 
     const failureReason = result.imageUrl
       ? undefined
@@ -1063,23 +1110,39 @@ export async function buildComic(
       );
     }
 
+    const noteParts = [
+      ...wardrobe.map((w) => `In character sheet: ${w}`),
+      ...withContinuity.notes,
+    ];
+
     panels.push({
       ...panel,
-      characters,
+      characters: characters.map((c) => ({
+        ...c,
+        description: descriptionCache.get(c.id) ?? c.description,
+      })),
       imageUrl: result.imageUrl ?? undefined,
       imagePrompt: result.prompt || undefined,
       imageFailureReason: failureReason,
       imageAttempts: attemptLog,
-      continuityNote:
-        withContinuity.notes.length > 0
-          ? withContinuity.notes.join("; ")
-          : undefined,
+      continuityNote: noteParts.length > 0 ? noteParts.join("; ") : undefined,
     });
   }
 
+  // Final cast review: base likeness + wardrobe accumulated across the story.
+  const finalDescriptions = descriptionsWithContinuity(
+    baseDescriptions,
+    continuity,
+    baseDescriptions.keys()
+  );
+  const castWithWardrobe: ComicCharacter[] = cast.map((c) => ({
+    ...c,
+    description: finalDescriptions.get(c.id) ?? c.description,
+  }));
+
   // If image generation failed across the board, present as a photo strip.
   const anyImages = panels.some((p) => p.imageUrl);
-  return { mode: anyImages ? "ai" : "photo", panels, cast };
+  return { mode: anyImages ? "ai" : "photo", panels, cast: castWithWardrobe };
 }
 
 /**
