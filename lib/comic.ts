@@ -478,9 +478,15 @@ type PanelResult = {
   prompt: string;
   /** True when the image API refused for safety/moderation. */
   blocked?: boolean;
+  /** True when OpenAI returned a rate-limit (429) — caller should wait & retry. */
+  rateLimited?: boolean;
   /** Human-readable explanation of why generation failed (when imageUrl is null). */
   reason?: string;
 };
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function looksLikeModerationBlock(status: number, body: string): boolean {
   if (status === 400 || status === 403 || status === 451) {
@@ -592,12 +598,13 @@ async function generatePanelFromTextCast(
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       const blocked = looksLikeModerationBlock(res.status, body);
+      const rateLimited = res.status === 429;
       const reason = explainImageApiFailure(res.status, body);
       console.warn(
         `[comic] text-to-image failed status=${res.status} blocked=${blocked} ` +
-          `reason=${reason}`
+          `rateLimited=${rateLimited} reason=${reason}`
       );
-      return { imageUrl: null, prompt, blocked, reason };
+      return { imageUrl: null, prompt, blocked, rateLimited, reason };
     }
     const data = await res.json();
     const b64 = data?.data?.[0]?.b64_json;
@@ -632,7 +639,8 @@ async function generatePanelImage(
   caption: string,
   characters: ComicCharacter[],
   descriptions: Map<string, string>,
-  caricatures: Map<string, string | null>
+  caricatures: Map<string, string | null>,
+  options: { textOnly?: boolean } = {}
 ): Promise<PanelResult> {
   if (!OPENAI_API_KEY) {
     return {
@@ -652,8 +660,9 @@ async function generatePanelImage(
   const labeledScene = sceneCaptionRewriter(caption);
   const withRefs = cast.filter((c) => c.image);
 
-  // No reference images at all → text-to-image using feature descriptions.
-  if (withRefs.length === 0) {
+  // Soften retries use text-only to avoid burning the 5 input-images/min
+  // cast-sheet quota. Feature descriptions still keep likeness.
+  if (options.textOnly || withRefs.length === 0) {
     return generatePanelFromTextCast(labeledScene, cast);
   }
 
@@ -693,6 +702,7 @@ async function generatePanelImage(
   );
 
   let editBlocked = false;
+  let editRateLimited = false;
   let editReason: string | undefined;
   try {
     const form = new FormData();
@@ -716,10 +726,11 @@ async function generatePanelImage(
     } else {
       const body = await res.text().catch(() => "");
       editBlocked = looksLikeModerationBlock(res.status, body);
+      editRateLimited = res.status === 429;
       editReason = explainImageApiFailure(res.status, body);
       console.warn(
         `[comic] image-edit failed status=${res.status} blocked=${editBlocked} ` +
-          `reason=${editReason}`
+          `rateLimited=${editRateLimited} reason=${editReason}`
       );
     }
   } catch (err) {
@@ -730,6 +741,18 @@ async function generatePanelImage(
 
   // Fall back to text-to-image, but keep the richer cast-sheet prompt as the
   // record of what we asked for (it's the more descriptive instruction).
+  // If the edit call was rate-limited, skip the immediate text fallback — the
+  // caller will wait and retry rather than burning more quota instantly.
+  if (editRateLimited) {
+    return {
+      imageUrl: null,
+      prompt,
+      blocked: editBlocked,
+      rateLimited: true,
+      reason: editReason,
+    };
+  }
+
   const fallback = await generatePanelFromTextCast(labeledScene, cast);
   if (fallback.imageUrl) {
     return {
@@ -742,6 +765,7 @@ async function generatePanelImage(
     imageUrl: null,
     prompt,
     blocked: editBlocked || fallback.blocked,
+    rateLimited: fallback.rateLimited,
     reason: [
       editReason ? `Edit: ${editReason}` : null,
       fallback.reason ? `Text fallback: ${fallback.reason}` : null,
@@ -823,120 +847,144 @@ export async function buildComic(
     descriptionSource: descriptionSource.get(c.id),
   }));
 
-  // Overall wall-clock deadline for the whole request (panels run in
-  // parallel and share this clock). Caricature generation above has already
-  // consumed some of it. We only start a new image attempt while there is
-  // enough time left to plausibly finish one, so a stuck/refused panel can't
-  // run unbounded. gpt-image-1 edits at quality:"medium" take ~30s each, and
-  // the caricature step alone can eat ~50s, so this must be generous enough
-  // that the raw retry and the softening ladder actually get a chance to run
-  // for edgy captions. The route's maxDuration is 300s and tunnels tolerate
-  // well over 100s, so 180s leaves room for several attempts per panel while
-  // still bounding the request.
-  const OVERALL_DEADLINE_MS = 180_000;
-  const MIN_ATTEMPT_MS = 20_000;
+  // Panels run SEQUENTIALLY — gpt-image-1 allows only ~5 input-images/min,
+  // so parallel panels + soften retries were burning the quota and later
+  // rounds failed in <1s. Soften retries use text-only (no cast sheet) to
+  // avoid that limit. Each soften round is a DISTINCT strategy applied to
+  // the ORIGINAL caption: 0 framing → 1 covering → 2 underwear.
+  const OVERALL_DEADLINE_MS = 280_000;
+  const MIN_ATTEMPT_MS = 18_000;
   const deadline = buildStart + OVERALL_DEADLINE_MS;
   const canAttempt = () => Date.now() < deadline - MIN_ATTEMPT_MS;
 
-  const panels: StoryPanel[] = await Promise.all(
-    scripted.map(async (panel, panelIdx) => {
-      const characters = panel.characters.map((c) => ({
-        ...c,
-        imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
-        description: descriptionCache.get(c.id) ?? c.description ?? "",
-      }));
+  const panels: StoryPanel[] = [];
+  for (let panelIdx = 0; panelIdx < scripted.length; panelIdx++) {
+    const panel = scripted[panelIdx];
+    const characters = panel.characters.map((c) => ({
+      ...c,
+      imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
+      description: descriptionCache.get(c.id) ?? c.description ?? "",
+    }));
 
-      // Convert real names → Character N labels BEFORE any image attempt or
-      // softening. Softening must preserve labels (not real names) so the
-      // image model never sees player/celebrity names.
-      const { cast: panelCast, sceneCaptionRewriter } = buildPanelCast(
-        characters,
-        descriptionCache,
-        caricatureCache
-      );
-      const labeledCaption = sceneCaptionRewriter(panel.caption);
-      const labelNames = panelCast.map((c) => c.label);
+    // Convert real names → Character N labels BEFORE any image attempt or
+    // softening so the image model never sees player/celebrity names.
+    const { cast: panelCast, sceneCaptionRewriter } = buildPanelCast(
+      characters,
+      descriptionCache,
+      caricatureCache
+    );
+    const labeledCaption = sceneCaptionRewriter(panel.caption);
+    const labelNames = panelCast.map((c) => c.label);
 
-      // Crudest first: try the labeled caption, then on ANY failure walk the
-      // soften ladder. Softening ALWAYS produces a different caption
-      // (force:true) so we never waste an attempt on a no-op rewrite.
-      type Attempt = { label: string; caption: string };
-      let result: PanelResult = { imageUrl: null, prompt: "" };
-      const tried = new Set<string>();
-      const attemptLog: PanelImageAttempt[] = [];
-      let lastRefusedCaption = labeledCaption;
+    type Attempt = { label: string; caption: string; textOnly?: boolean };
+    let result: PanelResult = { imageUrl: null, prompt: "" };
+    const tried = new Set<string>();
+    const attemptLog: PanelImageAttempt[] = [];
+    let lastRefusedCaption = labeledCaption;
+    let useTextOnly = false;
 
-      const runAttempt = async (a: Attempt) => {
-        const key = a.caption.trim();
-        if (tried.has(key)) return;
-        tried.add(key);
+    const runAttempt = async (a: Attempt) => {
+      const key = `${a.textOnly ? "t:" : "e:"}${a.caption.trim()}`;
+      if (tried.has(key)) return;
+      tried.add(key);
+
+      // On rate-limit, wait and retry the SAME caption up to twice before
+      // escalating the soften ladder.
+      for (let rateTry = 0; rateTry < 3; rateTry++) {
+        if (!canAttempt()) {
+          attemptLog.push({
+            attempt: a.label,
+            ok: false,
+            reason: "Skipped — overall comic time budget exhausted.",
+            caption: a.caption.slice(0, 160),
+          });
+          return;
+        }
         const t0 = Date.now();
         result = await generatePanelImage(
           a.caption,
           characters,
           descriptionCache,
-          caricatureCache
+          caricatureCache,
+          { textOnly: a.textOnly || useTextOnly }
         );
-        const reason = result.imageUrl
-          ? undefined
-          : result.reason ||
-            (result.blocked
-              ? "Blocked by image moderation."
-              : "Image generation failed.");
-        if (!result.imageUrl) lastRefusedCaption = a.caption;
+        if (result.imageUrl) {
+          attemptLog.push({
+            attempt: a.label,
+            ok: true,
+            caption: a.caption.slice(0, 160),
+          });
+          console.log(
+            `[comic] panel ${panelIdx} attempt=${a.label} imageOk=true ` +
+              `took=${Date.now() - t0}ms remaining=${deadline - Date.now()}ms ` +
+              `caption=${JSON.stringify(a.caption.slice(0, 80))}`
+          );
+          return;
+        }
+
+        if (result.rateLimited && rateTry < 2) {
+          const waitMs = 15_000;
+          console.warn(
+            `[comic] panel ${panelIdx} rate-limited on ${a.label}, ` +
+              `waiting ${waitMs}ms then retrying same caption`
+          );
+          attemptLog.push({
+            attempt: `${a.label}-ratewait`,
+            ok: false,
+            reason: `Rate limited — waiting ${waitMs / 1000}s then retrying.`,
+            caption: a.caption.slice(0, 160),
+          });
+          await sleep(waitMs);
+          continue;
+        }
+
+        const reason =
+          result.reason ||
+          (result.blocked
+            ? "Blocked by image moderation."
+            : "Image generation failed.");
+        lastRefusedCaption = a.caption;
+        if (result.blocked) useTextOnly = true;
         attemptLog.push({
           attempt: a.label,
-          ok: Boolean(result.imageUrl),
+          ok: false,
           reason,
           caption: a.caption.slice(0, 160),
         });
         console.log(
-          `[comic] panel ${panelIdx} attempt=${a.label} ` +
-            `imageOk=${Boolean(result.imageUrl)} blocked=${Boolean(result.blocked)} ` +
+          `[comic] panel ${panelIdx} attempt=${a.label} imageOk=false ` +
+            `blocked=${Boolean(result.blocked)} ` +
             `took=${Date.now() - t0}ms remaining=${deadline - Date.now()}ms ` +
-            `reason=${reason ?? "ok"} ` +
-            `caption=${JSON.stringify(a.caption.slice(0, 80))}`
+            `reason=${reason} caption=${JSON.stringify(a.caption.slice(0, 80))}`
         );
-      };
+        return;
+      }
+    };
 
-      if (canAttempt()) {
-        await runAttempt({ label: "raw", caption: labeledCaption });
-      } else {
+    // 1) Raw (with cast sheet when photos exist)
+    if (canAttempt()) {
+      await runAttempt({ label: "raw", caption: labeledCaption });
+    }
+
+    // 2–4) Progressive soften rounds from the ORIGINAL caption — each is a
+    // different strategy: framing → covering → underwear. Soften retries are
+    // text-only so they don't burn the cast-sheet input-image quota.
+    const levels: SanitizeLevel[] = [0, 1, 2];
+    for (const level of levels) {
+      if (result.imageUrl) break;
+      if (!canAttempt()) {
         attemptLog.push({
-          attempt: "raw",
+          attempt: `soft${level}`,
           ok: false,
-          reason: "Skipped — overall comic time budget already exhausted.",
+          reason: "Skipped — overall comic time budget exhausted.",
         });
+        break;
       }
 
-      // One raw retry only when the first failure wasn't a clear moderation
-      // block (flaky network / model blip). If it was blocked, skip straight
-      // to softening so we don't burn budget on a prompt we already know fails.
-      if (!result.imageUrl && !result.blocked && canAttempt()) {
-        await runAttempt({ label: "raw-retry", caption: labeledCaption });
-      }
-
-      // Guaranteed local framing softener first — works on labeled captions
-      // and preserves Character 1 / Character 2 (never real names).
-      if (!result.imageUrl && canAttempt()) {
-        const local = localSoften(labeledCaption, 0, labelNames);
-        if (local) {
-          await runAttempt({ label: "local0", caption: local });
-        }
-      }
-
-      const levels: SanitizeLevel[] = [0, 1, 2];
-      for (const level of levels) {
-        if (result.imageUrl) break;
-        if (!canAttempt()) {
-          attemptLog.push({
-            attempt: `level${level}`,
-            ok: false,
-            reason: "Skipped — overall comic time budget exhausted.",
-          });
-          break;
-        }
-        const [softer] = await sanitizeCaptionsForImage(
+      // Prefer deterministic local soften for this distinct strategy.
+      let softer = localSoften(labeledCaption, level, labelNames);
+      if (!softer || tried.has(`t:${softer.trim()}`) || tried.has(`e:${softer.trim()}`)) {
+        const [llmSoft] = await sanitizeCaptionsForImage(
           [
             {
               caption: labeledCaption,
@@ -947,45 +995,45 @@ export async function buildComic(
           level,
           { force: true }
         );
-        if (!softer || tried.has(softer.trim())) continue;
-        await runAttempt({ label: `level${level}`, caption: softer });
-      }
-
-      // Last local pass at stronger level if LLM softenings also failed.
-      if (!result.imageUrl && canAttempt()) {
-        const localStrong = localSoften(labeledCaption, 2, labelNames);
-        if (localStrong && !tried.has(localStrong.trim())) {
-          await runAttempt({ label: "local2", caption: localStrong });
+        if (llmSoft && llmSoft.trim() !== labeledCaption.trim()) {
+          softer = llmSoft;
         }
       }
+      if (!softer || softer.trim() === labeledCaption.trim()) continue;
+      if (tried.has(`t:${softer.trim()}`) || tried.has(`e:${softer.trim()}`)) continue;
 
-      const failureReason = result.imageUrl
-        ? undefined
-        : attemptLog
-            .filter((a) => !a.ok && a.reason)
-            .map((a) => `${a.attempt}: ${a.reason}`)
-            .join(" | ") ||
-          result.reason ||
-          "All image attempts failed.";
+      await runAttempt({
+        label: `soft${level}`,
+        caption: softer,
+        textOnly: true,
+      });
+    }
 
-      if (!result.imageUrl) {
-        console.warn(
-          `[comic] panel ${panelIdx} produced no image, ` +
-            `total=${Date.now() - buildStart}ms ` +
-            `reason=${failureReason}`
-        );
-      }
+    const failureReason = result.imageUrl
+      ? undefined
+      : attemptLog
+          .filter((a) => !a.ok && a.reason)
+          .map((a) => `${a.attempt}: ${a.reason}`)
+          .join(" | ") ||
+        result.reason ||
+        "All image attempts failed.";
 
-      return {
-        ...panel,
-        characters,
-        imageUrl: result.imageUrl ?? undefined,
-        imagePrompt: result.prompt || undefined,
-        imageFailureReason: failureReason,
-        imageAttempts: attemptLog,
-      };
-    })
-  );
+    if (!result.imageUrl) {
+      console.warn(
+        `[comic] panel ${panelIdx} produced no image, ` +
+          `total=${Date.now() - buildStart}ms reason=${failureReason}`
+      );
+    }
+
+    panels.push({
+      ...panel,
+      characters,
+      imageUrl: result.imageUrl ?? undefined,
+      imagePrompt: result.prompt || undefined,
+      imageFailureReason: failureReason,
+      imageAttempts: attemptLog,
+    });
+  }
 
   // If image generation failed across the board, present as a photo strip.
   const anyImages = panels.some((p) => p.imageUrl);

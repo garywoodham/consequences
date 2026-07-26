@@ -2,101 +2,66 @@
 // image model is less likely to refuse them. Only the *image prompt* is
 // changed; the story text shown to players stays exactly as written.
 //
-// Strategy when an image is blocked:
-//   1. Surgical framing / implication rewrite (keep the joke, hide the trigger)
-//   2. Stronger aftermath / props rewrite
-//   3. Context-preserving cartoon beat (still about the same moment)
-// Plus a deterministic local softener as a guaranteed first soft pass so we
-// never depend solely on the LLM.
+// Progressive ladder — each round is a DISTINCT strategy applied to the
+// ORIGINAL caption (not a tiny tweak of the previous try):
+//   0 = framing hide (shoulders-up / covering with arms)
+//   1 = covering with an object (sheet / towel / cushion / bathrobe)
+//   2 = underwear / lightly clothed (still cheeky, clearly not nude)
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-/** Escalation ladder for the sanitiser. Start mild; only go harder on refusal. */
 export type SanitizeLevel = 0 | 1 | 2;
 
 const BASE_RULES =
   "ABSOLUTE RULES:\n" +
-  "1. Every character name provided for an item MUST appear in that item's " +
-  "rewrite spelled EXACTLY as given, in the same role/position it had in the " +
-  "original caption. Do not replace names with pronouns, roles ('the man'), " +
-  "or different names, and do not swap who is doing what.\n" +
-  "2. Preserve the SAME story beat, setting, and adult humour. The rewrite " +
-  "must still clearly be about the same moment — do NOT invent a different " +
-  "scene, moralise, or make it wholesome/kid-friendly.\n" +
-  "3. KEEP AS MUCH OF THE ORIGINAL WORDING AS POSSIBLE. Only change the " +
-  "phrase that would trip an image filter.\n" +
-  "4. Do NOT lengthen the caption much. Keep it about the same length.\n" +
-  "5. No moralising, apologies, disclaimers or explanations.\n" +
-  "6. Prefer FRAMING and IMPLICATION over inventing props that change the " +
-  "story (shoulders-up crop, sheet wrapped around them, covering themselves " +
-  "with arms, silhouette, steam, rumpled duvet, flushed faces).\n";
+  "1. Every character name/label provided MUST appear spelled EXACTLY as " +
+  "given. Do not invent real-person names. Do not swap who is who.\n" +
+  "2. Keep the SAME setting and adult joke intent — do not invent an " +
+  "unrelated wholesome scene.\n" +
+  "3. Remove EVERY blocked word (naked/nude/sex/fuck/etc.).\n" +
+  "4. Keep the caption about the same length.\n" +
+  "5. No moralising, apologies, or disclaimers.\n";
 
 const LEVEL_INSTRUCTIONS: Record<SanitizeLevel, string> = {
   0:
-    "You are the image-safety pass for an ADULT party game. The image model " +
-    "just REFUSED this caption. Soften ONLY the blocked phrase so a comic " +
-    "panel can still be drawn that matches the joke. Prefer framing tricks " +
-    "and implication over changing the story.\n\n" +
-    "GOOD rewrites (same beat, image-safe framing). Names below are often " +
-    "neutral labels like 'Character 1' — keep whatever names you are given " +
-    "verbatim, never invent real-person names:\n" +
-    "  • 'Character 2 got completely naked in the kitchen'\n" +
-    "      → 'Character 2 in the kitchen seen from the shoulders up, covering " +
-    "himself with his arms, clothes on the floor'\n" +
-    "  • 'Character 1 was naked on the sofa'\n" +
-    "      → 'Character 1 on the sofa wrapped in a thin sheet from the " +
-    "shoulders down, looking shocked'\n" +
-    "  • 'Character 1 and Character 2 had sex on the sofa'\n" +
-    "      → 'Character 1 and Character 2 cuddled and kissed on the sofa, " +
-    "wrapped in a rumpled duvet'\n" +
-    "  • 'They were having sex'\n" +
-    "      → 'Character 1 and Character 2 cuddled and kissed passionately " +
-    "under the covers'\n" +
-    "  • 'Character 1 went down on Character 2 at the party'\n" +
-    "      → 'Character 1 disappeared under Character 2\\'s skirt at the party'\n" +
-    "  • 'Character 1 shot Character 2 in the face with a rifle'\n" +
-    "      → 'Character 1 blasted Character 2 in the face with a cartoon pop-gun'\n" +
-    "  • 'Character 1 snorted a huge line of cocaine'\n" +
-    "      → 'Character 1 snorted a huge line of sherbet powder'\n" +
-    "\n" +
-    "When the caption has two named people, BOTH names must stay and refer to " +
-    "the SAME two people — do not invent a third person or swap who is who.\n" +
-    "\n" +
-    "Bad — do NOT do this:\n" +
-    "  ✗ Leaving the trigger word in (naked/nude/sex/cock/etc.).\n" +
-    "  ✗ Turning it into a wholesome or unrelated scene.\n" +
-    "  ✗ Dropping or paraphrasing the character names.\n" +
-    "  ✗ Rewriting phrases that are already fine.\n",
+    "SOFTEN ROUND 1 — FRAMING HIDE. The image model refused. Rewrite so " +
+    "nudity/sex is HIDDEN by camera framing, not removed from the joke.\n\n" +
+    "Nudity → shoulders-up crop, covering themselves with arms, clothes on floor.\n" +
+    "Sex → cuddled and kissed under a rumpled duvet.\n\n" +
+    "Examples:\n" +
+    "  • 'Character 2 got naked' → 'Character 2 seen from the shoulders up, " +
+    "covering themselves with their arms, clothes on the floor'\n" +
+    "  • 'You look good naked' → 'You look good — seen from the shoulders up, " +
+    "covering yourself with your arms'\n" +
+    "  • 'they Had sex' → 'they cuddled and kissed under a rumpled duvet'\n",
   1:
-    "STRONGER RETRY. The image model still refused. Soften further while " +
-    "keeping the same story beat and adult tone. Lean harder on aftermath, " +
-    "framing, and romantic implication (cuddling, kissing, flushed faces, " +
-    "rumpled sheets) without showing the act.\n\n" +
-    "Examples (keep given labels/names verbatim):\n" +
-    "  • 'Character 2 got naked'\n" +
-    "      → 'Character 2 covering himself with a cushion, clothes piled on " +
-    "the floor, framed from the waist up'\n" +
-    "  • 'Character 1 and Character 2 had sex'\n" +
-    "      → 'Character 1 and Character 2 cuddled and kissed under the duvet " +
-    "afterwards, both flushed and giggling'\n" +
-    "  • 'Character 1 shot Character 2'\n" +
-    "      → 'Character 2 collapsed with cartoon X-eyes and stars, Character 1 " +
-    "holding a smoking pop-gun'\n" +
-    "  • 'Character 1 did cocaine'\n" +
-    "      → 'Character 1 wild-eyed with spiral pupils, white dust on her nose'\n",
+    "SOFTEN ROUND 2 — COVERING. Round 1 still refused. Rewrite so anyone " +
+    "undressed is COVERING themselves with something (sheet, towel, cushion, " +
+    "bathrobe) — the joke stays, skin is hidden.\n\n" +
+    "Nudity → wrapped in a sheet / towel / bathrobe, covering themselves.\n" +
+    "Sex → tangled under a duvet / blanket, covered up, both flushed.\n\n" +
+    "Examples:\n" +
+    "  • 'Character 2 got naked' → 'Character 2 wrapped in a bedsheet, " +
+    "covering themselves, clothes in a pile nearby'\n" +
+    "  • 'You look good naked' → 'You look good wrapped in a towel, covering " +
+    "yourself'\n" +
+    "  • 'they Had sex' → 'they were tangled under a duvet, fully covered, " +
+    "both flushed'\n",
   2:
-    "LAST RETRY. Keep the SAME characters, setting and joke intent, but " +
-    "depict it as a cheeky PG-13 cartoon beat — still recognisably the same " +
-    "moment (cuddling, kissing, rumpled bed, empty glasses, shocked faces), " +
-    "never a generic unrelated whimsical scene. Every required name MUST " +
-    "appear verbatim as the same people.",
+    "SOFTEN ROUND 3 — UNDERWEAR / LIGHT CLOTHING. Rounds 1–2 still refused. " +
+    "Rewrite so anyone undressed is clearly wearing underwear or a towel — " +
+    "cheeky but not nude. Sex → cuddling in underwear under the covers.\n\n" +
+    "Examples:\n" +
+    "  • 'Character 2 got naked' → 'Character 2 standing in their underwear, " +
+    "looking surprised'\n" +
+    "  • 'You look good naked' → 'You look good in your underwear'\n" +
+    "  • 'they Had sex' → 'they cuddled in their underwear under the covers'\n",
 };
 
 function systemPrompt(level: SanitizeLevel, retryDueToNameDrop = false): string {
   const nameNote = retryDueToNameDrop
     ? "\nCRITICAL: your previous rewrite dropped or altered one or more " +
-      "required names. Every listed name MUST appear verbatim, doing what " +
-      "the caption says.\n"
+      "required names. Every listed name MUST appear verbatim.\n"
     : "";
   return (
     LEVEL_INSTRUCTIONS[level] +
@@ -115,15 +80,10 @@ export function hasSafeRewriteProvider(): boolean {
 export type SafeRewriteItem = {
   caption: string;
   names: string[];
-  /** Optional previously-refused caption, so the LLM can escalate from it. */
   refusedCaption?: string;
 };
 
-/**
- * Heuristic: is this caption likely to trip image-model moderation?
- */
 const TRIGGER_PATTERNS: RegExp[] = [
-  // Nudity / sex acts
   /\bnaked\b/i,
   /\bnude\b/i,
   /\bstark naked\b/i,
@@ -166,8 +126,6 @@ const TRIGGER_PATTERNS: RegExp[] = [
   /\barse\b/i,
   /\bass(hole)?\b/i,
   /\bbutthole\b/i,
-
-  // Drugs
   /\bcocaine\b/i,
   /\bcoke\b/i,
   /\bheroin\b/i,
@@ -179,8 +137,6 @@ const TRIGGER_PATTERNS: RegExp[] = [
   /\bsnort(ed|ing)?\b/i,
   /\binject(ed|ing)?\b/i,
   /\bshoot(ing)? up\b/i,
-
-  // Weapons / gore
   /\bshot(gun|s)?\b/i,
   /\bshot\b/i,
   /\brifle\b/i,
@@ -199,38 +155,26 @@ export function mayNeedSanitizing(caption: string): boolean {
   return TRIGGER_PATTERNS.some((re) => re.test(caption));
 }
 
-/** All required names appear (case-insensitively) as whole-word matches. */
 function preservesNames(rewrite: string, names: string[]): boolean {
   return names.every((n) => {
     const needle = n.trim();
     if (!needle) return true;
     const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "iu");
-    return re.test(rewrite);
+    return new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "iu").test(rewrite);
   });
 }
 
-/**
- * If a rewrite dropped the required names (common when the caption said
- * "they had sex"), put the SAME people back in — replace "they" with the
- * name pair, or prepend the names. Never invent a third person.
- */
 function ensureNamesPresent(caption: string, names: string[]): string {
   const needed = names.map((n) => n.trim()).filter(Boolean);
   if (needed.length === 0 || preservesNames(caption, needed)) return caption;
 
   if (needed.length === 1) {
-    if (/\bthey\b/i.test(caption)) {
-      return caption.replace(/\bthey\b/i, needed[0]);
-    }
+    if (/\bthey\b/i.test(caption)) return caption.replace(/\bthey\b/i, needed[0]);
     return `${needed[0]} — ${caption}`;
   }
 
   const pair = `${needed[0]} and ${needed[1]}`;
-  if (/\bthey\b/i.test(caption)) {
-    return caption.replace(/\bthey\b/i, pair);
-  }
-  // Already has one of the names — append the missing one beside it if possible.
+  if (/\bthey\b/i.test(caption)) return caption.replace(/\bthey\b/i, pair);
   if (preservesNames(caption, [needed[0]]) && !preservesNames(caption, [needed[1]])) {
     return caption.replace(
       new RegExp(`(?<!\\p{L})${needed[0].replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?!\\p{L})`, "iu"),
@@ -246,11 +190,12 @@ function ensureNamesPresent(caption: string, names: string[]): string {
   return `${pair} — ${caption}`;
 }
 
+type Swap = { re: RegExp; byLevel: [string, string, string] };
+
 /**
- * Deterministic local softener for common trigger phrases. Used as a
- * guaranteed first soft pass so we don't depend solely on the LLM, and as a
- * last resort that still keeps the story beat instead of a generic whimsical
- * scene. Returns null if nothing matched.
+ * Deterministic progressive softener. Each level is a DIFFERENT strategy
+ * applied to the original caption:
+ *   0 framing hide · 1 covering with an object · 2 underwear
  */
 export function localSoften(
   caption: string,
@@ -259,111 +204,158 @@ export function localSoften(
 ): string | null {
   let out = caption;
   let changed = false;
+  const lvl = Math.min(Math.max(level, 0), 2) as SanitizeLevel;
 
-  const swaps: { re: RegExp; mild: string; stronger: string }[] = [
+  const swaps: Swap[] = [
     {
       re: /\b(?:got |was |were )?(?:completely |stark |totally )?(?:naked|nude)\b/gi,
-      mild:
+      byLevel: [
         "seen from the shoulders up, covering themselves with their arms, clothes on the floor",
-      stronger:
-        "wrapped in a thin sheet from the shoulders down, looking shocked, clothes on the floor",
+        "wrapped in a bedsheet covering themselves, clothes in a pile nearby",
+        "standing in their underwear, looking surprised",
+      ],
+    },
+    {
+      re: /\bnaked\b/gi,
+      byLevel: [
+        "seen from the shoulders up, covering themselves with their arms",
+        "wrapped in a towel covering themselves",
+        "in their underwear",
+      ],
+    },
+    {
+      re: /\bnude\b/gi,
+      byLevel: [
+        "seen from the shoulders up, covering themselves with their arms",
+        "wrapped in a towel covering themselves",
+        "in their underwear",
+      ],
     },
     {
       re: /\btopless\b/gi,
-      mild: "seen from the shoulders up, arms crossed over their chest",
-      stronger: "wearing only a strategically held towel across the chest",
+      byLevel: [
+        "seen from the shoulders up, arms crossed over their chest",
+        "covering their chest with a towel",
+        "wearing a camisole",
+      ],
     },
     {
       re: /\bbottomless\b/gi,
-      mild: "framed from the waist up, covering themselves with a cushion",
-      stronger: "wrapped in a bedsheet from the waist down",
+      byLevel: [
+        "framed from the waist up, covering themselves with a cushion",
+        "wrapped in a towel covering themselves",
+        "wearing underwear",
+      ],
     },
     {
       re: /\b(?:stripped|stripping|strip)\b/gi,
-      mild: "in a state of undress, covering themselves",
-      stronger: "wrapped in a sheet, clothes piled nearby",
+      byLevel: [
+        "in a state of undress, covering themselves",
+        "wrapped in a bathrobe covering themselves, clothes nearby",
+        "changed down to their underwear",
+      ],
     },
     {
       re: /\b(?:were |was |are |is )?(?:had sex|having sex|have sex|made love|making love)\b/gi,
-      mild: "cuddled and kissed under a rumpled duvet",
-      stronger: "cuddled and kissed passionately under the covers afterwards, both flushed",
+      byLevel: [
+        "cuddled and kissed under a rumpled duvet",
+        "were tangled under a duvet, fully covered, both flushed",
+        "cuddled in their underwear under the covers",
+      ],
     },
     {
       re: /\b(?:shagged|shagging|shag|bonked|bonking|bonk)\b/gi,
-      mild: "cuddled and kissed under a blanket",
-      stronger: "cuddled and kissed under the sheets afterwards, both flushed",
+      byLevel: [
+        "cuddled and kissed under a blanket",
+        "were tangled under a blanket, fully covered, both flushed",
+        "cuddled in their underwear under the covers",
+      ],
     },
     {
       re: /\bfuck(?:ed|ing|s)?\b/gi,
-      mild: "cuddled and kissed",
-      stronger: "cuddled and kissed under the covers",
+      byLevel: [
+        "cuddled and kissed",
+        "were covered up under the duvet, both flushed",
+        "cuddled in their underwear",
+      ],
     },
     {
       re: /\b(?:slept together|sleeping together|hooked up|hooking up)\b/gi,
-      mild: "cuddled and kissed",
-      stronger: "cuddled up together under a rumpled duvet",
+      byLevel: [
+        "cuddled and kissed",
+        "were covered up under the duvet, both flushed",
+        "cuddled in their underwear under the covers",
+      ],
     },
     {
       re: /\b(?:went down on|going down on)\b/gi,
-      mild: "disappeared under",
-      stronger: "vanished mischievously under a tablecloth near",
+      byLevel: [
+        "disappeared under",
+        "hid under a blanket near",
+        "gave a mischievous wink to",
+      ],
     },
     {
       re: /\b(?:blow ?job|handjob)\b/gi,
-      mild: "a very private cuddle under the table",
-      stronger: "a mischievous cuddle under the tablecloth",
+      byLevel: [
+        "a very private cuddle under the table",
+        "a cuddle under a covering tablecloth",
+        "a cheeky cuddle under the tablecloth",
+      ],
     },
     {
       re: /\b(?:boobs?|tits?|nipples?)\b/gi,
-      mild: "chest",
-      stronger: "upper body",
+      byLevel: ["chest", "outfit", "top"],
     },
     {
       re: /\b(?:penis|cock|dick|vagina|pussy)\b/gi,
-      mild: "nothing visible below a carefully placed sheet",
-      stronger: "nothing visible below a carefully placed sheet",
+      byLevel: [
+        "nothing visible below a carefully placed sheet",
+        "nothing visible under the covers",
+        "nothing visible below their underwear",
+      ],
     },
     {
       re: /\b(?:cocaine|coke|heroin|meth|mdma|ecstasy|ketamine)\b/gi,
-      mild: "sherbet powder",
-      stronger: "sparkly party powder",
+      byLevel: ["sherbet powder", "sparkly party powder", "icing sugar"],
     },
     {
       re: /\b(?:rifle|pistol|shotgun)\b/gi,
-      mild: "cartoon pop-gun",
-      stronger: "oversized comedy water pistol",
+      byLevel: ["cartoon pop-gun", "oversized comedy water pistol", "foam noodle"],
     },
     {
       re: /\b(?:shot|stabbed|murdered|killed)\b/gi,
-      mild: "blasted with a cartoon pop-gun",
-      stronger: "knocked out with cartoon X-eyes and stars",
+      byLevel: [
+        "blasted with a cartoon pop-gun",
+        "knocked out with cartoon X-eyes and stars",
+        "bonked with a rubber chicken",
+      ],
     },
   ];
 
   for (const swap of swaps) {
-    // Reset lastIndex for global regexes before testing/replacing.
     swap.re.lastIndex = 0;
     if (swap.re.test(out)) {
       swap.re.lastIndex = 0;
-      out = out.replace(swap.re, level === 0 ? swap.mild : swap.stronger);
+      out = out.replace(swap.re, swap.byLevel[lvl]);
       changed = true;
     }
   }
 
   out = out.replace(/\s+/g, " ").trim();
   if (!changed || out === caption.trim()) return null;
+  // Must not still contain hard triggers after a soften pass.
+  if (mayNeedSanitizing(out) && lvl < 2) {
+    // Try once more at a higher level from the ORIGINAL caption.
+    return localSoften(caption, ((lvl + 1) as SanitizeLevel), names);
+  }
   return ensureNamesPresent(out, names);
 }
 
-/**
- * Context-preserving last resort if every other attempt fails. Keeps names
- * and a hint of the original caption rather than inventing a whimsical scene.
- */
 function synthesizeFallback(item: SafeRewriteItem): string {
   const local = localSoften(item.caption, 2, item.names);
   if (local && preservesNames(local, item.names)) return local;
 
-  // Strip triggers from the original for a lightweight context keep.
   let stripped = item.caption;
   for (const re of TRIGGER_PATTERNS) stripped = stripped.replace(re, "");
   stripped = stripped
@@ -372,8 +364,6 @@ function synthesizeFallback(item: SafeRewriteItem): string {
     .replace(/^[,.\s]+|[,.\s]+$/g, "")
     .trim();
 
-  // Nothing spicy to remove — keep the original caption rather than inventing
-  // a generic scene that drifts from the story.
   if (!mayNeedSanitizing(item.caption) || stripped === item.caption.trim()) {
     return item.caption;
   }
@@ -420,8 +410,8 @@ async function callSanitizer(
           {
             role: "user",
             content:
-              "The image model refused the previous prompt. Soften each caption " +
-              "so it can be drawn, keeping the same story beat.\n" +
+              "The image model refused. Soften each caption using THIS round's " +
+              "strategy. Keep labels/names verbatim.\n" +
               JSON.stringify({ items: payload }),
           },
         ],
@@ -443,20 +433,13 @@ async function callSanitizer(
 }
 
 export type SanitizeOptions = {
-  /**
-   * When true (refusal path), always rewrite — never skip via the keyword
-   * heuristic. A caption can be refused even without matching our trigger list.
-   */
+  /** When true (refusal path), always rewrite — never skip via the keyword heuristic. */
   force?: boolean;
 };
 
 /**
- * Rewrite each caption to an image-safe version at the given escalation
- * `level` (0 = framing/implication; 1 = stronger aftermath; 2 = PG-13 cartoon).
- *
- * On the refusal path (`force: true`) we ALWAYS produce a different caption:
- *   local softener → LLM rewrite → context-preserving fallback.
- * At Level 0 without force, mild captions with no trigger words are left alone.
+ * Rewrite each caption at the given escalation level.
+ * Prefer deterministic local soften (distinct per level); LLM fills gaps.
  */
 export async function sanitizeCaptionsForImage(
   items: SafeRewriteItem[],
@@ -475,15 +458,9 @@ export async function sanitizeCaptionsForImage(
     if (!force && level === 0 && !mayNeedSanitizing(it.caption)) {
       return it.caption;
     }
-    // At level 0, prefer the cheap deterministic local softener first.
-    // At higher levels (or when we need a fresh rewrite after a local pass
-    // already failed), leave null so the LLM gets a chance.
-    if (level === 0) {
-      const local = localSoften(it.caption, level, it.names);
-      if (local && local !== it.caption.trim()) {
-        return local;
-      }
-    }
+    // Always prefer the deterministic level-specific local softener first.
+    const local = localSoften(it.caption, level, it.names);
+    if (local && local !== it.caption.trim()) return local;
     return null;
   });
 
@@ -507,9 +484,7 @@ export async function sanitizeCaptionsForImage(
       const withNames = ensureNamesPresent(rw, items[origIdx].names);
       if (
         preservesNames(withNames, items[origIdx].names) &&
-        // Spicy captions must change; clean ones may stay as-is.
         (!spicy || withNames !== original) &&
-        // Prefer rewrites that actually removed triggers when the original had them.
         (!spicy || !mayNeedSanitizing(withNames) || level >= 1)
       ) {
         finalResults[origIdx] = withNames;
@@ -521,16 +496,14 @@ export async function sanitizeCaptionsForImage(
   }
 
   pendingIndices.forEach((i) => {
-    const local = localSoften(items[i].caption, level, items[i].names);
-    finalResults[i] = local ?? synthesizeFallback(items[i]);
+    finalResults[i] =
+      localSoften(items[i].caption, level, items[i].names) ??
+      synthesizeFallback(items[i]);
   });
 
   return finalResults.map((r, i) => {
     let result = r ?? synthesizeFallback(items[i]);
     result = ensureNamesPresent(result, items[i].names);
-    // On the refusal path for spicy captions, never return the identical
-    // original — that wastes an image attempt. Clean captions can stay as-is
-    // (the caller already tried them).
     if (
       force &&
       mayNeedSanitizing(items[i].caption) &&
