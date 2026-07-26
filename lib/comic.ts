@@ -674,25 +674,60 @@ async function generatePanelFromTextCast(
 }
 
 /**
- * FLUX Pro (via fal.ai) text-to-image panel. Same feature-description prompt
- * as the OpenAI text path, but with fal's safety filters dialled to their
- * most permissive settings — useful when OpenAI moderation refuses a scene.
+ * Compress a model-sheet description so it survives FLUX's short prompt
+ * window: keep the leading feature sentences, always keep the STORY WARDROBE
+ * clause (continuity), and trim at a word boundary.
+ */
+function compactDescriptionForFlux(desc: string, maxChars = 260): string {
+  const cleaned = desc.replace(/\s+/g, " ").trim();
+  if (cleaned.length <= maxChars) return cleaned;
+
+  const wardrobeMatch = cleaned.match(/STORY WARDROBE\b[\s\S]*$/i);
+  const wardrobe = wardrobeMatch ? ` ${wardrobeMatch[0].trim()}` : "";
+  const budget = Math.max(80, maxChars - wardrobe.length);
+  const base = wardrobeMatch
+    ? cleaned.slice(0, wardrobeMatch.index).trim()
+    : cleaned;
+  let head = base.slice(0, budget);
+  const lastSpace = head.lastIndexOf(" ");
+  if (lastSpace > 40) head = head.slice(0, lastSpace);
+  return `${head.replace(/[,;.\s]+$/, "")}.${wardrobe}`;
+}
+
+/**
+ * FLUX Pro (via fal.ai) text-to-image panel with fal's safety filters at
+ * their most permissive settings — useful when OpenAI refuses a scene.
+ *
+ * FLUX truncates long prompts (short text-encoder window), so unlike the
+ * OpenAI path this uses a COMPACT prompt: headcount + scene first, then
+ * shortened character descriptions. Otherwise the second character's
+ * description falls off the end and only one person gets drawn.
  */
 async function generatePanelFromFlux(
   sceneWithLabels: string,
   cast: PanelCharacter[]
 ): Promise<PanelResult> {
-  const guide = cast.length ? buildCharacterGuide(cast, false) : "";
-  const labelList = cast.map((c) => c.label).join(", ");
-  const guideBlock = guide
-    ? `${FICTIONAL_NOTE}\n\nCHARACTER GUIDE:\n${guide}\n\n` +
-      `All of these characters (${labelList}) must appear in the panel doing ` +
-      `exactly what the scene says; do not swap or omit anyone.\n\n`
-    : "";
-  const scene = ensureAllPresent(sceneWithLabels, cast);
+  const labelList = cast.map((c) => c.label).join(" and ");
+  const headcount =
+    cast.length > 1
+      ? `The panel MUST show ALL ${cast.length} people together, every one ` +
+        `fully visible: ${labelList}. Do not leave anyone out or merge them.\n\n`
+      : "";
+  const castLines = cast
+    .map((pc) => {
+      const features = pc.description
+        ? compactDescriptionForFlux(pc.description)
+        : "an original cartoon character with a distinct, consistent look";
+      return `${pc.label}: ${features}`;
+    })
+    .join("\n");
+
   const prompt = scrubRealNamesFromPrompt(
-    `${NO_TEXT}\n\n${guideBlock}SCENE: ${scene}\n\n` +
-      `STYLE: ${PANEL_STYLE}.\n\n${NO_TEXT}`,
+    `${PANEL_STYLE}. No text, no words, no letters, no speech bubbles, ` +
+      `no signs anywhere in the image.\n\n` +
+      headcount +
+      `SCENE: ${sceneWithLabels}\n\n` +
+      (castLines ? `WHO THEY ARE (fictional cartoon characters):\n${castLines}` : ""),
     cast
   );
 
