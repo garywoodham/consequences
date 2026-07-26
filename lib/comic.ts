@@ -1,9 +1,10 @@
-// Server-only module: reads OPENAI_API_KEY and calls external image APIs.
+// Server-only module: reads OPENAI_API_KEY / FAL_KEY and calls image APIs.
 import type {
   CaricatureStyle,
   ComicBuildResult,
   ComicCharacter,
   ComicStripData,
+  ImageProvider,
   PanelImageAttempt,
   Story,
   StoryLine,
@@ -25,6 +26,7 @@ import {
 } from "./continuity";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const FAL_KEY = process.env.FAL_KEY;
 
 const CARICATURE_STYLE_BASE =
   "bold ink outlines, flat vibrant colors, clean white background, single " +
@@ -84,7 +86,15 @@ const NO_TEXT =
   "no scribbles that resemble writing. All storytelling must be visual only.";
 
 export function hasAiProvider(): boolean {
-  return Boolean(OPENAI_API_KEY);
+  return Boolean(OPENAI_API_KEY || FAL_KEY);
+}
+
+/** Which image engines are configured (drives the UI provider toggle). */
+export function availableImageProviders(): ImageProvider[] {
+  const providers: ImageProvider[] = [];
+  if (OPENAI_API_KEY) providers.push("openai");
+  if (FAL_KEY) providers.push("flux");
+  return providers;
 }
 
 function escapeRegExp(s: string): string {
@@ -664,6 +674,96 @@ async function generatePanelFromTextCast(
 }
 
 /**
+ * FLUX Pro (via fal.ai) text-to-image panel. Same feature-description prompt
+ * as the OpenAI text path, but with fal's safety filters dialled to their
+ * most permissive settings — useful when OpenAI moderation refuses a scene.
+ */
+async function generatePanelFromFlux(
+  sceneWithLabels: string,
+  cast: PanelCharacter[]
+): Promise<PanelResult> {
+  const guide = cast.length ? buildCharacterGuide(cast, false) : "";
+  const labelList = cast.map((c) => c.label).join(", ");
+  const guideBlock = guide
+    ? `${FICTIONAL_NOTE}\n\nCHARACTER GUIDE:\n${guide}\n\n` +
+      `All of these characters (${labelList}) must appear in the panel doing ` +
+      `exactly what the scene says; do not swap or omit anyone.\n\n`
+    : "";
+  const scene = ensureAllPresent(sceneWithLabels, cast);
+  const prompt = scrubRealNamesFromPrompt(
+    `${NO_TEXT}\n\n${guideBlock}SCENE: ${scene}\n\n` +
+      `STYLE: ${PANEL_STYLE}.\n\n${NO_TEXT}`,
+    cast
+  );
+
+  try {
+    const res = await fetch("https://fal.run/fal-ai/flux-pro/v1.1", {
+      method: "POST",
+      headers: {
+        Authorization: `Key ${FAL_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        prompt,
+        image_size: "square_hd",
+        num_images: 1,
+        output_format: "png",
+        // Most permissive settings fal exposes for this model.
+        safety_tolerance: "6",
+        enable_safety_checker: false,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      const lower = body.toLowerCase();
+      const blocked =
+        looksLikeModerationBlock(res.status, body) ||
+        lower.includes("nsfw") ||
+        (res.status === 422 && lower.includes("content"));
+      const rateLimited = res.status === 429;
+      const reason = blocked
+        ? "Blocked by FLUX content filter."
+        : `FLUX API error (HTTP ${res.status}): ${body.slice(0, 160)}`;
+      console.warn(
+        `[comic] flux generation failed status=${res.status} blocked=${blocked} reason=${reason}`
+      );
+      return { imageUrl: null, prompt, blocked, rateLimited, reason };
+    }
+
+    const data = (await res.json()) as {
+      images?: { url?: string; content_type?: string }[];
+      has_nsfw_concepts?: boolean[];
+    };
+    const url = data?.images?.[0]?.url;
+    if (!url) {
+      return {
+        imageUrl: null,
+        prompt,
+        reason: "FLUX returned success but no image URL.",
+      };
+    }
+
+    // Inline as a data URL so downloads/resume behave exactly like OpenAI
+    // panels (fal-hosted URLs also expire).
+    const imgRes = await fetch(url);
+    if (!imgRes.ok) {
+      return { imageUrl: url, prompt };
+    }
+    const buf = Buffer.from(await imgRes.arrayBuffer());
+    const mime = imgRes.headers.get("content-type") ?? "image/png";
+    return { imageUrl: `data:${mime};base64,${buf.toString("base64")}`, prompt };
+  } catch (err) {
+    return {
+      imageUrl: null,
+      prompt,
+      reason: `Network error calling FLUX API: ${
+        err instanceof Error ? err.message : "unknown"
+      }`,
+    };
+  }
+}
+
+/**
  * Generate a single comic panel. Characters are described by their FEATURES
  * (from the caricature) under neutral labels, and the caption is rewritten so
  * those labels replace the real names. When reference caricatures exist they
@@ -676,9 +776,12 @@ async function generatePanelImage(
   characters: ComicCharacter[],
   descriptions: Map<string, string>,
   caricatures: Map<string, string | null>,
-  options: { textOnly?: boolean } = {}
+  options: { textOnly?: boolean; provider?: ImageProvider } = {}
 ): Promise<PanelResult> {
-  if (!OPENAI_API_KEY) {
+  const provider: ImageProvider =
+    options.provider === "flux" && FAL_KEY ? "flux" : "openai";
+
+  if (provider === "openai" && !OPENAI_API_KEY) {
     return {
       imageUrl: null,
       prompt: "",
@@ -694,6 +797,13 @@ async function generatePanelImage(
   // Caption may already be label-substituted by the caller; run again so any
   // leftover real names become Character N before the prompt is built.
   const labeledScene = sceneCaptionRewriter(caption);
+
+  // FLUX path: text-to-image with the same feature-description guide (no
+  // cast-sheet edit support), fewest content restrictions.
+  if (provider === "flux") {
+    return generatePanelFromFlux(labeledScene, cast);
+  }
+
   const withRefs = cast.filter((c) => c.image);
 
   // Soften retries use text-only to avoid burning the 5 input-images/min
@@ -874,7 +984,8 @@ type PlannedPanel = {
 export async function buildComic(
   story: Story,
   style: CaricatureStyle = "balanced",
-  previousComic?: ComicStripData | null
+  previousComic?: ComicStripData | null,
+  provider: ImageProvider = "openai"
 ): Promise<ComicBuildResult> {
   const buildStart = Date.now();
   const scripted = scriptPanels(story);
@@ -1139,7 +1250,8 @@ export async function buildComic(
 
   console.log(
     `[comic] drawing ${planned.length} panels in parallel ` +
-      `(concurrency=${PARALLEL_CONCURRENCY}, kept=${keptPanels.size})`
+      `(provider=${provider}, concurrency=${PARALLEL_CONCURRENCY}, ` +
+      `kept=${keptPanels.size})`
   );
 
   const drawnPanels: StoryPanel[] = await mapPool(
@@ -1213,7 +1325,7 @@ export async function buildComic(
             characters,
             liveDescriptions,
             caricatureCache,
-            { textOnly: a.textOnly || useTextOnly }
+            { textOnly: a.textOnly || useTextOnly, provider }
           );
           if (result.imageUrl) {
             attemptLog.push({

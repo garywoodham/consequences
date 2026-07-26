@@ -41,6 +41,7 @@ cp .env.local.example .env.local
 | `PARTYKIT_HOST` | Runtime override | Read at request time by `/api/config`, so the host can change without rebuilding (handy for preview tunnels). |
 | `BLOB_READ_WRITE_TOKEN` | Optional | Vercel Blob token for avatar uploads. Without it, avatars use base64 fallback. |
 | `OPENAI_API_KEY` | Optional | Enables AI comic strips: caricatures of player photos + illustrated panels. Without it, a photo-based comic is rendered instead. |
+| `FAL_KEY` | Optional | Enables the FLUX Pro image engine (via [fal.ai](https://fal.ai)) as an alternative to OpenAI for panel art — fewer content restrictions. When set, an "Image engine" toggle appears on the story reveal screen. |
 
 The client resolves the PartyKit host in this order: it first uses
 `NEXT_PUBLIC_PARTYKIT_HOST` (if set at build time), then overrides it with

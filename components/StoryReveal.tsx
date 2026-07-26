@@ -19,6 +19,7 @@ import type {
   ComicBuildResult,
   ComicStripData,
   GameState,
+  ImageProvider,
   Story,
 } from "@/lib/types";
 import { PlayerAvatar } from "./PlayerAvatar";
@@ -119,7 +120,30 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
   const [comicError, setComicError] = useState<string | null>(null);
   const [tidying, setTidying] = useState(false);
   const [caricatureStyle, setCaricatureStyle] = useState<CaricatureStyle>("balanced");
+  const [imageProvider, setImageProvider] = useState<ImageProvider>("openai");
+  const [providersAvailable, setProvidersAvailable] = useState<ImageProvider[]>([
+    "openai",
+  ]);
   const tidyAttemptRef = useRef<string>("");
+
+  // Discover which image engines the server has keys for.
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/config")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { imageProviders?: ImageProvider[] } | null) => {
+        if (!cancelled && data?.imageProviders?.length) {
+          setProvidersAvailable(data.imageProviders);
+          if (!data.imageProviders.includes("openai")) {
+            setImageProvider(data.imageProviders[0]);
+          }
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const stories = state.stories;
   const story = stories[index];
@@ -235,6 +259,7 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
             body: JSON.stringify({
               story: target,
               style: caricatureStyle,
+              provider: imageProvider,
               // Slim payload: don't re-upload finished panel PNGs each pass.
               previousComic: previousComic
                 ? slimComicForResume(previousComic)
@@ -627,6 +652,39 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
             {STYLE_OPTIONS.find((o) => o.value === caricatureStyle)?.hint}
           </p>
         </div>
+        {providersAvailable.includes("flux") && (
+          <div className="mb-3 rounded-xl border border-white/10 bg-white/5 p-3">
+            <p className="mb-2 text-xs font-medium uppercase tracking-wide text-white/60">
+              Image engine
+            </p>
+            <div className="grid grid-cols-2 gap-2">
+              {providersAvailable.map((p) => {
+                const selected = imageProvider === p;
+                return (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => setImageProvider(p)}
+                    disabled={comicLoading}
+                    aria-pressed={selected}
+                    className={`rounded-lg border px-3 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                      selected
+                        ? "border-violet-400 bg-violet-500/20 text-white"
+                        : "border-white/10 bg-white/5 text-white/70 hover:border-white/30 hover:text-white"
+                    }`}
+                  >
+                    {p === "openai" ? "OpenAI" : "FLUX"}
+                  </button>
+                );
+              })}
+            </div>
+            <p className="mt-2 text-xs text-white/50">
+              {imageProvider === "flux"
+                ? "FLUX Pro (fal.ai) — fewer content restrictions, better for risqué scenes. Draws from written descriptions only."
+                : "OpenAI gpt-image-1 — stricter moderation, but uses the cast sheet for stronger likenesses."}
+            </p>
+          </div>
+        )}
         {currentComic ? (
           <ComicStrip comic={currentComic} />
         ) : (

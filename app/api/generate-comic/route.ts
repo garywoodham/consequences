@@ -2,8 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { buildComic } from "@/lib/comic";
 import {
   CARICATURE_STYLES,
+  IMAGE_PROVIDERS,
   type CaricatureStyle,
   type ComicStripData,
+  type ImageProvider,
   type Story,
 } from "@/lib/types";
 
@@ -15,6 +17,8 @@ export async function POST(request: NextRequest) {
   let body: {
     story?: Story;
     style?: CaricatureStyle;
+    /** Which image engine draws the panels ("openai" default, or "flux"). */
+    provider?: ImageProvider;
     /** Partial comic from a previous chunk — resume keeps cast + finished panels. */
     previousComic?: ComicStripData;
   };
@@ -38,8 +42,19 @@ export async function POST(request: NextRequest) {
     ? (body.style as CaricatureStyle)
     : "balanced";
 
+  const provider: ImageProvider = IMAGE_PROVIDERS.includes(
+    body.provider as ImageProvider
+  )
+    ? (body.provider as ImageProvider)
+    : "openai";
+
   try {
-    const result = await buildComic(story, style, body.previousComic ?? null);
+    const result = await buildComic(
+      story,
+      style,
+      body.previousComic ?? null,
+      provider
+    );
     return NextResponse.json(result);
   } catch (error) {
     console.error("Comic generation failed:", error);
