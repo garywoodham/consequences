@@ -22,7 +22,7 @@ export default function HomePage() {
       <div className="mt-6 flex flex-col items-center gap-2">
         <SampleGameButton />
         <p className="text-center text-xs text-white/40">
-          Skips setup — creates a game with 3 players and random stories ready to read.
+          Skips setup — 3 players and random celebrity preset stories (funny → crude) ready to read.
         </p>
       </div>
 

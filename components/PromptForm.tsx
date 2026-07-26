@@ -1,10 +1,15 @@
 "use client";
 
 import { useRef, useState } from "react";
+import { Dices, Shuffle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { getTemplateById } from "@/lib/prompts";
+import {
+  pickRandomPresetAnswer,
+  pickRandomPresetAnswers,
+} from "@/lib/preset-stories";
 import type { GameState } from "@/lib/types";
 import { PlayerNamePicker } from "./PlayerNamePicker";
 import { PersonInsertMenu, type KnownPerson } from "./PersonInsertMenu";
@@ -13,12 +18,20 @@ type PromptFormProps = {
   state: GameState;
   currentPlayerId: string;
   onSubmit: (answers: Record<string, string>) => void;
+  /** When true (host default), random celebrity fills are featured. */
+  usePresets?: boolean;
 };
 
-export function PromptForm({ state, currentPlayerId, onSubmit }: PromptFormProps) {
+export function PromptForm({
+  state,
+  currentPlayerId,
+  onSubmit,
+  usePresets = true,
+}: PromptFormProps) {
   const template = getTemplateById(state.templateId);
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
+  const [lastPresetTitle, setLastPresetTitle] = useState<string | null>(null);
   const inputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
   // Everyone the writer can link to: all players in the game, plus any names
@@ -76,6 +89,23 @@ export function PromptForm({ state, currentPlayerId, onSubmit }: PromptFormProps
     });
   }
 
+  /** Fill one prompt from the celebrity preset library. */
+  function fillRandomAnswer(promptId: string) {
+    const picked = pickRandomPresetAnswer(state.templateId, promptId);
+    if (!picked) return;
+    setAnswers((prev) => ({ ...prev, [promptId]: picked }));
+    setLastPresetTitle(null);
+    setError(null);
+  }
+
+  /** Fill every prompt from one random complete preset story. */
+  function fillRandomStory() {
+    const filled = pickRandomPresetAnswers(state.templateId);
+    setAnswers(filled);
+    setLastPresetTitle("Random celebrity preset loaded — edit anything you like");
+    setError(null);
+  }
+
   const submittedCount = state.players.filter((p) => p.hasSubmitted).length;
   const totalCount = state.players.filter((p) => p.connected).length;
   const currentPlayer = state.players.find((p) => p.id === currentPlayerId);
@@ -114,16 +144,62 @@ export function PromptForm({ state, currentPlayerId, onSubmit }: PromptFormProps
       <CardDescription className="mt-1 mb-2">
         Don&apos;t peek — your answers will be mixed with everyone else&apos;s!
       </CardDescription>
-      <p className="mb-4 text-xs text-white/50">
+      <p className="mb-3 text-xs text-white/50">
         {submittedCount}/{totalCount} players submitted
       </p>
+
+      {usePresets && (
+        <div className="mb-4 rounded-xl border border-white/15 bg-white/5 p-3">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <p className="text-xs text-white/60">
+              Stuck? Pull a random celebrity answer (funny → crude) instead of typing.
+            </p>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={fillRandomStory}
+              className="shrink-0"
+            >
+              <Shuffle className="h-4 w-4" />
+              Random full story
+            </Button>
+          </div>
+          {lastPresetTitle && (
+            <p className="mt-2 text-xs text-violet-300">{lastPresetTitle}</p>
+          )}
+        </div>
+      )}
+
+      {!usePresets && (
+        <div className="mb-4 flex justify-end">
+          <Button type="button" variant="ghost" size="sm" onClick={fillRandomStory}>
+            <Shuffle className="h-4 w-4" />
+            Random celebrity story
+          </Button>
+        </div>
+      )}
 
       <form onSubmit={handleSubmit} className="space-y-5">
         {template.prompts.map((prompt, index) => (
           <div key={prompt.id}>
-            <label className="mb-2 block text-sm font-medium text-white">
-              {index + 1}. {prompt.label}
-            </label>
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <label className="block text-sm font-medium text-white">
+                {index + 1}. {prompt.label}
+              </label>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-8 shrink-0 px-2 text-xs text-white/60 hover:text-white"
+                onClick={() => fillRandomAnswer(prompt.id)}
+                aria-label={`Pick a random answer for ${prompt.label}`}
+                title="Pick a random preset answer"
+              >
+                <Dices className="h-3.5 w-3.5" />
+                Random
+              </Button>
+            </div>
             {prompt.type === "name" ? (
               <PlayerNamePicker
                 players={state.players}

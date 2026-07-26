@@ -89,6 +89,7 @@ export default function GamePage() {
           state={state}
           currentPlayerId={session.playerId}
           onSubmit={submitAnswers}
+          usePresets={session.usePresets !== false}
         />
       )}
 

@@ -14,6 +14,7 @@ export function CreateGameForm() {
   const [templateId, setTemplateId] = useState("classic");
   const [avatarUrl, setAvatarUrl] = useState<string | undefined>();
   const [tidyEnabled, setTidyEnabled] = useState(true);
+  const [usePresets, setUsePresets] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
@@ -45,6 +46,7 @@ export function CreateGameForm() {
         templateId,
         roomCode,
         tidyEnabled,
+        usePresets,
       });
 
       window.location.href = `/game/${roomCode}`;
@@ -94,6 +96,27 @@ export function CreateGameForm() {
             ))}
           </select>
         </div>
+        <label
+          htmlFor="create-presets"
+          className="flex cursor-pointer items-start gap-3 rounded-xl border border-white/15 bg-white/5 p-3"
+        >
+          <input
+            id="create-presets"
+            type="checkbox"
+            checked={usePresets}
+            onChange={(e) => setUsePresets(e.target.checked)}
+            className="mt-0.5 h-4 w-4 accent-violet-500"
+          />
+          <span className="text-sm">
+            <span className="font-medium text-white">
+              Use celebrity preset stories by default
+            </span>
+            <span className="mt-0.5 block text-xs text-white/50">
+              Shows random-fill buttons during the game (funny → crude presets with
+              famous names). On by default.
+            </span>
+          </span>
+        </label>
         <label
           htmlFor="create-tidy"
           className="flex cursor-pointer items-start gap-3 rounded-xl border border-white/15 bg-white/5 p-3"
