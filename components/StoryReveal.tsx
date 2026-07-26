@@ -1,7 +1,17 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, Check, Copy, Maximize2, Sparkles, Wand2, X } from "lucide-react";
+import {
+  ChevronLeft,
+  ChevronRight,
+  Check,
+  Copy,
+  Images,
+  Maximize2,
+  Sparkles,
+  Wand2,
+  X,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardTitle } from "@/components/ui/card";
 import type { CaricatureStyle, ComicStripData, GameState, Story } from "@/lib/types";
@@ -37,6 +47,9 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
   const [index, setIndex] = useState(0);
   const [readAloud, setReadAloud] = useState(false);
   const [lineIndex, setLineIndex] = useState(0);
+  // Fullscreen panel-by-panel reveal (image + caption), mirrors words-only mode.
+  const [comicSlideshow, setComicSlideshow] = useState(false);
+  const [panelIndex, setPanelIndex] = useState(0);
   const [copied, setCopied] = useState(false);
   const [comics, setComics] = useState<Record<string, ComicStripData>>({});
   const [comicLoading, setComicLoading] = useState(false);
@@ -47,6 +60,7 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
 
   const stories = state.stories;
   const story = stories[index];
+  const currentComic = story ? comics[story.id] : undefined;
 
   // Host polishes the stories once and broadcasts the result to everyone.
   useEffect(() => {
@@ -93,11 +107,18 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
   function nextStory() {
     setIndex((i) => Math.min(i + 1, stories.length - 1));
     setLineIndex(0);
+    setPanelIndex(0);
   }
 
   function prevStory() {
     setIndex((i) => Math.max(i - 1, 0));
     setLineIndex(0);
+    setPanelIndex(0);
+  }
+
+  function openComicSlideshow() {
+    setPanelIndex(0);
+    setComicSlideshow(true);
   }
 
   async function generateComic(target: Story) {
@@ -190,6 +211,89 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
     );
   }
 
+  if (comicSlideshow && currentComic) {
+    const panels = currentComic.panels;
+    const safeIndex = Math.min(panelIndex, Math.max(0, panels.length - 1));
+    const panel = panels[safeIndex];
+    const isLastPanel = safeIndex >= panels.length - 1;
+
+    return (
+      <div className="fixed inset-0 z-50 flex flex-col bg-gradient-to-br from-violet-950 via-purple-900 to-fuchsia-900 p-4 md:p-6">
+        <div className="flex items-center justify-between">
+          <p className="text-sm uppercase tracking-widest text-white/50">
+            Panel {safeIndex + 1} of {panels.length}
+          </p>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => {
+              setComicSlideshow(false);
+              setPanelIndex(0);
+            }}
+            aria-label="Close comic slideshow"
+          >
+            <X className="h-5 w-5" />
+          </Button>
+        </div>
+
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 py-4">
+          <div className="relative flex max-h-[min(65vh,720px)] w-full max-w-3xl items-center justify-center overflow-hidden rounded-2xl border-2 border-white/80 bg-black/30 shadow-2xl">
+            {panel?.imageUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={panel.imageUrl}
+                alt={panel.caption}
+                className="max-h-[min(65vh,720px)] w-full object-contain"
+              />
+            ) : (
+              <div className="flex aspect-square w-full max-w-md flex-col items-center justify-center gap-3 p-6 text-white/60">
+                {panel?.characters?.length ? (
+                  <div className="flex flex-wrap items-center justify-center gap-3">
+                    {panel.characters.map((c) => (
+                      <div key={c.id} className="flex flex-col items-center gap-1">
+                        <PlayerAvatar name={c.name} avatarUrl={c.imageUrl} size="lg" />
+                        <span className="text-xs text-white/70">{c.name}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <span className="text-5xl">✨</span>
+                )}
+                <p className="text-sm">No image for this panel</p>
+              </div>
+            )}
+          </div>
+          <p className="max-w-3xl px-2 text-center text-lg font-medium leading-snug text-white md:text-2xl">
+            {panel?.caption ?? ""}
+          </p>
+        </div>
+
+        <div className="flex justify-center gap-3">
+          <Button
+            variant="secondary"
+            disabled={safeIndex === 0}
+            onClick={() => setPanelIndex((i) => Math.max(0, i - 1))}
+          >
+            <ChevronLeft className="h-4 w-4" /> Back
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={() => {
+              if (isLastPanel) {
+                setComicSlideshow(false);
+                setPanelIndex(0);
+              } else {
+                setPanelIndex((i) => i + 1);
+              }
+            }}
+          >
+            {isLastPanel ? "Finish" : "Reveal next"} <ChevronRight className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <Card>
       <div className="mb-4 flex items-center justify-between">
@@ -203,6 +307,20 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
           </Button>
           <Button variant="secondary" size="icon" onClick={() => setReadAloud(true)} aria-label="Read aloud mode">
             <Maximize2 className="h-4 w-4" />
+          </Button>
+          <Button
+            variant="secondary"
+            size="icon"
+            onClick={openComicSlideshow}
+            disabled={!currentComic || currentComic.panels.length === 0}
+            aria-label="Comic slideshow mode"
+            title={
+              currentComic
+                ? "Present comic panels fullscreen"
+                : "Generate a comic strip first"
+            }
+          >
+            <Images className="h-4 w-4" />
           </Button>
         </div>
       </div>
@@ -283,8 +401,8 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
             {STYLE_OPTIONS.find((o) => o.value === caricatureStyle)?.hint}
           </p>
         </div>
-        {comics[story.id] ? (
-          <ComicStrip comic={comics[story.id]} />
+        {currentComic ? (
+          <ComicStrip comic={currentComic} />
         ) : comicLoading ? (
           <div className="space-y-3">
             <p className="text-center text-sm text-white/60">Drawing your comic strip...</p>
@@ -303,17 +421,27 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
         {comicError && (
           <p className="mt-2 text-center text-sm text-red-300">{comicError}</p>
         )}
-        {comics[story.id] && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="mx-auto mt-2 flex"
-            onClick={() => generateComic(story)}
-            disabled={comicLoading}
-          >
-            <Sparkles className="h-4 w-4" />
-            Regenerate
-          </Button>
+        {currentComic && (
+          <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={openComicSlideshow}
+              disabled={currentComic.panels.length === 0}
+            >
+              <Images className="h-4 w-4" />
+              Present panels
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => generateComic(story)}
+              disabled={comicLoading}
+            >
+              <Sparkles className="h-4 w-4" />
+              Regenerate
+            </Button>
+          </div>
         )}
       </div>
 
