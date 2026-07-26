@@ -794,25 +794,91 @@ function buildFluxPromptBody(
   );
 }
 
+/** Ordinal tile references ("first/leftmost", ...) for unlabelled sheets. */
+const TILE_ORDINALS = [
+  "first (leftmost)",
+  "second",
+  "third",
+  "fourth",
+  "fifth",
+  "sixth",
+];
+
 /**
- * FLUX Kontext (via fal.ai) panel drawn FROM the labelled cast sheet, so the
- * same faces carry across panels. Kontext caps safety tolerance lower when an
- * input image is attached; if it refuses, the caller falls back to the
- * text-only path below.
+ * FLUX Kontext (via fal.ai) panel drawn FROM an UNLABELLED cast sheet, so the
+ * same faces carry across panels. The sheet must carry no printed labels —
+ * Kontext copies visible text into its output — so characters are referenced
+ * by tile order instead. The scene action leads the prompt; identity comes
+ * from the image, so the long feature descriptions are omitted (only a short
+ * wardrobe line is kept for continuity).
+ *
+ * Kontext caps safety tolerance lower when an input image is attached; if it
+ * refuses, the caller falls back to the text-only path below.
  */
 async function generatePanelWithFluxKontext(
   sceneWithLabels: string,
   cast: PanelCharacter[],
+  refCast: PanelCharacter[],
   castSheetDataUrl: string,
   seed: number
 ): Promise<PanelResult> {
+  // Rewrite "Character N" mentions to tile references so the scene sentence
+  // itself tells Kontext who does what. Only characters actually on the
+  // sheet get tile ordinals; any without a reference keep a described role.
+  let scene = sceneWithLabels;
+  const nameFor = new Map<string, string>();
+  refCast.forEach((pc, i) => {
+    nameFor.set(pc.id, `the ${TILE_ORDINALS[i] ?? `${i + 1}th`} person`);
+  });
+  const offSheet = cast.filter((pc) => !nameFor.has(pc.id));
+  for (const pc of cast) {
+    const tile = nameFor.get(pc.id);
+    if (tile) {
+      scene = scene.replace(wordBoundaryRegex(pc.label, "giu"), tile);
+    }
+  }
+
+  // Continuity: wardrobe lives in the descriptions as a STORY WARDROBE
+  // clause — surface just that (short) so outfits persist across panels.
+  const wardrobeLines = cast
+    .map((pc) => {
+      const m = pc.description?.match(/STORY WARDROBE\b[:\s-]*([\s\S]*)$/i);
+      if (!m?.[1]?.trim()) return null;
+      const ref = nameFor.get(pc.id) ?? pc.label;
+      return `${ref} is ${m[1].trim().replace(/\.\s*$/, "")}`;
+    })
+    .filter(Boolean)
+    .join("; ");
+
+  // Characters with no photo/caricature still need a text identity.
+  const extraCast = offSheet
+    .map(
+      (pc) =>
+        `${pc.label}: ${
+          pc.description
+            ? compactDescriptionForFlux(pc.description, 200)
+            : "an original cartoon character"
+        }`
+    )
+    .join("\n");
+
+  const who =
+    refCast.length > 1
+      ? `The input image shows ${refCast.length} separate people side by side. `
+      : `The input image shows one person. `;
+
   const prompt = scrubRealNamesFromPrompt(
-    `Using the character reference sheet in the input image (each tile is one ` +
-      `character, label printed beneath), draw ONE brand-new ${PANEL_STYLE}. ` +
-      `Redraw the SAME people — identical faces, hair and builds — in the new ` +
-      `scene. Do NOT copy the sheet layout, tiles or labels. No text, words, ` +
-      `letters or speech bubbles anywhere.\n\n` +
-      buildFluxPromptBody(sceneWithLabels, cast),
+    `Create ONE brand-new comic panel of this scene: ${scene}\n\n` +
+      who +
+      `Redraw these EXACT same people — identical faces, hair, builds and ` +
+      `outfits — now actively doing the scene above together in a full ` +
+      `background setting. All ${cast.length} character(s) must appear. ` +
+      (wardrobeLines ? `${wardrobeLines}. ` : "") +
+      (extraCast ? `Also include:\n${extraCast}\n` : "") +
+      `Style: ${PANEL_STYLE}. ` +
+      `Do NOT reproduce the side-by-side line-up of the input image. ` +
+      `ABSOLUTELY NO text, no words, no letters, no captions, no speech ` +
+      `bubbles, no signs anywhere in the image.`,
     cast
   );
 
@@ -912,8 +978,10 @@ async function generatePanelImage(
     const seed = options.seed ?? 0;
     const fluxRefs = cast.filter((c) => c.image);
     if (!options.textOnly && fluxRefs.length > 0) {
+      // Unlabelled: Kontext copies any printed text into its output.
       const sheetBuf = await buildCastSheet(
-        fluxRefs.map((c) => ({ name: c.label, imageUrl: c.image as string }))
+        fluxRefs.map((c) => ({ name: c.label, imageUrl: c.image as string })),
+        { labels: false }
       );
       if (sheetBuf) {
         const sheetDataUrl = `data:image/png;base64,${Buffer.from(
@@ -922,6 +990,7 @@ async function generatePanelImage(
         const viaKontext = await generatePanelWithFluxKontext(
           labeledScene,
           cast,
+          fluxRefs,
           sheetDataUrl,
           seed
         );

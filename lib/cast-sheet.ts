@@ -44,17 +44,25 @@ type CastEntry = { name: string; imageUrl: string };
 
 /**
  * Build a cast sheet: each character tile is 512×512 with the caricature on
- * top and the character's name printed clearly beneath it. Tiles are laid out
- * left-to-right on a white background. Returns a PNG buffer.
+ * top and (unless `labels: false`) the character's name printed clearly
+ * beneath it. Tiles are laid out left-to-right on a white background.
+ * Returns a PNG buffer.
+ *
+ * Pass `labels: false` for models that copy visible text into their output
+ * (e.g. FLUX Kontext) — characters are then referenced by tile order instead.
  *
  * The returned image is at most 4 tiles wide (2048px). For 5+ characters we
  * wrap onto a second row.
  */
-export async function buildCastSheet(cast: CastEntry[]): Promise<Buffer | null> {
+export async function buildCastSheet(
+  cast: CastEntry[],
+  options: { labels?: boolean } = {}
+): Promise<Buffer | null> {
   if (cast.length === 0) return null;
 
+  const withLabels = options.labels !== false;
   const TILE = 512;
-  const LABEL = 96;
+  const LABEL = withLabels ? 96 : 0;
   const columns = Math.min(cast.length, 4);
   const rows = Math.ceil(cast.length / columns);
   const width = TILE * columns;
@@ -81,19 +89,21 @@ export async function buildCastSheet(cast: CastEntry[]): Promise<Buffer | null> 
     const top = row * (TILE + LABEL);
     tiles.push({ input: resized, left, top });
 
-    const labelSvg = Buffer.from(
-      `<?xml version="1.0" encoding="UTF-8"?>
-       <svg xmlns="http://www.w3.org/2000/svg" width="${TILE}" height="${LABEL}">
-         <rect width="100%" height="100%" fill="white"/>
-         <text
-           x="50%" y="60%" text-anchor="middle" dominant-baseline="middle"
-           font-family="Impact, 'Arial Black', sans-serif"
-           font-size="56" font-weight="900" fill="black"
-           stroke="white" stroke-width="6" paint-order="stroke fill"
-         >#${i + 1}  ${xmlEscape(cast[i].name.toUpperCase())}</text>
-       </svg>`
-    );
-    tiles.push({ input: labelSvg, left, top: top + TILE });
+    if (withLabels) {
+      const labelSvg = Buffer.from(
+        `<?xml version="1.0" encoding="UTF-8"?>
+         <svg xmlns="http://www.w3.org/2000/svg" width="${TILE}" height="${LABEL}">
+           <rect width="100%" height="100%" fill="white"/>
+           <text
+             x="50%" y="60%" text-anchor="middle" dominant-baseline="middle"
+             font-family="Impact, 'Arial Black', sans-serif"
+             font-size="56" font-weight="900" fill="black"
+             stroke="white" stroke-width="6" paint-order="stroke fill"
+           >#${i + 1}  ${xmlEscape(cast[i].name.toUpperCase())}</text>
+         </svg>`
+      );
+      tiles.push({ input: labelSvg, left, top: top + TILE });
+    }
   }
 
   if (tiles.length === 0) return null;
