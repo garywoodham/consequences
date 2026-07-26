@@ -194,8 +194,7 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
   function progressLabel(done: number, total: number | undefined, preparing: boolean) {
     if (preparing || !total) return "Preparing characters…";
     if (done <= 0) return `Generating image 1 of ${total}…`;
-    if (done >= total) return `Image ${total} of ${total} generated`;
-    return `Image ${done} of ${total} generated — drawing ${done + 1}…`;
+    return `Image ${done} of ${total} generated`;
   }
 
   async function generateComic(target: Story) {
@@ -323,6 +322,59 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
     await navigator.clipboard.writeText(displayProse);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  }
+
+  if (comicLoading) {
+    const total = comicPanelTotal;
+    const pct =
+      total && total > 0
+        ? Math.min(100, Math.round((comicDoneCount / total) * 100))
+        : 0;
+
+    return (
+      <div
+        className="fixed inset-0 z-50 flex flex-col bg-gradient-to-br from-violet-950 via-purple-900 to-fuchsia-900 p-6"
+        role="status"
+        aria-live="polite"
+        aria-busy="true"
+      >
+        <div className="flex items-center justify-between">
+          <p className="text-sm uppercase tracking-widest text-white/50">
+            Generating comic
+          </p>
+        </div>
+
+        <div className="flex flex-1 flex-col items-center justify-center text-center">
+          <div className="mb-8 flex h-20 w-20 items-center justify-center rounded-full border border-white/20 bg-white/10">
+            <Sparkles className="h-9 w-9 animate-pulse text-violet-200" />
+          </div>
+
+          <p className="text-sm uppercase tracking-[0.2em] text-white/50">
+            Please wait
+          </p>
+          <p className="mt-3 max-w-lg text-3xl font-semibold tracking-tight text-white md:text-5xl">
+            {comicProgress ?? "Drawing your comic strip…"}
+          </p>
+          <p className="mt-4 max-w-md text-base text-white/55">
+            {total
+              ? `Drawing panel images one by one. The strip appears when all ${total} are ready.`
+              : "Setting up characters, then drawing each panel image."}
+          </p>
+
+          <div className="mt-10 w-full max-w-md">
+            <div className="h-2.5 overflow-hidden rounded-full bg-white/15">
+              <div
+                className="h-full rounded-full bg-violet-300 transition-[width] duration-500 ease-out"
+                style={{ width: `${total ? pct : 8}%` }}
+              />
+            </div>
+            <p className="mt-3 text-sm tabular-nums text-white/60">
+              {total ? `${comicDoneCount} / ${total} images` : "Starting…"}
+            </p>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   if (readAloud) {
@@ -573,40 +625,7 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
             {STYLE_OPTIONS.find((o) => o.value === caricatureStyle)?.hint}
           </p>
         </div>
-        {comicLoading ? (
-          <div
-            className="overflow-hidden rounded-2xl border border-white/15 bg-gradient-to-b from-white/10 to-white/5 p-6"
-            role="status"
-            aria-live="polite"
-            aria-busy="true"
-          >
-            <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full border border-violet-300/40 bg-violet-500/20">
-              <Sparkles className="h-5 w-5 animate-pulse text-violet-200" />
-            </div>
-            <p className="text-center text-base font-medium text-white">
-              {comicProgress ?? "Drawing your comic strip…"}
-            </p>
-            <p className="mt-1 text-center text-sm text-white/50">
-              Panels stay hidden until every image is ready.
-            </p>
-            {comicPanelTotal != null && comicPanelTotal > 0 && (
-              <div className="mx-auto mt-4 h-2 max-w-xs overflow-hidden rounded-full bg-white/10">
-                <div
-                  className="h-full rounded-full bg-violet-400 transition-[width] duration-500 ease-out"
-                  style={{
-                    width: `${Math.min(
-                      100,
-                      Math.round((comicDoneCount / comicPanelTotal) * 100)
-                    )}%`,
-                  }}
-                />
-              </div>
-            )}
-            <div className="mt-5">
-              <ComicStripSkeleton count={comicPanelTotal ?? 4} />
-            </div>
-          </div>
-        ) : currentComic ? (
+        {currentComic ? (
           <ComicStrip comic={currentComic} />
         ) : (
           <Button
@@ -621,7 +640,7 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
         {comicError && (
           <p className="mt-2 text-center text-sm text-red-300">{comicError}</p>
         )}
-        {currentComic && !comicLoading && (
+        {currentComic && (
           <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
             <Button
               variant="secondary"
