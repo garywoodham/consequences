@@ -114,6 +114,8 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
   const [comics, setComics] = useState<Record<string, ComicStripData>>({});
   const [comicLoading, setComicLoading] = useState(false);
   const [comicProgress, setComicProgress] = useState<string | null>(null);
+  const [comicDoneCount, setComicDoneCount] = useState(0);
+  const [comicPanelTotal, setComicPanelTotal] = useState<number | null>(null);
   const [comicError, setComicError] = useState<string | null>(null);
   const [tidying, setTidying] = useState(false);
   const [caricatureStyle, setCaricatureStyle] = useState<CaricatureStyle>("balanced");
@@ -182,11 +184,36 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
     setComicSlideshow(true);
   }
 
+  function countDoneImages(comic: ComicStripData | undefined): number {
+    if (!comic) return 0;
+    return comic.panels.filter(
+      (p) => p.imageUrl && p.imageUrl !== DONE_IMAGE_MARKER
+    ).length;
+  }
+
+  function progressLabel(done: number, total: number | undefined, preparing: boolean) {
+    if (preparing || !total) return "Preparing characters…";
+    if (done <= 0) return `Generating image 1 of ${total}…`;
+    if (done >= total) return `Image ${total} of ${total} generated`;
+    return `Image ${done} of ${total} generated — drawing ${done + 1}…`;
+  }
+
   async function generateComic(target: Story) {
     setComicError(null);
     setComicLoading(true);
     setComicProgress("Preparing characters…");
+    setComicDoneCount(0);
+    setComicPanelTotal(null);
+    // Hide any previous strip until the new one is fully finished.
+    setComics((prev) => {
+      if (!(target.id in prev)) return prev;
+      const next = { ...prev };
+      delete next[target.id];
+      return next;
+    });
+
     // One API call prepares the cast; each later call draws exactly one panel.
+    // Keep the in-progress comic local — only publish when complete.
     let previousComic: ComicStripData | undefined;
     let chunk = 0;
     let networkRetries = 0;
@@ -195,18 +222,9 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
     try {
       while (chunk < MAX_COMIC_CHUNKS) {
         chunk += 1;
-        const doneSoFar =
-          previousComic?.panels.filter(
-            (p) => p.imageUrl && p.imageUrl !== DONE_IMAGE_MARKER
-          ).length ?? 0;
+        const doneSoFar = countDoneImages(previousComic);
         const totalPanels = previousComic?.panels.length;
-        setComicProgress(
-          !previousComic
-            ? "Preparing characters…"
-            : totalPanels
-              ? `Drawing panel ${Math.min(doneSoFar + 1, totalPanels)} of ${totalPanels}…`
-              : `Drawing next panel (pass ${chunk})…`
-        );
+        setComicProgress(progressLabel(doneSoFar, totalPanels, !previousComic));
 
         let res: Response;
         try {
@@ -243,19 +261,17 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
         const data = (await res.json()) as ComicBuildResult;
         previousComic = mergeComicProgress(previousComic, data.comic);
         networkRetries = 0;
-        setComics((prev) => ({ ...prev, [target.id]: previousComic! }));
 
-        const doneCount = previousComic.panels.filter(
-          (p) => p.imageUrl && p.imageUrl !== DONE_IMAGE_MARKER
-        ).length;
+        const doneCount = countDoneImages(previousComic);
         const total = previousComic.panels.length;
-        setComicProgress(
-          data.complete
-            ? null
-            : `Drawn ${doneCount}/${total} panels…`
-        );
+        setComicDoneCount(doneCount);
+        setComicPanelTotal(total);
+        setComicProgress(progressLabel(doneCount, total, false));
 
-        if (data.complete) break;
+        if (data.complete) {
+          setComics((prev) => ({ ...prev, [target.id]: previousComic! }));
+          break;
+        }
 
         if (data.generatedThisChunk === 0) {
           stallCount += 1;
@@ -265,6 +281,8 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
             setComicError(
               `Stopped after ${doneCount}/${total} panels — remaining panels could not be drawn.`
             );
+            // Publish whatever we have so the player can still view partial results.
+            setComics((prev) => ({ ...prev, [target.id]: previousComic! }));
             break;
           }
         } else {
@@ -273,21 +291,27 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
       }
 
       if (chunk >= MAX_COMIC_CHUNKS && previousComic) {
-        const doneCount = previousComic.panels.filter(
-          (p) => p.imageUrl && p.imageUrl !== DONE_IMAGE_MARKER
-        ).length;
+        const doneCount = countDoneImages(previousComic);
         const total = previousComic.panels.length;
         if (doneCount < total) {
           setComicError(
             `Reached the pass limit with ${doneCount}/${total} panels drawn. Tap Regenerate to retry the rest.`
           );
+          setComics((prev) => ({ ...prev, [target.id]: previousComic! }));
+        } else {
+          setComics((prev) => ({ ...prev, [target.id]: previousComic! }));
         }
       }
     } catch (err) {
       setComicError(err instanceof Error ? err.message : "Comic generation failed");
+      if (previousComic && countDoneImages(previousComic) > 0) {
+        setComics((prev) => ({ ...prev, [target.id]: previousComic! }));
+      }
     } finally {
       setComicLoading(false);
       setComicProgress(null);
+      setComicDoneCount(0);
+      setComicPanelTotal(null);
     }
   }
 
@@ -549,15 +573,41 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
             {STYLE_OPTIONS.find((o) => o.value === caricatureStyle)?.hint}
           </p>
         </div>
-        {currentComic ? (
-          <ComicStrip comic={currentComic} />
-        ) : comicLoading ? (
-          <div className="space-y-3">
-            <p className="text-center text-sm text-white/60">
+        {comicLoading ? (
+          <div
+            className="overflow-hidden rounded-2xl border border-white/15 bg-gradient-to-b from-white/10 to-white/5 p-6"
+            role="status"
+            aria-live="polite"
+            aria-busy="true"
+          >
+            <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full border border-violet-300/40 bg-violet-500/20">
+              <Sparkles className="h-5 w-5 animate-pulse text-violet-200" />
+            </div>
+            <p className="text-center text-base font-medium text-white">
               {comicProgress ?? "Drawing your comic strip…"}
             </p>
-            <ComicStripSkeleton />
+            <p className="mt-1 text-center text-sm text-white/50">
+              Panels stay hidden until every image is ready.
+            </p>
+            {comicPanelTotal != null && comicPanelTotal > 0 && (
+              <div className="mx-auto mt-4 h-2 max-w-xs overflow-hidden rounded-full bg-white/10">
+                <div
+                  className="h-full rounded-full bg-violet-400 transition-[width] duration-500 ease-out"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      Math.round((comicDoneCount / comicPanelTotal) * 100)
+                    )}%`,
+                  }}
+                />
+              </div>
+            )}
+            <div className="mt-5">
+              <ComicStripSkeleton count={comicPanelTotal ?? 4} />
+            </div>
           </div>
+        ) : currentComic ? (
+          <ComicStrip comic={currentComic} />
         ) : (
           <Button
             variant="secondary"
@@ -568,19 +618,16 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
             Generate comic strip
           </Button>
         )}
-        {comicLoading && currentComic && comicProgress && (
-          <p className="mt-2 text-center text-sm text-violet-300">{comicProgress}</p>
-        )}
         {comicError && (
           <p className="mt-2 text-center text-sm text-red-300">{comicError}</p>
         )}
-        {currentComic && (
+        {currentComic && !comicLoading && (
           <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
             <Button
               variant="secondary"
               size="sm"
               onClick={openComicSlideshow}
-              disabled={currentComic.panels.length === 0 || comicLoading}
+              disabled={currentComic.panels.length === 0}
             >
               <Images className="h-4 w-4" />
               Present panels
@@ -589,7 +636,6 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
               variant="ghost"
               size="sm"
               onClick={() => generateComic(story)}
-              disabled={comicLoading}
             >
               <Sparkles className="h-4 w-4" />
               Regenerate
