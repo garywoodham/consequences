@@ -673,12 +673,21 @@ async function generatePanelFromTextCast(
   }
 }
 
+/** Stable positive seed from a story id so every panel shares it (djb2). */
+function stableSeedFromId(id: string): number {
+  let h = 5381;
+  for (let i = 0; i < id.length; i++) {
+    h = ((h << 5) + h + id.charCodeAt(i)) >>> 0;
+  }
+  return h % 2147483647;
+}
+
 /**
  * Compress a model-sheet description so it survives FLUX's short prompt
  * window: keep the leading feature sentences, always keep the STORY WARDROBE
  * clause (continuity), and trim at a word boundary.
  */
-function compactDescriptionForFlux(desc: string, maxChars = 260): string {
+function compactDescriptionForFlux(desc: string, maxChars = 420): string {
   const cleaned = desc.replace(/\s+/g, " ").trim();
   if (cleaned.length <= maxChars) return cleaned;
 
@@ -694,59 +703,20 @@ function compactDescriptionForFlux(desc: string, maxChars = 260): string {
   return `${head.replace(/[,;.\s]+$/, "")}.${wardrobe}`;
 }
 
-/**
- * FLUX Pro (via fal.ai) text-to-image panel with fal's safety filters at
- * their most permissive settings — useful when OpenAI refuses a scene.
- *
- * FLUX truncates long prompts (short text-encoder window), so unlike the
- * OpenAI path this uses a COMPACT prompt: headcount + scene first, then
- * shortened character descriptions. Otherwise the second character's
- * description falls off the end and only one person gets drawn.
- */
-async function generatePanelFromFlux(
-  sceneWithLabels: string,
-  cast: PanelCharacter[]
+/** POST to a fal.ai endpoint, inline the resulting image as a data URL. */
+async function callFluxEndpoint(
+  endpoint: string,
+  payload: Record<string, unknown>,
+  prompt: string
 ): Promise<PanelResult> {
-  const labelList = cast.map((c) => c.label).join(" and ");
-  const headcount =
-    cast.length > 1
-      ? `The panel MUST show ALL ${cast.length} people together, every one ` +
-        `fully visible: ${labelList}. Do not leave anyone out or merge them.\n\n`
-      : "";
-  const castLines = cast
-    .map((pc) => {
-      const features = pc.description
-        ? compactDescriptionForFlux(pc.description)
-        : "an original cartoon character with a distinct, consistent look";
-      return `${pc.label}: ${features}`;
-    })
-    .join("\n");
-
-  const prompt = scrubRealNamesFromPrompt(
-    `${PANEL_STYLE}. No text, no words, no letters, no speech bubbles, ` +
-      `no signs anywhere in the image.\n\n` +
-      headcount +
-      `SCENE: ${sceneWithLabels}\n\n` +
-      (castLines ? `WHO THEY ARE (fictional cartoon characters):\n${castLines}` : ""),
-    cast
-  );
-
   try {
-    const res = await fetch("https://fal.run/fal-ai/flux-pro/v1.1", {
+    const res = await fetch(`https://fal.run/${endpoint}`, {
       method: "POST",
       headers: {
         Authorization: `Key ${FAL_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        prompt,
-        image_size: "square_hd",
-        num_images: 1,
-        output_format: "png",
-        // Most permissive settings fal exposes for this model.
-        safety_tolerance: "6",
-        enable_safety_checker: false,
-      }),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
@@ -760,7 +730,7 @@ async function generatePanelFromFlux(
         ? "Blocked by FLUX content filter."
         : `FLUX API error (HTTP ${res.status}): ${body.slice(0, 160)}`;
       console.warn(
-        `[comic] flux generation failed status=${res.status} blocked=${blocked} reason=${reason}`
+        `[comic] flux ${endpoint} failed status=${res.status} blocked=${blocked} reason=${reason}`
       );
       return { imageUrl: null, prompt, blocked, rateLimited, reason };
     }
@@ -798,6 +768,108 @@ async function generatePanelFromFlux(
   }
 }
 
+/** Shared compact prompt body for both FLUX paths (short encoder window). */
+function buildFluxPromptBody(
+  sceneWithLabels: string,
+  cast: PanelCharacter[]
+): string {
+  const labelList = cast.map((c) => c.label).join(" and ");
+  const headcount =
+    cast.length > 1
+      ? `The panel MUST show ALL ${cast.length} people together, every one ` +
+        `fully visible: ${labelList}. Do not leave anyone out or merge them.\n\n`
+      : "";
+  const castLines = cast
+    .map((pc) => {
+      const features = pc.description
+        ? compactDescriptionForFlux(pc.description)
+        : "an original cartoon character with a distinct, consistent look";
+      return `${pc.label}: ${features}`;
+    })
+    .join("\n");
+  return (
+    headcount +
+    `SCENE: ${sceneWithLabels}\n\n` +
+    (castLines ? `WHO THEY ARE (fictional cartoon characters):\n${castLines}` : "")
+  );
+}
+
+/**
+ * FLUX Kontext (via fal.ai) panel drawn FROM the labelled cast sheet, so the
+ * same faces carry across panels. Kontext caps safety tolerance lower when an
+ * input image is attached; if it refuses, the caller falls back to the
+ * text-only path below.
+ */
+async function generatePanelWithFluxKontext(
+  sceneWithLabels: string,
+  cast: PanelCharacter[],
+  castSheetDataUrl: string,
+  seed: number
+): Promise<PanelResult> {
+  const prompt = scrubRealNamesFromPrompt(
+    `Using the character reference sheet in the input image (each tile is one ` +
+      `character, label printed beneath), draw ONE brand-new ${PANEL_STYLE}. ` +
+      `Redraw the SAME people — identical faces, hair and builds — in the new ` +
+      `scene. Do NOT copy the sheet layout, tiles or labels. No text, words, ` +
+      `letters or speech bubbles anywhere.\n\n` +
+      buildFluxPromptBody(sceneWithLabels, cast),
+    cast
+  );
+
+  return callFluxEndpoint(
+    "fal-ai/flux-pro/kontext",
+    {
+      prompt,
+      image_url: castSheetDataUrl,
+      aspect_ratio: "1:1",
+      num_images: 1,
+      output_format: "png",
+      // Kontext allows at most 2 when an input image is attached.
+      safety_tolerance: "2",
+      seed,
+    },
+    prompt
+  );
+}
+
+/**
+ * FLUX Pro text-to-image panel with fal's safety filters at their most
+ * permissive settings — used when no cast references exist or when the
+ * Kontext/soften ladder falls back to text-only.
+ *
+ * FLUX truncates long prompts (short text-encoder window), so unlike the
+ * OpenAI path this uses a COMPACT prompt: headcount + scene first, then
+ * shortened character descriptions. Otherwise the second character's
+ * description falls off the end and only one person gets drawn.
+ */
+async function generatePanelFromFlux(
+  sceneWithLabels: string,
+  cast: PanelCharacter[],
+  seed?: number
+): Promise<PanelResult> {
+  const prompt = scrubRealNamesFromPrompt(
+    `${PANEL_STYLE}. No text, no words, no letters, no speech bubbles, ` +
+      `no signs anywhere in the image.\n\n` +
+      buildFluxPromptBody(sceneWithLabels, cast),
+    cast
+  );
+
+  return callFluxEndpoint(
+    "fal-ai/flux-pro/v1.1",
+    {
+      prompt,
+      image_size: "square_hd",
+      num_images: 1,
+      output_format: "png",
+      // Most permissive settings fal exposes for this model.
+      safety_tolerance: "6",
+      enable_safety_checker: false,
+      ...(seed != null ? { seed } : {}),
+    },
+    prompt
+  );
+}
+
 /**
  * Generate a single comic panel. Characters are described by their FEATURES
  * (from the caricature) under neutral labels, and the caption is rewritten so
@@ -811,7 +883,7 @@ async function generatePanelImage(
   characters: ComicCharacter[],
   descriptions: Map<string, string>,
   caricatures: Map<string, string | null>,
-  options: { textOnly?: boolean; provider?: ImageProvider } = {}
+  options: { textOnly?: boolean; provider?: ImageProvider; seed?: number } = {}
 ): Promise<PanelResult> {
   const provider: ImageProvider =
     options.provider === "flux" && FAL_KEY ? "flux" : "openai";
@@ -833,10 +905,35 @@ async function generatePanelImage(
   // leftover real names become Character N before the prompt is built.
   const labeledScene = sceneCaptionRewriter(caption);
 
-  // FLUX path: text-to-image with the same feature-description guide (no
-  // cast-sheet edit support), fewest content restrictions.
+  // FLUX path: anchor identity with the labelled cast sheet via Kontext when
+  // references exist; otherwise (or on soften retries / Kontext refusal) use
+  // seeded text-to-image with the fewest content restrictions.
   if (provider === "flux") {
-    return generatePanelFromFlux(labeledScene, cast);
+    const seed = options.seed ?? 0;
+    const fluxRefs = cast.filter((c) => c.image);
+    if (!options.textOnly && fluxRefs.length > 0) {
+      const sheetBuf = await buildCastSheet(
+        fluxRefs.map((c) => ({ name: c.label, imageUrl: c.image as string }))
+      );
+      if (sheetBuf) {
+        const sheetDataUrl = `data:image/png;base64,${Buffer.from(
+          sheetBuf
+        ).toString("base64")}`;
+        const viaKontext = await generatePanelWithFluxKontext(
+          labeledScene,
+          cast,
+          sheetDataUrl,
+          seed
+        );
+        if (viaKontext.imageUrl) return viaKontext;
+        if (viaKontext.rateLimited) return viaKontext;
+        console.warn(
+          `[comic] flux kontext failed (${viaKontext.reason}); ` +
+            `falling back to seeded text-to-image`
+        );
+      }
+    }
+    return generatePanelFromFlux(labeledScene, cast, seed);
   }
 
   const withRefs = cast.filter((c) => c.image);
@@ -1024,6 +1121,9 @@ export async function buildComic(
 ): Promise<ComicBuildResult> {
   const buildStart = Date.now();
   const scripted = scriptPanels(story);
+  // One seed per story so FLUX renders characters consistently across panels
+  // (and across resume passes).
+  const storySeed = stableSeedFromId(story.id);
 
   if (!hasAiProvider()) {
     const comic: ComicStripData = {
@@ -1360,7 +1460,7 @@ export async function buildComic(
             characters,
             liveDescriptions,
             caricatureCache,
-            { textOnly: a.textOnly || useTextOnly, provider }
+            { textOnly: a.textOnly || useTextOnly, provider, seed: storySeed }
           );
           if (result.imageUrl) {
             attemptLog.push({
