@@ -14,6 +14,12 @@ import {
   type SanitizeLevel,
 } from "./safe-rewrite";
 import { buildCastSheet } from "./cast-sheet";
+import {
+  applyContinuity,
+  emptyContinuity,
+  updateContinuityFromCaption,
+  type ContinuityMap,
+} from "./continuity";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
@@ -399,6 +405,7 @@ function replaceNameWithLabel(text: string, name: string, label: string): string
 }
 
 type PanelCharacter = {
+  id: string;
   name: string;
   label: string;
   description: string;
@@ -417,6 +424,7 @@ function buildPanelCast(
   caricatures: Map<string, string | null>
 ): { cast: PanelCharacter[]; sceneCaptionRewriter: (caption: string) => string } {
   const cast: PanelCharacter[] = characters.map((c, i) => ({
+    id: c.id,
     name: c.name,
     label: `Character ${i + 1}`,
     description: descriptions.get(c.id) ?? "",
@@ -858,6 +866,10 @@ export async function buildComic(
   const canAttempt = () => Date.now() < deadline - MIN_ATTEMPT_MS;
 
   const panels: StoryPanel[] = [];
+  // Carry clothing / appearance across panels so visuals stay consistent
+  // (e.g. naked in beat 1 stays until a later caption changes the outfit).
+  const continuity: ContinuityMap = emptyContinuity();
+
   for (let panelIdx = 0; panelIdx < scripted.length; panelIdx++) {
     const panel = scripted[panelIdx];
     const characters = panel.characters.map((c) => ({
@@ -876,11 +888,26 @@ export async function buildComic(
     const labeledCaption = sceneCaptionRewriter(panel.caption);
     const labelNames = panelCast.map((c) => c.label);
 
+    // Inject prior visual state for anyone who reappears without a new
+    // appearance description in this caption.
+    const withContinuity = applyContinuity(
+      labeledCaption,
+      panelCast,
+      continuity
+    );
+    const baseCaption = withContinuity.caption;
+    if (withContinuity.notes.length > 0) {
+      console.log(
+        `[comic] panel ${panelIdx} continuity: ${withContinuity.notes.join("; ")}`
+      );
+    }
+
     type Attempt = { label: string; caption: string; textOnly?: boolean };
     let result: PanelResult = { imageUrl: null, prompt: "" };
     const tried = new Set<string>();
     const attemptLog: PanelImageAttempt[] = [];
-    let lastRefusedCaption = labeledCaption;
+    let lastRefusedCaption = baseCaption;
+    let successfulCaption: string | undefined;
     let useTextOnly = false;
 
     const runAttempt = async (a: Attempt) => {
@@ -909,6 +936,7 @@ export async function buildComic(
           { textOnly: a.textOnly || useTextOnly }
         );
         if (result.imageUrl) {
+          successfulCaption = a.caption;
           attemptLog.push({
             attempt: a.label,
             ok: true,
@@ -961,14 +989,16 @@ export async function buildComic(
       }
     };
 
-    // 1) Raw (with cast sheet when photos exist)
+    // 1) Continuity-aware raw caption (with cast sheet when photos exist)
     if (canAttempt()) {
-      await runAttempt({ label: "raw", caption: labeledCaption });
+      await runAttempt({ label: "raw", caption: baseCaption });
     }
 
-    // 2–4) Progressive soften rounds from the ORIGINAL caption — each is a
-    // different strategy: framing → covering → underwear. Soften retries are
-    // text-only so they don't burn the cast-sheet input-image quota.
+    // 2–4) Progressive soften rounds from the continuity-aware caption — each
+    // is a different strategy: framing → covering → underwear. Soften retries
+    // are text-only so they don't burn the cast-sheet input-image quota.
+    // Softening the continuity clause too keeps carried state (e.g. prior
+    // "naked") from re-blocking after an earlier panel already softened.
     const levels: SanitizeLevel[] = [0, 1, 2];
     for (const level of levels) {
       if (result.imageUrl) break;
@@ -982,12 +1012,12 @@ export async function buildComic(
       }
 
       // Prefer deterministic local soften for this distinct strategy.
-      let softer = localSoften(labeledCaption, level, labelNames);
+      let softer = localSoften(baseCaption, level, labelNames);
       if (!softer || tried.has(`t:${softer.trim()}`) || tried.has(`e:${softer.trim()}`)) {
         const [llmSoft] = await sanitizeCaptionsForImage(
           [
             {
-              caption: labeledCaption,
+              caption: baseCaption,
               names: labelNames,
               refusedCaption: lastRefusedCaption,
             },
@@ -995,11 +1025,11 @@ export async function buildComic(
           level,
           { force: true }
         );
-        if (llmSoft && llmSoft.trim() !== labeledCaption.trim()) {
+        if (llmSoft && llmSoft.trim() !== baseCaption.trim()) {
           softer = llmSoft;
         }
       }
-      if (!softer || softer.trim() === labeledCaption.trim()) continue;
+      if (!softer || softer.trim() === baseCaption.trim()) continue;
       if (tried.has(`t:${softer.trim()}`) || tried.has(`e:${softer.trim()}`)) continue;
 
       await runAttempt({
@@ -1008,6 +1038,14 @@ export async function buildComic(
         textOnly: true,
       });
     }
+
+    // Update continuity from what was drawn (successful softened caption),
+    // else from the continuity-aware story caption so later panels still match.
+    updateContinuityFromCaption(
+      continuity,
+      successfulCaption ?? baseCaption,
+      panelCast
+    );
 
     const failureReason = result.imageUrl
       ? undefined
@@ -1032,6 +1070,10 @@ export async function buildComic(
       imagePrompt: result.prompt || undefined,
       imageFailureReason: failureReason,
       imageAttempts: attemptLog,
+      continuityNote:
+        withContinuity.notes.length > 0
+          ? withContinuity.notes.join("; ")
+          : undefined,
     });
   }
 

@@ -88,6 +88,11 @@ export type StoryPanel = {
   imageFailureReason?: string;
   /** Per-attempt log so you can see exactly why each try failed. */
   imageAttempts?: PanelImageAttempt[];
+  /**
+   * Visual state carried forward from earlier panels (e.g. still naked /
+   * covering / in underwear) so image progression stays consistent.
+   */
+  continuityNote?: string;
 };
 
 export type ComicStripData = {

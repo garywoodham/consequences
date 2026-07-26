@@ -73,6 +73,14 @@ export function ComicStrip({ comic }: ComicStripProps) {
             <figcaption className="border-t-2 border-white/80 bg-white px-3 py-2 text-sm font-medium leading-snug text-zinc-900">
               {panel.caption}
             </figcaption>
+            {panel.continuityNote && (
+              <div className="border-t border-sky-200 bg-sky-50 px-3 py-1.5">
+                <p className="text-[11px] leading-snug text-sky-900">
+                  <span className="font-semibold">Carried look: </span>
+                  {panel.continuityNote}
+                </p>
+              </div>
+            )}
             {!panel.imageUrl && panel.imageFailureReason && (
               <div className="border-t border-amber-200 bg-amber-50 px-3 py-2">
                 <p className="text-[11px] font-semibold uppercase tracking-wide text-amber-800">
