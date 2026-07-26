@@ -831,9 +831,9 @@ function lastSuccessfulAttemptCaption(
 /**
  * Build (or resume) a comic strip from a finished story.
  *
- * Each call has a ~280s budget. Pass `previousComic` from an incomplete chunk
- * to skip finished panels and reuse cast/caricatures/wardrobe continuity.
- * The client should keep calling until `complete` is true.
+ * One HTTP call = at most one new panel image (plus a cast-only setup call
+ * first). Pass `previousComic` to reuse cast/caricatures/wardrobe and keep
+ * finished panels. The client loops until `complete` is true.
  */
 export async function buildComic(
   story: Story,
@@ -874,39 +874,104 @@ export async function buildComic(
     }
   }
 
-  await Promise.all(
-    storyCast.map(async (c) => {
-      // Already have a likeness description from a prior chunk — keep it.
-      if (descriptionCache.has(c.id) || caricatureCache.has(c.id)) {
-        if (!descriptionCache.has(c.id) && c.imageUrl) {
+  // Any prior cast means setup already ran — never redo caricature lookups.
+  const castAlreadyReady = Boolean(previousComic?.cast?.length);
+
+  // First call: prepare cast ONLY (no panel images) so caricature work and
+  // image generation never share one tunnel request.
+  if (!castAlreadyReady) {
+    await Promise.all(
+      storyCast.map(async (c) => {
+        if (descriptionCache.has(c.id) || caricatureCache.has(c.id)) {
+          if (!descriptionCache.has(c.id) && c.imageUrl) {
+            const desc = await describeCaricature(
+              (caricatureCache.get(c.id) || c.imageUrl) as string
+            );
+            if (desc) {
+              descriptionCache.set(c.id, desc);
+              descriptionSource.set(c.id, "photo");
+            }
+          }
+          return;
+        }
+
+        if (c.imageUrl) {
+          const caricature = await generateCaricatureWithRetry(
+            c.imageUrl as string,
+            style
+          );
+          caricatureCache.set(c.id, caricature);
           const desc = await describeCaricature(
-            (caricatureCache.get(c.id) || c.imageUrl) as string
+            caricature ?? (c.imageUrl as string)
           );
           if (desc) {
             descriptionCache.set(c.id, desc);
             descriptionSource.set(c.id, "photo");
           }
+          if (!caricature) {
+            console.warn(
+              `[comic] caricature failed for "${c.name}", using original photo + description`
+            );
+          }
+        } else {
+          const desc = await lookupPersonDescription(c.name);
+          if (desc) {
+            descriptionCache.set(c.id, desc);
+            descriptionSource.set(c.id, "web");
+          }
         }
-        return;
-      }
+      })
+    );
 
+    const cast: ComicCharacter[] = storyCast.map((c) => ({
+      id: c.id,
+      name: c.name,
+      imageUrl: resolveImage(c),
+      description: descriptionCache.get(c.id) ?? "",
+      descriptionSource: descriptionSource.get(c.id),
+    }));
+
+    const stubPanels: StoryPanel[] = scripted.map((panel) => ({
+      ...panel,
+      characters: panel.characters.map((c) => ({
+        ...c,
+        imageUrl: resolveImage(c),
+        description: descriptionCache.get(c.id) ?? c.description ?? "",
+      })),
+      imageFailureReason:
+        "Deferred — cast prepared; panel will draw on the next pass.",
+      imageAttempts: [
+        {
+          attempt: "deferred",
+          ok: false,
+          reason: "Waiting for per-panel generation pass.",
+        },
+      ],
+    }));
+
+    console.log(
+      `[comic] cast setup done characters=${cast.length} ` +
+        `panels=${stubPanels.length} total=${Date.now() - buildStart}ms`
+    );
+
+    return {
+      comic: { mode: "ai", panels: stubPanels, cast },
+      complete: false,
+      pendingPanelIndexes: stubPanels.map((p) => p.index),
+      generatedThisChunk: 0,
+    };
+  }
+
+  // Resume path — cast is already ready; refill caches for any gaps.
+  await Promise.all(
+    storyCast.map(async (c) => {
+      if (descriptionCache.has(c.id)) return;
       if (c.imageUrl) {
-        const caricature = await generateCaricatureWithRetry(
-          c.imageUrl as string,
-          style
-        );
-        caricatureCache.set(c.id, caricature);
-        const desc = await describeCaricature(
-          caricature ?? (c.imageUrl as string)
-        );
+        const src = (caricatureCache.get(c.id) || c.imageUrl) as string;
+        const desc = await describeCaricature(src);
         if (desc) {
           descriptionCache.set(c.id, desc);
           descriptionSource.set(c.id, "photo");
-        }
-        if (!caricature) {
-          console.warn(
-            `[comic] caricature failed for "${c.name}", using original photo + description`
-          );
         }
       } else {
         const desc = await lookupPersonDescription(c.name);
@@ -926,14 +991,11 @@ export async function buildComic(
     descriptionSource: descriptionSource.get(c.id),
   }));
 
-  // Per-chunk budget. Cloudflare quick tunnels cancel long HTTP requests
-  // (~100s), so each chunk must finish and return well under that. The client
-  // resumes with previousComic until every panel is done.
-  const OVERALL_DEADLINE_MS = 75_000;
-  const MIN_ATTEMPT_MS = 20_000;
-  // Cap images per request so the JSON payload (base64 PNGs) stays small
-  // enough to return through the tunnel reliably.
-  const MAX_NEW_PANELS_PER_CHUNK = 2;
+  // One panel image per HTTP request (tunnel-safe). Soften retries for that
+  // single panel still share this budget.
+  const OVERALL_DEADLINE_MS = 90_000;
+  const MIN_ATTEMPT_MS = 12_000;
+  const MAX_NEW_PANELS_PER_CHUNK = 1;
   const deadline = buildStart + OVERALL_DEADLINE_MS;
   const panels: StoryPanel[] = [];
   let generatedThisChunk = 0;
@@ -964,8 +1026,8 @@ export async function buildComic(
     // (including after a resume) stay consistent.
     updateContinuityFromCaption(continuity, labeledCaption, panelCast);
 
-    // Finished in a prior chunk — keep the image and fold any softened caption
-    // into continuity, then move on (no API calls).
+    // Finished in a prior chunk — keep the image (or a slim "done" marker)
+    // and fold any softened caption into continuity, then move on.
     if (previousPanel?.imageUrl) {
       const softCaption = lastSuccessfulAttemptCaption(
         previousPanel.imageAttempts
@@ -1100,8 +1162,10 @@ export async function buildComic(
           return;
         }
 
-        if (result.rateLimited && rateTry < 2) {
-          const waitMs = 15_000;
+        // Single short wait only — long rate-limit loops blow the per-panel
+        // request budget through the public tunnel.
+        if (result.rateLimited && rateTry < 1) {
+          const waitMs = 8_000;
           console.warn(
             `[comic] panel ${panelIdx} rate-limited on ${a.label}, ` +
               `waiting ${waitMs}ms then retrying same caption`

@@ -24,8 +24,59 @@ import type {
 import { PlayerAvatar } from "./PlayerAvatar";
 import { ComicStrip, ComicStripSkeleton } from "./ComicStrip";
 
-/** Safety cap so a stuck panel can't loop forever (~2 images per chunk). */
-const MAX_COMIC_CHUNKS = 12;
+/** Setup call + one call per panel (+ a few retries). */
+const MAX_COMIC_CHUNKS = 20;
+
+/** Marker used in slim resume payloads instead of shipping base64 images. */
+const DONE_IMAGE_MARKER = "done";
+
+/** Strip heavy image bytes before sending previousComic back to the API. */
+function slimComicForResume(comic: ComicStripData): ComicStripData {
+  return {
+    ...comic,
+    panels: comic.panels.map((p) => ({
+      ...p,
+      imageUrl: p.imageUrl ? DONE_IMAGE_MARKER : undefined,
+      imagePrompt: undefined,
+    })),
+  };
+}
+
+/** Re-attach real panel images kept on the client after a slim server round-trip. */
+function mergeComicProgress(
+  local: ComicStripData | undefined,
+  incoming: ComicStripData
+): ComicStripData {
+  if (!local) return incoming;
+  const localByIndex = new Map(local.panels.map((p) => [p.index, p]));
+  return {
+    ...incoming,
+    cast: incoming.cast ?? local.cast,
+    panels: incoming.panels.map((p) => {
+      const prev = localByIndex.get(p.index);
+      const incomingIsReal =
+        Boolean(p.imageUrl) &&
+        p.imageUrl !== DONE_IMAGE_MARKER &&
+        (p.imageUrl!.startsWith("data:") || p.imageUrl!.startsWith("http"));
+      if (incomingIsReal) return p;
+      if (prev?.imageUrl && prev.imageUrl !== DONE_IMAGE_MARKER) {
+        return {
+          ...p,
+          imageUrl: prev.imageUrl,
+          imagePrompt: p.imagePrompt ?? prev.imagePrompt,
+          imageAttempts: p.imageAttempts ?? prev.imageAttempts,
+          imageFailureReason: p.imageUrl ? p.imageFailureReason : prev.imageFailureReason,
+          continuityNote: p.continuityNote ?? prev.continuityNote,
+        };
+      }
+      return {
+        ...p,
+        imageUrl:
+          p.imageUrl === DONE_IMAGE_MARKER ? undefined : p.imageUrl,
+      };
+    }),
+  };
+}
 
 type StoryRevealProps = {
   state: GameState;
@@ -134,20 +185,27 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
   async function generateComic(target: Story) {
     setComicError(null);
     setComicLoading(true);
-    setComicProgress("Starting comic…");
-    // Fresh generate clears any prior strip for this story; resume chunks
-    // keep carrying the in-progress comic forward.
+    setComicProgress("Preparing characters…");
+    // One API call prepares the cast; each later call draws exactly one panel.
     let previousComic: ComicStripData | undefined;
     let chunk = 0;
     let networkRetries = 0;
+    let stallCount = 0;
 
     try {
       while (chunk < MAX_COMIC_CHUNKS) {
         chunk += 1;
+        const doneSoFar =
+          previousComic?.panels.filter(
+            (p) => p.imageUrl && p.imageUrl !== DONE_IMAGE_MARKER
+          ).length ?? 0;
+        const totalPanels = previousComic?.panels.length;
         setComicProgress(
-          previousComic
-            ? `Continuing comic (pass ${chunk}) — keeping finished panels & looks…`
-            : `Drawing comic (pass ${chunk})…`
+          !previousComic
+            ? "Preparing characters…"
+            : totalPanels
+              ? `Drawing panel ${Math.min(doneSoFar + 1, totalPanels)} of ${totalPanels}…`
+              : `Drawing next panel (pass ${chunk})…`
         );
 
         let res: Response;
@@ -158,18 +216,17 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
             body: JSON.stringify({
               story: target,
               style: caricatureStyle,
-              previousComic,
+              // Slim payload: don't re-upload finished panel PNGs each pass.
+              previousComic: previousComic
+                ? slimComicForResume(previousComic)
+                : undefined,
             }),
           });
         } catch {
-          // Tunnel/proxy often aborts long requests. Retry the same chunk a
-          // couple of times (with whatever progress we already have).
           networkRetries += 1;
           if (networkRetries <= 3) {
             chunk -= 1;
-            setComicProgress(
-              `Connection dropped — retrying pass ${chunk + 1}…`
-            );
+            setComicProgress("Connection dropped — retrying…");
             await new Promise((r) => setTimeout(r, 1500));
             continue;
           }
@@ -184,31 +241,41 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
         }
 
         const data = (await res.json()) as ComicBuildResult;
-        previousComic = data.comic;
+        previousComic = mergeComicProgress(previousComic, data.comic);
         networkRetries = 0;
-        setComics((prev) => ({ ...prev, [target.id]: data.comic }));
+        setComics((prev) => ({ ...prev, [target.id]: previousComic! }));
 
-        const doneCount = data.comic.panels.filter((p) => p.imageUrl).length;
-        const total = data.comic.panels.length;
+        const doneCount = previousComic.panels.filter(
+          (p) => p.imageUrl && p.imageUrl !== DONE_IMAGE_MARKER
+        ).length;
+        const total = previousComic.panels.length;
         setComicProgress(
           data.complete
             ? null
-            : `Drawn ${doneCount}/${total} panels — starting another pass for the rest…`
+            : `Drawn ${doneCount}/${total} panels…`
         );
 
         if (data.complete) break;
 
-        // Nothing new this chunk and still incomplete → stop rather than spin.
-        if (data.generatedThisChunk === 0 && chunk > 1) {
-          setComicError(
-            `Stopped after ${doneCount}/${total} panels — remaining panels could not be drawn.`
-          );
-          break;
+        if (data.generatedThisChunk === 0) {
+          stallCount += 1;
+          // First call is cast-only (0 images). After that, two stalls in a
+          // row means we aren't making progress.
+          if (chunk > 1 && stallCount >= 2) {
+            setComicError(
+              `Stopped after ${doneCount}/${total} panels — remaining panels could not be drawn.`
+            );
+            break;
+          }
+        } else {
+          stallCount = 0;
         }
       }
 
       if (chunk >= MAX_COMIC_CHUNKS && previousComic) {
-        const doneCount = previousComic.panels.filter((p) => p.imageUrl).length;
+        const doneCount = previousComic.panels.filter(
+          (p) => p.imageUrl && p.imageUrl !== DONE_IMAGE_MARKER
+        ).length;
         const total = previousComic.panels.length;
         if (doneCount < total) {
           setComicError(
