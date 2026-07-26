@@ -43,9 +43,14 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** "(?:label|name)" alternation, reused by every mention-anchored regex below. */
+function nameOrLabelAlternation(member: CastMember): string {
+  return `(?:${escapeRegExp(member.label)}|${escapeRegExp(member.name)})`;
+}
+
 function mentionRe(member: CastMember): RegExp {
   return new RegExp(
-    `(?<!\\p{L})(?:${escapeRegExp(member.label)}|${escapeRegExp(member.name)})(?!\\p{L})`,
+    `(?<!\\p{L})${nameOrLabelAlternation(member)}(?!\\p{L})`,
     "iu"
   );
 }
@@ -105,6 +110,33 @@ function isAccessoryOnlyItem(item: string): boolean {
   return ACCESSORY_ITEMS.some((acc) => acc.re.test(s));
 }
 
+/**
+ * Shared by the "wore …" and "wearing …" extractors (identical branching):
+ * an accessory-only item (e.g. "a hat") becomes just that accessory trait;
+ * anything else becomes an "outfit" trait plus any accessories mentioned
+ * inside it (e.g. "a suit and a top hat" → outfit + hat).
+ */
+function pushWornItemTraits(traits: Trait[], item: string): void {
+  const phrase = wearingPhrase(item);
+  const accessoryHits = ACCESSORY_ITEMS.filter((acc) => acc.re.test(item));
+  if (isAccessoryOnlyItem(item) && accessoryHits.length > 0) {
+    for (const acc of accessoryHits) {
+      traits.push({
+        slot: acc.slot,
+        phrase: accessoryPhraseFromMatch(acc.slot, phrase, item),
+      });
+    }
+  } else {
+    traits.push({ slot: "outfit", phrase });
+    for (const acc of accessoryHits) {
+      traits.push({
+        slot: acc.slot,
+        phrase: accessoryPhraseFromMatch(acc.slot, acc.phrase, item),
+      });
+    }
+  }
+}
+
 /** Traits explicitly tied to this character (wore / wearing / naked / …). */
 function extractDirectTraits(caption: string, member: CastMember): Trait[] {
   const text = caption.replace(/\s+/g, " ").trim();
@@ -114,7 +146,7 @@ function extractDirectTraits(caption: string, member: CastMember): Trait[] {
 
   // "Character 1 wore a seafoam green leisure suit."
   const woreRe = new RegExp(
-    `(?<!\\p{L})(?:${escapeRegExp(member.label)}|${escapeRegExp(member.name)})(?!\\p{L})\\s+wore\\s+([^.!?]+)`,
+    `(?<!\\p{L})${nameOrLabelAlternation(member)}(?!\\p{L})\\s+wore\\s+([^.!?]+)`,
     "giu"
   );
   for (const m of text.matchAll(woreRe)) {
@@ -123,56 +155,22 @@ function extractDirectTraits(caption: string, member: CastMember): Trait[] {
       traits.push({ slot: "body", phrase: "naked" });
       continue;
     }
-    const phrase = wearingPhrase(item);
-    const accessoryHits = ACCESSORY_ITEMS.filter((acc) => acc.re.test(item));
-    if (isAccessoryOnlyItem(item) && accessoryHits.length > 0) {
-      for (const acc of accessoryHits) {
-        traits.push({
-          slot: acc.slot,
-          phrase: accessoryPhraseFromMatch(acc.slot, phrase, item),
-        });
-      }
-    } else {
-      traits.push({ slot: "outfit", phrase });
-      for (const acc of accessoryHits) {
-        traits.push({
-          slot: acc.slot,
-          phrase: accessoryPhraseFromMatch(acc.slot, acc.phrase, item),
-        });
-      }
-    }
+    pushWornItemTraits(traits, item);
   }
 
   // "Character 1 was wearing a hat" / "put on a coat"
   const wearingRe = new RegExp(
-    `(?<!\\p{L})(?:${escapeRegExp(member.label)}|${escapeRegExp(member.name)})(?!\\p{L})\\s+(?:is |was |were )?(?:wearing|in)\\s+([^.!?,]+)`,
+    `(?<!\\p{L})${nameOrLabelAlternation(member)}(?!\\p{L})\\s+(?:is |was |were )?(?:wearing|in)\\s+([^.!?,]+)`,
     "giu"
   );
   for (const m of text.matchAll(wearingRe)) {
     const item = (m[1] ?? "").trim();
     if (!item) continue;
-    const phrase = wearingPhrase(item);
-    const accessoryHits = ACCESSORY_ITEMS.filter((acc) => acc.re.test(item));
-    if (isAccessoryOnlyItem(item) && accessoryHits.length > 0) {
-      for (const acc of accessoryHits) {
-        traits.push({
-          slot: acc.slot,
-          phrase: accessoryPhraseFromMatch(acc.slot, phrase, item),
-        });
-      }
-    } else {
-      traits.push({ slot: "outfit", phrase });
-      for (const acc of accessoryHits) {
-        traits.push({
-          slot: acc.slot,
-          phrase: accessoryPhraseFromMatch(acc.slot, acc.phrase, item),
-        });
-      }
-    }
+    pushWornItemTraits(traits, item);
   }
 
   const putOnRe = new RegExp(
-    `(?<!\\p{L})(?:${escapeRegExp(member.label)}|${escapeRegExp(member.name)})(?!\\p{L})\\s+put on\\s+([^.!?,]+)`,
+    `(?<!\\p{L})${nameOrLabelAlternation(member)}(?!\\p{L})\\s+put on\\s+([^.!?,]+)`,
     "giu"
   );
   for (const m of text.matchAll(putOnRe)) {
@@ -194,7 +192,7 @@ function extractDirectTraits(caption: string, member: CastMember): Trait[] {
 
   // Body / covering states near this character.
   const windowRe = new RegExp(
-    `.{0,50}(?<!\\p{L})(?:${escapeRegExp(member.label)}|${escapeRegExp(member.name)})(?!\\p{L}).{0,90}`,
+    `.{0,50}(?<!\\p{L})${nameOrLabelAlternation(member)}(?!\\p{L}).{0,90}`,
     "iu"
   );
   const win = text.match(windowRe)?.[0] ?? (re.test(text) ? text : "");
@@ -246,7 +244,7 @@ function extractDirectTraits(caption: string, member: CastMember): Trait[] {
 
   // Removals clear slots.
   const takeOffRe = new RegExp(
-    `(?<!\\p{L})(?:${escapeRegExp(member.label)}|${escapeRegExp(member.name)})(?!\\p{L})[^.]{0,40}\\b(?:took off|removed|ditched|lost)\\b[^.]{0,40}`,
+    `(?<!\\p{L})${nameOrLabelAlternation(member)}(?!\\p{L})[^.]{0,40}\\b(?:took off|removed|ditched|lost)\\b[^.]{0,40}`,
     "iu"
   );
   const takeOff = text.match(takeOffRe)?.[0];
@@ -280,7 +278,7 @@ function extractComplimentTraits(
     // Match "X said …" / "X replied …" including quoted answers and
     // punctuation ("Nice hat!"). Speech runs to the sentence end.
     const saidRe = new RegExp(
-      `(?<!\\p{L})(?:${escapeRegExp(speaker.label)}|${escapeRegExp(speaker.name)})(?!\\p{L})\\s+(?:said|replied|whispered|shouted|yelled|asked|answered)\\s+(.+?)(?=(?:[.!?](?:\\s|$))|$)`,
+      `(?<!\\p{L})${nameOrLabelAlternation(speaker)}(?!\\p{L})\\s+(?:said|replied|whispered|shouted|yelled|asked|answered)\\s+(.+?)(?=(?:[.!?](?:\\s|$))|$)`,
       "giu"
     );
     for (const m of text.matchAll(saidRe)) {
@@ -383,6 +381,14 @@ function extractJointTraits(caption: string): Trait[] {
   return traits;
 }
 
+// Matches body-slot phrases that mean "undressed" so we know when to clear
+// the conflicting slot (outfit vs. body). The two lists differ slightly for
+// historical reasons but cover the same reachable phrases from this file.
+const UNDRESSED_BODY_PHRASE_RE =
+  /naked|nude|topless|bottomless|stripped|underwear|covering|bedsheet|towel|bathrobe|duvet|undress/i;
+const UNDRESSED_BODY_SLOT_RE =
+  /naked|nude|topless|bottomless|stripped|underwear|covering|bedsheet|towel|bathrobe|duvet/i;
+
 function applyTraitsToMember(
   continuity: ContinuityMap,
   memberId: string,
@@ -398,26 +404,13 @@ function applyTraitsToMember(
     bag.set(t.slot, t.phrase);
     // Naked / covering clears normal clothes, but keeps accessories (hat on a
     // naked person is classic Consequences comedy).
-    if (
-      t.slot === "body" &&
-      /naked|nude|topless|bottomless|stripped|underwear|covering|bedsheet|towel|bathrobe|duvet|undress/i.test(
-        t.phrase
-      )
-    ) {
+    if (t.slot === "body" && UNDRESSED_BODY_PHRASE_RE.test(t.phrase)) {
       bag.delete("outfit");
     }
-    if (t.slot === "body" && t.phrase === "fully clothed") {
-      // clothed replaces undress body slot
-    }
+    // A new outfit replaces a previously undressed body state.
     if (t.slot === "outfit") {
-      // A new outfit replaces undress body state.
       const body = bag.get("body");
-      if (
-        body &&
-        /naked|nude|topless|bottomless|stripped|underwear|covering|bedsheet|towel|bathrobe|duvet/i.test(
-          body
-        )
-      ) {
+      if (body && UNDRESSED_BODY_SLOT_RE.test(body)) {
         bag.delete("body");
       }
     }
@@ -475,16 +468,20 @@ export function updateContinuityFromCaption(
   }
 }
 
-/** Current wardrobe/body trait phrases for one character. */
-export function traitPhrasesFor(
-  continuity: ContinuityMap,
-  id: string
+/**
+ * De-duplicated trait phrases from a trait bag, optionally skipping slots
+ * already covered by an incoming caption (`excludeSlots`). Drops an "outfit"
+ * phrase when it just repeats a more specific accessory phrase already in
+ * the bag (e.g. outfit "wearing a hat" vs. the "hat" slot's own phrase).
+ */
+function dedupedTraitPhrases(
+  bag: Map<string, string>,
+  excludeSlots: Set<string> = new Set()
 ): string[] {
-  const bag = continuity.get(id);
-  if (!bag || bag.size === 0) return [];
   const phrases: string[] = [];
   const seen = new Set<string>();
   for (const [slot, phrase] of bag) {
+    if (excludeSlots.has(slot)) continue;
     const key = phrase.toLowerCase();
     if (seen.has(key)) continue;
     if (
@@ -499,6 +496,16 @@ export function traitPhrasesFor(
     phrases.push(phrase);
   }
   return phrases;
+}
+
+/** Current wardrobe/body trait phrases for one character. */
+export function traitPhrasesFor(
+  continuity: ContinuityMap,
+  id: string
+): string[] {
+  const bag = continuity.get(id);
+  if (!bag || bag.size === 0) return [];
+  return dedupedTraitPhrases(bag);
 }
 
 /**
@@ -580,24 +587,7 @@ export function applyContinuity(
       ...joint.map((t) => t.slot),
     ]);
 
-    const carry: string[] = [];
-    const seen = new Set<string>();
-    for (const [slot, phrase] of prior) {
-      if (incomingSlots.has(slot)) continue;
-      const key = phrase.toLowerCase();
-      if (seen.has(key)) continue;
-      // Drop outfit phrase when it duplicates an accessory phrase ("wearing a hat").
-      if (
-        slot === "outfit" &&
-        [...prior.entries()].some(
-          ([s, p]) => s !== "outfit" && p.toLowerCase() === key
-        )
-      ) {
-        continue;
-      }
-      seen.add(key);
-      carry.push(phrase);
-    }
+    const carry = dedupedTraitPhrases(prior, incomingSlots);
     if (carry.length === 0) continue;
 
     notes.push(`${member.label} is still ${carry.join(", and still ")}`);

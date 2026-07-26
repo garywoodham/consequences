@@ -86,6 +86,19 @@ export function hasAiProvider(): boolean {
   return Boolean(OPENAI_API_KEY);
 }
 
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Whole-word, Unicode-aware regex matching `needle` (already escaped inside).
+ * Shared by every name-lookup/rewrite/scrub helper below so they all use the
+ * exact same boundary semantics.
+ */
+function wordBoundaryRegex(needle: string, flags: string): RegExp {
+  return new RegExp(`(?<!\\p{L})${escapeRegExp(needle)}(?!\\p{L})`, flags);
+}
+
 /** Split a finished story into 3-6 comic panels deterministically. */
 export function scriptPanels(story: Story): Omit<StoryPanel, "imageUrl">[] {
   const lines = story.lines;
@@ -147,8 +160,7 @@ export function scriptPanels(story: Story): Omit<StoryPanel, "imageUrl">[] {
 function mentionsName(text: string, name: string): boolean {
   const needle = name.trim();
   if (!needle) return false;
-  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "iu").test(text);
+  return wordBoundaryRegex(needle, "iu").test(text);
 }
 
 function buildSceneDescription(caption: string, characters: ComicCharacter[]): string {
@@ -174,6 +186,17 @@ async function fetchAsBlob(url: string): Promise<Blob | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * Caricature generation once, retried once on failure — image generation is
+ * non-deterministic and an occasional flaky refusal shouldn't drop a character.
+ */
+async function generateCaricatureWithRetry(
+  imageUrl: string,
+  style: CaricatureStyle
+): Promise<string | null> {
+  return (await generateCaricature(imageUrl, style)) ?? (await generateCaricature(imageUrl, style));
 }
 
 /** Turn an uploaded photo into a cartoon caricature (OpenAI image edit). */
@@ -330,8 +353,7 @@ function cleanupPersonDescription(text: string, name: string): string {
   for (const token of name.split(/\s+/)) {
     const t = token.trim();
     if (t.length < 2) continue;
-    const escaped = t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    out = out.replace(new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "giu"), "");
+    out = out.replace(wordBoundaryRegex(t, "giu"), "");
   }
   return out.replace(/\s{2,}/g, " ").replace(/\s+([,.])/g, "$1").trim();
 }
@@ -402,8 +424,7 @@ async function lookupPersonDescription(name: string): Promise<string> {
 function replaceNameWithLabel(text: string, name: string, label: string): string {
   const needle = name.trim();
   if (!needle) return text;
-  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return text.replace(new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "giu"), label);
+  return text.replace(wordBoundaryRegex(needle, "giu"), label);
 }
 
 type PanelCharacter = {
@@ -570,8 +591,7 @@ function scrubRealNamesFromPrompt(
   for (const { name, label } of sorted) {
     const needle = name.trim();
     if (!needle) continue;
-    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    out = out.replace(new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "giu"), label);
+    out = out.replace(wordBoundaryRegex(needle, "giu"), label);
   }
   return out;
 }
@@ -818,19 +838,18 @@ export async function buildComic(
   const caricatureCache = new Map<string, string | null>();
   const descriptionCache = new Map<string, string>();
   const descriptionSource = new Map<string, "photo" | "web">();
+  // Prefer the generated caricature over the original uploaded photo.
+  const resolveImage = (c: ComicCharacter): string | undefined =>
+    caricatureCache.get(c.id) ?? c.imageUrl;
 
   await Promise.all(
     storyCast.map(async (c) => {
       if (c.imageUrl) {
-        // Photo uploaded → caricature it (retry once; image generation is
-        // non-deterministic and an occasional flaky refusal shouldn't drop the
-        // character), then describe it. If the caricature never comes through,
-        // still describe the ORIGINAL photo so this character ALWAYS has a
-        // feature description to anchor every panel.
-        let caricature = await generateCaricature(c.imageUrl as string, style);
-        if (!caricature) {
-          caricature = await generateCaricature(c.imageUrl as string, style);
-        }
+        // Photo uploaded → caricature it (retry once), then describe it. If
+        // the caricature never comes through, still describe the ORIGINAL
+        // photo so this character ALWAYS has a feature description to
+        // anchor every panel.
+        const caricature = await generateCaricatureWithRetry(c.imageUrl as string, style);
         caricatureCache.set(c.id, caricature);
 
         const desc = await describeCaricature(caricature ?? (c.imageUrl as string));
@@ -857,7 +876,7 @@ export async function buildComic(
   const cast: ComicCharacter[] = storyCast.map((c) => ({
     id: c.id,
     name: c.name,
-    imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
+    imageUrl: resolveImage(c),
     description: descriptionCache.get(c.id) ?? "",
     descriptionSource: descriptionSource.get(c.id),
   }));
@@ -887,7 +906,7 @@ export async function buildComic(
     // softening so the image model never sees player/celebrity names.
     const labelingCharacters = panel.characters.map((c) => ({
       ...c,
-      imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
+      imageUrl: resolveImage(c),
       description: baseDescriptions.get(c.id) ?? c.description ?? "",
     }));
     const { cast: panelCast, sceneCaptionRewriter } = buildPanelCast(
@@ -900,9 +919,10 @@ export async function buildComic(
 
     // Learn wardrobe from THIS panel's story text BEFORE drawing, so
     // "Character 1 said nice hat" immediately updates Character 2's
-    // feature description for this panel and every later one.
+    // feature description for this panel and every later one. Trait regexes
+    // match a cast member by label OR real name, so scanning the labeled
+    // caption once is sufficient (no need to also scan the raw caption).
     updateContinuityFromCaption(continuity, labeledCaption, panelCast);
-    updateContinuityFromCaption(continuity, panel.caption, panelCast);
 
     const liveDescriptions = descriptionsWithContinuity(
       baseDescriptions,
@@ -916,7 +936,7 @@ export async function buildComic(
 
     const characters = panel.characters.map((c) => ({
       ...c,
-      imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
+      imageUrl: resolveImage(c),
       description: liveDescriptions.get(c.id) ?? c.description ?? "",
     }));
 
