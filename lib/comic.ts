@@ -757,13 +757,33 @@ async function callFluxEndpoint(
 }
 
 /**
- * Full-detail prompt body shared by the FLUX.2 paths. FLUX.2 accepts prompts
- * up to 32K tokens, so nothing is compressed: complete feature descriptions
- * (including the STORY WARDROBE continuity clause) all pass through.
+ * Strip the "(CRITICAL VISUAL CONTINUITY FROM EARLIER PANELS …)" parenthetical
+ * that `applyContinuity` appends to captions. On the FLUX path that bloat
+ * belongs in the character guide (STORY WARDROBE), not in the scene sentence —
+ * leaving it in the scene pushes identity detail toward the end of the prompt
+ * where later panels drift. OpenAI still receives the bloated caption.
+ */
+function stripContinuityParenthetical(scene: string): string {
+  return scene
+    .replace(
+      /\s*\(CRITICAL VISUAL CONTINUITY FROM EARLIER PANELS[^)]*\)\.?/gi,
+      ""
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Full-detail prompt body shared by the FLUX.2 / Qwen paths.
  *
- * `refIndex` maps character id → 1-based reference-image index for the edit
- * path; characters present there are anchored as "the person in @imageN"
- * (or whatever `anchorFor` renders — Qwen uses "image N" phrasing instead).
+ * Priority order (models weight early tokens most heavily):
+ *   1. Character identity + wardrobe (consistency across the strip)
+ *   2. Scene action (the story beat for this panel)
+ *   3. Composition / style / no-text (brief, last)
+ *
+ * Later panels accumulate wardrobe; putting characters FIRST means that growth
+ * never pushes faces out of the attended window the way a scene-first layout
+ * did.
  */
 function buildFlux2PromptBody(
   sceneWithLabels: string,
@@ -771,6 +791,7 @@ function buildFlux2PromptBody(
   refIndex?: Map<string, number>,
   anchorFor: (n: number) => string = (n) => `@image${n}`
 ): string {
+  const scene = stripContinuityParenthetical(sceneWithLabels);
   const labelList = cast.map((c) => c.label).join(", ");
   const castLines = cast
     .map((pc) => {
@@ -784,33 +805,29 @@ function buildFlux2PromptBody(
         ? pc.description
         : "an original cartoon character — invent a distinct look and keep it consistent";
       const wardrobeNote = /STORY WARDROBE/i.test(features)
-        ? " Honour the STORY WARDROBE clause in this description — it overrides " +
-          "the clothing shown in the reference image for this panel."
+        ? " Honour the STORY WARDROBE clause — it overrides the clothing " +
+          "shown in the reference image for this panel."
         : "";
       return `  • ${pc.label}${anchor}: ${features}.${wardrobeNote}`;
     })
     .join("\n");
 
   return (
-    `SCENE TO ILLUSTRATE: ${sceneWithLabels}\n\n` +
+    `${FICTIONAL_NOTE}\n\n` +
+    `CHARACTER GUIDE (highest priority — match these features precisely: ` +
+    `face shape, hair colour and style, eyes, build, skin tone, age; keep ` +
+    `every character identical across the whole comic strip):\n${castLines}\n\n` +
+    `SCENE TO ILLUSTRATE: ${scene}\n\n` +
     `Render this as a full moment caught mid-action: a rich, detailed ` +
     `environment that fits the scene (location, furniture, props, lighting, ` +
     `time of day), with expressive faces and body language showing exactly ` +
-    `how each character feels about what is happening.\n\n` +
-    `${FICTIONAL_NOTE}\n\n` +
-    `CHARACTER GUIDE (match these features precisely — face shape, hair ` +
-    `colour and style, eyes, build, skin tone, age and outfit):\n${castLines}\n\n` +
-    `COMPOSITION RULES (highest priority):\n` +
-    `  • EVERY character listed MUST appear in the panel (${labelList}) — ` +
-    `do not drop, merge or duplicate anyone. Prefer a wider composition ` +
-    `over leaving anyone out.\n` +
-    `  • Each character does exactly what the scene says they do.\n` +
-    `  • Keep every character's look identical to their description and ` +
-    `reference image so they stay consistent across the whole comic strip.\n` +
-    `  • This is ONE brand-new illustration with a full background setting — ` +
-    `NOT a copy, collage or side-by-side line-up of the reference images.\n` +
-    `  • STYLE: ${PANEL_STYLE}.\n` +
-    `  • ${NO_TEXT_BRIEF}.`
+    `how each character feels about what is happening. Each character does ` +
+    `exactly what the scene says they do.\n\n` +
+    `COMPOSITION: EVERY character listed MUST appear (${labelList}) — do not ` +
+    `drop, merge or duplicate anyone. Prefer a wider shot over leaving ` +
+    `anyone out. This is ONE brand-new illustration with a full background ` +
+    `— NOT a copy, collage or side-by-side line-up of the reference images. ` +
+    `STYLE: ${PANEL_STYLE}. ${NO_TEXT_BRIEF}.`
   );
 }
 
@@ -903,36 +920,56 @@ async function generatePanelWithQwenEdit(
 }
 
 /**
- * Compress a model-sheet description so it survives FLUX v1.1's short prompt
- * window: keep the leading feature sentences, always keep the STORY WARDROBE
- * clause (continuity), and trim at a word boundary.
+ * Compress a model-sheet description for FLUX v1.1's short prompt window.
+ * Face/identity ALWAYS keeps a reserved budget; wardrobe is trimmed second
+ * when the total won't fit. (Earlier versions reserved wardrobe first, which
+ * made later panels — where wardrobe has grown — lose the face description
+ * that keeps characters consistent.)
  */
 function compactDescriptionForFlux(desc: string, maxChars = 470): string {
   const cleaned = desc.replace(/\s+/g, " ").trim();
   if (cleaned.length <= maxChars) return cleaned;
 
   const wardrobeMatch = cleaned.match(/STORY WARDROBE\b[\s\S]*$/i);
-  const wardrobe = wardrobeMatch ? ` ${wardrobeMatch[0].trim()}` : "";
-  const budget = Math.max(80, maxChars - wardrobe.length);
+  const wardrobeFull = wardrobeMatch ? wardrobeMatch[0].trim() : "";
   const base = wardrobeMatch
     ? cleaned.slice(0, wardrobeMatch.index).trim()
     : cleaned;
-  let head = base.slice(0, budget);
+
+  // Reserve at least ~280 chars for face/identity so later-panel wardrobe
+  // growth can't wipe the look that early panels established.
+  const IDENTITY_MIN = 280;
+  const identityBudget = Math.min(
+    base.length,
+    Math.max(IDENTITY_MIN, maxChars - Math.min(wardrobeFull.length + 1, 180))
+  );
+  let head = base.slice(0, identityBudget);
   const lastSpace = head.lastIndexOf(" ");
   if (lastSpace > 40) head = head.slice(0, lastSpace);
-  return `${head.replace(/[,;.\s]+$/, "")}.${wardrobe}`;
+  head = head.replace(/[,;.\s]+$/, "");
+
+  const wardrobeBudget = Math.max(0, maxChars - head.length - 2);
+  let wardrobe = "";
+  if (wardrobeFull && wardrobeBudget > 40) {
+    wardrobe =
+      wardrobeFull.length <= wardrobeBudget
+        ? ` ${wardrobeFull}`
+        : ` ${wardrobeFull.slice(0, wardrobeBudget).replace(/[,;.\s]+$/, "")}`;
+  }
+  return `${head}.${wardrobe}`;
 }
 
-/** Compact prompt body for FLUX v1.1's short text-encoder window. */
+/** Compact prompt body for FLUX v1.1 — characters first, clean scene, brief no-text. */
 function buildFluxCompactPromptBody(
   sceneWithLabels: string,
   cast: PanelCharacter[]
 ): string {
+  const scene = stripContinuityParenthetical(sceneWithLabels);
   const labelList = cast.map((c) => c.label).join(" and ");
   const headcount =
     cast.length > 1
-      ? `The panel MUST show ALL ${cast.length} people together, every one ` +
-        `fully visible: ${labelList}. Do not leave anyone out or merge them.\n\n`
+      ? `ALL ${cast.length} people must appear fully visible: ${labelList}. ` +
+        `Do not leave anyone out or merge them.\n\n`
       : "";
   const castLines = cast
     .map((pc) => {
@@ -944,8 +981,10 @@ function buildFluxCompactPromptBody(
     .join("\n");
   return (
     headcount +
-    `SCENE: ${sceneWithLabels}\n\n` +
-    (castLines ? `WHO THEY ARE (fictional cartoon characters):\n${castLines}` : "")
+    (castLines
+      ? `WHO THEY ARE (identical faces/hair/builds across every panel):\n${castLines}\n\n`
+      : "") +
+    `SCENE: ${scene}`
   );
 }
 
