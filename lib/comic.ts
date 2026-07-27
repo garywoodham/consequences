@@ -84,6 +84,11 @@ const NO_TEXT =
   "captions, no titles, no chapter headings, no speech bubbles, no thought " +
   "bubbles, no signs, no book covers, no shop names, no logos, no watermarks, " +
   "no scribbles that resemble writing. All storytelling must be visual only.";
+// Single compact no-text rule for the FLUX prompts, stated once so the prompt
+// budget goes to character and scene detail instead.
+const NO_TEXT_BRIEF =
+  "Wordless image: no text, speech bubbles or signs anywhere — visual " +
+  "storytelling only";
 
 export function hasAiProvider(): boolean {
   return Boolean(OPENAI_API_KEY || FAL_KEY);
@@ -788,8 +793,13 @@ function buildFlux2PromptBody(
 
   return (
     `SCENE TO ILLUSTRATE: ${sceneWithLabels}\n\n` +
+    `Render this as a full moment caught mid-action: a rich, detailed ` +
+    `environment that fits the scene (location, furniture, props, lighting, ` +
+    `time of day), with expressive faces and body language showing exactly ` +
+    `how each character feels about what is happening.\n\n` +
     `${FICTIONAL_NOTE}\n\n` +
-    `CHARACTER GUIDE (match these features precisely):\n${castLines}\n\n` +
+    `CHARACTER GUIDE (match these features precisely — face shape, hair ` +
+    `colour and style, eyes, build, skin tone, age and outfit):\n${castLines}\n\n` +
     `COMPOSITION RULES (highest priority):\n` +
     `  • EVERY character listed MUST appear in the panel (${labelList}) — ` +
     `do not drop, merge or duplicate anyone. Prefer a wider composition ` +
@@ -800,7 +810,7 @@ function buildFlux2PromptBody(
     `  • This is ONE brand-new illustration with a full background setting — ` +
     `NOT a copy, collage or side-by-side line-up of the reference images.\n` +
     `  • STYLE: ${PANEL_STYLE}.\n` +
-    `  • ${NO_TEXT}`
+    `  • ${NO_TEXT_BRIEF}.`
   );
 }
 
@@ -860,11 +870,10 @@ async function generatePanelWithQwenEdit(
   const refIndex = new Map<string, number>();
   refs.forEach((pc, i) => refIndex.set(pc.id, i + 1));
 
-  // Qwen under-weights negative prompts, so the no-text rule leads the
-  // positive prompt too (models weight the opening most heavily).
+  // The no-text rule lives once in the shared body (and in the negative
+  // prompt below); the prompt budget goes to character and scene detail.
   const prompt = scrubRealNamesFromPrompt(
-    `Create ONE brand-new comic panel with absolutely NO text, NO speech ` +
-      `bubbles, NO words and NO letters anywhere in the image.\n\n` +
+    `Create ONE brand-new comic panel.\n\n` +
       buildFlux2PromptBody(
         sceneWithLabels,
         cast,
@@ -898,7 +907,7 @@ async function generatePanelWithQwenEdit(
  * window: keep the leading feature sentences, always keep the STORY WARDROBE
  * clause (continuity), and trim at a word boundary.
  */
-function compactDescriptionForFlux(desc: string, maxChars = 420): string {
+function compactDescriptionForFlux(desc: string, maxChars = 470): string {
   const cleaned = desc.replace(/\s+/g, " ").trim();
   if (cleaned.length <= maxChars) return cleaned;
 
@@ -953,9 +962,7 @@ async function generatePanelFromFlux(
   seed?: number
 ): Promise<PanelResult> {
   const prompt = scrubRealNamesFromPrompt(
-    `Silent wordless illustration: absolutely no text, no words, no letters, ` +
-      `no speech bubbles, no dialogue balloons, no captions, no signs ` +
-      `anywhere. ${PANEL_STYLE}, nobody is speaking.\n\n` +
+    `${NO_TEXT_BRIEF}. ${PANEL_STYLE}, detailed background setting.\n\n` +
       buildFluxCompactPromptBody(sceneWithLabels, cast),
     cast
   );
