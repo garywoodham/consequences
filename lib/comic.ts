@@ -377,27 +377,33 @@ function cleanupPersonDescription(text: string, name: string): string {
 
 /**
  * When a player types a NAME that has no uploaded photo, resolve a physical
- * description so the image model can draw a matching likeness:
- *   1. Curated celebrity look bank (preset public figures — most reliable)
- *   2. Live web-search lookup for other recognisable names
- * Returns "" for ordinary names. The name itself is never sent to the image
- * model — only the appearance description (and a generated lookalike ref).
+ * description so the image model can draw a matching likeness.
+ *
+ * OpenAI path: live web-search only (unchanged from the proven behaviour).
+ * FLUX path: curated celebrity look bank first, then web-search fallback.
+ *
+ * The name itself is never sent to the image model — only the appearance
+ * description (and, on FLUX, a generated lookalike reference image).
  */
-async function lookupPersonDescription(name: string): Promise<string> {
+async function lookupPersonDescription(
+  name: string,
+  options: { useCuratedLooks?: boolean } = {}
+): Promise<string> {
   if (!OPENAI_API_KEY) return "";
   const trimmed = name.trim();
   if (!trimmed) return "";
 
-  const cacheKey = trimmed.toLowerCase();
+  const cacheKey = `${options.useCuratedLooks ? "c:" : "w:"}${trimmed.toLowerCase()}`;
   const cached = personLookupCache.get(cacheKey);
   if (cached !== undefined) return cached;
 
-  // Curated bank first — web search often returns generic features for
-  // well-known faces (e.g. "blonde woman" for Sydney Sweeney).
-  const curated = getCelebrityLook(trimmed);
-  if (curated) {
-    personLookupCache.set(cacheKey, curated);
-    return curated;
+  // Curated bank is FLUX-only — must not change OpenAI's text path.
+  if (options.useCuratedLooks) {
+    const curated = getCelebrityLook(trimmed);
+    if (curated) {
+      personLookupCache.set(cacheKey, curated);
+      return curated;
+    }
   }
 
   let result = "";
@@ -419,15 +425,14 @@ async function lookupPersonDescription(name: string): Promise<string> {
           `real public figure (celebrity, musician, actor, athlete, politician, ` +
           `historical figure, etc.). Search the web to confirm their appearance ` +
           `if helpful.\n\n` +
-          `If YES: reply with ONLY a 60-90 word physical-appearance description ` +
-          `an artist could use to draw a recognisable caricature. Begin DIRECTLY ` +
-          `with the appearance (e.g. "a 40-year-old woman with...") and cover ` +
-          `perceived gender & age range, build/body type, skin tone, face shape, ` +
-          `eyes (colour and shape), nose, lips, hair (colour/length/style), ` +
-          `facial hair, glasses/accessories, distinctive features, and their ` +
-          `typical/signature clothing or look. Emphasise what makes THIS person ` +
-          `visually distinctive — not generic traits. Physical appearance ONLY. ` +
-          `Do NOT include the person's name anywhere, no citations, no commentary.\n\n` +
+          `If YES: reply with ONLY a 45-75 word physical-appearance description ` +
+          `an artist could use to draw a caricature. Begin DIRECTLY with the ` +
+          `appearance (e.g. "a 40-year-old woman with...") and cover perceived ` +
+          `gender & age range, build, skin tone, face shape, hair ` +
+          `(colour/length/style), facial hair, glasses/accessories, ` +
+          `distinctive features, and their typical/signature clothing or look. ` +
+          `Physical appearance ONLY. Do NOT include the person's name anywhere, ` +
+          `no citations, no commentary.\n\n` +
           `If it is NOT a clearly recognisable public figure (e.g. an ordinary ` +
           `first name like "Dave" or "Sarah"), reply with exactly: NONE`,
       }),
@@ -558,7 +563,15 @@ function buildPanelCast(
   return { cast, sceneCaptionRewriter };
 }
 
-const FICTIONAL_NOTE =
+/** OpenAI panel prompts — keep the proven wording; do not share FLUX edits. */
+const OPENAI_FICTIONAL_NOTE =
+  "IMPORTANT: the people below are ORIGINAL FICTIONAL cartoon characters, each " +
+  "defined ONLY by the feature description given. They are NOT real, famous or " +
+  "identifiable individuals — draw an original cartoon character that matches " +
+  "the described features. Keep each character's look identical in every panel.";
+
+/** FLUX panel prompts — allow recognisable lookalikes from curated descriptions. */
+const FLUX_FICTIONAL_NOTE =
   "IMPORTANT: draw ORIGINAL cartoon characters defined by the feature " +
   "descriptions (and reference images when provided). Match those features " +
   "closely so each person is a recognisable LOOKALIKE of the described " +
@@ -697,7 +710,7 @@ async function generatePanelFromTextCast(
   const guide = cast.length ? buildCharacterGuide(cast, false) : "";
   const labelList = cast.map((c) => c.label).join(", ");
   const guideBlock = guide
-    ? `${FICTIONAL_NOTE}\n\nCHARACTER GUIDE:\n${guide}\n\n` +
+    ? `${OPENAI_FICTIONAL_NOTE}\n\nCHARACTER GUIDE:\n${guide}\n\n` +
       `All of these characters (${labelList}) must appear in the panel doing ` +
       `exactly what the scene says; do not swap or omit anyone.\n\n`
     : "";
@@ -919,7 +932,7 @@ function buildFlux2PromptBody(
     .join("\n");
 
   return (
-    `${FICTIONAL_NOTE}\n\n` +
+    `${FLUX_FICTIONAL_NOTE}\n\n` +
     `CAST:\n${roster}\n\n` +
     `SCENE TO ILLUSTRATE (do exactly this — do not invent a different story):\n` +
     `${scene}\n\n` +
@@ -1257,7 +1270,7 @@ async function generatePanelImage(
   const prompt = scrubRealNamesFromPrompt(
     `${NO_TEXT}\n\n` +
       `TASK: draw ONE brand-new comic panel illustrating the scene below.\n\n` +
-      `${FICTIONAL_NOTE}\n\n` +
+      `${OPENAI_FICTIONAL_NOTE}\n\n` +
       `CHARACTER GUIDE (match these features precisely):\n${guide}\n\n` +
       `A cast sheet is attached: each tile shows one character with their label ` +
       `printed beneath. Use it together with the feature descriptions above.\n\n` +
@@ -1266,8 +1279,7 @@ async function generatePanelImage(
       `feature description exactly (age/build, skin tone, hair, facial hair, ` +
       `glasses, notable clothing). Keep them consistent across panels.\n` +
       `  • Do NOT swap features between characters, do NOT merge them, do NOT ` +
-      `replace anyone with a random unrelated face — match each description ` +
-      `and cast-sheet tile exactly.\n` +
+      `replace anyone with a random or famous-looking person.\n` +
       `  • EVERY character listed MUST appear in the panel, even if the scene ` +
       `sentence only names some of them: ${labelList}.\n` +
       `  • Prefer a wider composition over leaving anyone out.\n\n` +
@@ -1495,27 +1507,31 @@ export async function buildComic(
             );
           }
         } else {
-          const desc = await lookupPersonDescription(c.name);
+          const desc = await lookupPersonDescription(c.name, {
+            useCuratedLooks: provider === "flux",
+          });
           if (desc) {
             descriptionCache.set(c.id, desc);
             descriptionSource.set(c.id, "web");
-            // No uploaded photo — bake a visual lookalike reference from the
-            // description so panel engines (OpenAI cast sheet / FLUX @imageN)
-            // can lock onto a consistent celebrity-like face.
-            const lookalike = await generateLookalikeFromDescription(
-              desc,
-              style
-            );
-            if (lookalike) {
-              caricatureCache.set(c.id, lookalike);
-              console.log(
-                `[comic] lookalike caricature ready for public figure "${c.name}"`
+            // Lookalike reference images are FLUX-only. OpenAI keeps its
+            // proven cast-sheet path (photo caricatures only; celebs stay
+            // description-driven without an extra generated face).
+            if (provider === "flux") {
+              const lookalike = await generateLookalikeFromDescription(
+                desc,
+                style
               );
-            } else {
-              console.warn(
-                `[comic] lookalike caricature failed for "${c.name}" — ` +
-                  `panels will rely on the text description only`
-              );
+              if (lookalike) {
+                caricatureCache.set(c.id, lookalike);
+                console.log(
+                  `[comic] lookalike caricature ready for public figure "${c.name}"`
+                );
+              } else {
+                console.warn(
+                  `[comic] lookalike caricature failed for "${c.name}" — ` +
+                    `panels will rely on the text description only`
+                );
+              }
             }
           }
         }
@@ -1573,7 +1589,9 @@ export async function buildComic(
           descriptionSource.set(c.id, "photo");
         }
       } else {
-        const desc = await lookupPersonDescription(c.name);
+        const desc = await lookupPersonDescription(c.name, {
+          useCuratedLooks: provider === "flux",
+        });
         if (desc) {
           descriptionCache.set(c.id, desc);
           descriptionSource.set(c.id, "web");
