@@ -786,14 +786,15 @@ function stripContinuityParenthetical(scene: string): string {
 /**
  * Full-detail prompt body shared by the FLUX.2 / Qwen paths.
  *
- * Priority order (models weight early tokens most heavily):
- *   1. Character identity + wardrobe (consistency across the strip)
- *   2. Scene action (the story beat for this panel)
- *   3. Composition / style / no-text (brief, last)
+ * Order matters for later panels (spicier → often fall to shorter-window
+ * engines): story beat must stay early and intact, characters stay anchored
+ * by reference images + a short roster up front, full descriptions follow,
+ * no-text is last and brief.
  *
- * Later panels accumulate wardrobe; putting characters FIRST means that growth
- * never pushes faces out of the attended window the way a scene-first layout
- * did.
+ *   1. Brief cast roster (@imageN / image N)
+ *   2. SCENE (clean story action — never buried)
+ *   3. Full character guide + wardrobe
+ *   4. Composition / style / no-text
  */
 function buildFlux2PromptBody(
   sceneWithLabels: string,
@@ -803,13 +804,21 @@ function buildFlux2PromptBody(
 ): string {
   const scene = stripContinuityParenthetical(sceneWithLabels);
   const labelList = cast.map((c) => c.label).join(", ");
+
+  const roster = cast
+    .map((pc) => {
+      const refN = refIndex?.get(pc.id);
+      return refN
+        ? `  • ${pc.label} = the person in ${anchorFor(refN)}`
+        : `  • ${pc.label}`;
+    })
+    .join("\n");
+
   const castLines = cast
     .map((pc) => {
       const refN = refIndex?.get(pc.id);
       const anchor = refN
-        ? ` — this is the person shown in ${anchorFor(refN)}; draw ` +
-          `them with the IDENTICAL face, hair, build and skin tone as that ` +
-          `reference image`
+        ? ` — IDENTICAL face/hair/build/skin to ${anchorFor(refN)}`
         : "";
       const features = pc.description
         ? pc.description
@@ -824,19 +833,17 @@ function buildFlux2PromptBody(
 
   return (
     `${FICTIONAL_NOTE}\n\n` +
-    `CHARACTER GUIDE (highest priority — match these features precisely: ` +
-    `face shape, hair colour and style, eyes, build, skin tone, age; keep ` +
-    `every character identical across the whole comic strip):\n${castLines}\n\n` +
-    `SCENE TO ILLUSTRATE: ${scene}\n\n` +
-    `Render this as a full moment caught mid-action: a rich, detailed ` +
-    `environment that fits the scene (location, furniture, props, lighting, ` +
-    `time of day), with expressive faces and body language showing exactly ` +
-    `how each character feels about what is happening. Each character does ` +
-    `exactly what the scene says they do.\n\n` +
-    `COMPOSITION: EVERY character listed MUST appear (${labelList}) — do not ` +
-    `drop, merge or duplicate anyone. Prefer a wider shot over leaving ` +
-    `anyone out. This is ONE brand-new illustration with a full background ` +
-    `— NOT a copy, collage or side-by-side line-up of the reference images. ` +
+    `CAST:\n${roster}\n\n` +
+    `SCENE TO ILLUSTRATE (do exactly this — do not invent a different story):\n` +
+    `${scene}\n\n` +
+    `Render a full moment mid-action with a rich environment (location, ` +
+    `furniture, props, lighting, time of day) and expressive faces/body ` +
+    `language. Every listed character must appear (${labelList}) doing ` +
+    `exactly what the scene says — do not drop, merge or duplicate anyone.\n\n` +
+    `CHARACTER DETAILS (match precisely; keep looks identical across the strip):\n` +
+    `${castLines}\n\n` +
+    `This is ONE brand-new illustration with a full background — NOT a copy, ` +
+    `collage or side-by-side line-up of the reference images. ` +
     `STYLE: ${PANEL_STYLE}. ${NO_TEXT_BRIEF}.`
   );
 }
@@ -931,12 +938,10 @@ async function generatePanelWithQwenEdit(
 
 /**
  * Compress a model-sheet description for FLUX v1.1's short prompt window.
- * Face/identity ALWAYS keeps a reserved budget; wardrobe is trimmed second
- * when the total won't fit. (Earlier versions reserved wardrobe first, which
- * made later panels — where wardrobe has grown — lose the face description
- * that keeps characters consistent.)
+ * Face/identity keeps a reserved budget; wardrobe is capped second so growing
+ * continuity on later panels cannot push the SCENE out of the encoder window.
  */
-function compactDescriptionForFlux(desc: string, maxChars = 470): string {
+function compactDescriptionForFlux(desc: string, maxChars = 360): string {
   const cleaned = desc.replace(/\s+/g, " ").trim();
   if (cleaned.length <= maxChars) return cleaned;
 
@@ -946,19 +951,25 @@ function compactDescriptionForFlux(desc: string, maxChars = 470): string {
     ? cleaned.slice(0, wardrobeMatch.index).trim()
     : cleaned;
 
-  // Reserve at least ~280 chars for face/identity so later-panel wardrobe
-  // growth can't wipe the look that early panels established.
-  const IDENTITY_MIN = 280;
+  // Face first; wardrobe capped so two characters + scene still fit in ~512 tokens.
+  const IDENTITY_MIN = 220;
+  const WARDROBE_MAX = 120;
   const identityBudget = Math.min(
     base.length,
-    Math.max(IDENTITY_MIN, maxChars - Math.min(wardrobeFull.length + 1, 180))
+    Math.max(
+      IDENTITY_MIN,
+      maxChars - Math.min(wardrobeFull.length + 1, WARDROBE_MAX)
+    )
   );
   let head = base.slice(0, identityBudget);
   const lastSpace = head.lastIndexOf(" ");
   if (lastSpace > 40) head = head.slice(0, lastSpace);
   head = head.replace(/[,;.\s]+$/, "");
 
-  const wardrobeBudget = Math.max(0, maxChars - head.length - 2);
+  const wardrobeBudget = Math.min(
+    WARDROBE_MAX,
+    Math.max(0, maxChars - head.length - 2)
+  );
   let wardrobe = "";
   if (wardrobeFull && wardrobeBudget > 40) {
     wardrobe =
@@ -969,7 +980,11 @@ function compactDescriptionForFlux(desc: string, maxChars = 470): string {
   return `${head}.${wardrobe}`;
 }
 
-/** Compact prompt body for FLUX v1.1 — characters first, clean scene, brief no-text. */
+/**
+ * Compact prompt for FLUX v1.1 — SCENE FIRST so later-panel wardrobe growth
+ * cannot truncate the story beat off the end of the short encoder window.
+ * Characters follow with a protected face budget.
+ */
 function buildFluxCompactPromptBody(
   sceneWithLabels: string,
   cast: PanelCharacter[]
@@ -979,7 +994,7 @@ function buildFluxCompactPromptBody(
   const headcount =
     cast.length > 1
       ? `ALL ${cast.length} people must appear fully visible: ${labelList}. ` +
-        `Do not leave anyone out or merge them.\n\n`
+        `Do not leave anyone out or merge them. `
       : "";
   const castLines = cast
     .map((pc) => {
@@ -990,11 +1005,10 @@ function buildFluxCompactPromptBody(
     })
     .join("\n");
   return (
-    headcount +
+    `${headcount}SCENE: ${scene}\n\n` +
     (castLines
-      ? `WHO THEY ARE (identical faces/hair/builds across every panel):\n${castLines}\n\n`
-      : "") +
-    `SCENE: ${scene}`
+      ? `WHO THEY ARE (identical faces/hair/builds across every panel):\n${castLines}`
+      : "")
   );
 }
 
@@ -1448,11 +1462,14 @@ export async function buildComic(
     descriptionSource: descriptionSource.get(c.id),
   }));
 
-  // Bake continuity from story order first, then draw pending panels in
-  // parallel. Wall-clock ≈ slowest panel (plus soften retries), not the sum.
-  const OVERALL_DEADLINE_MS = 150_000;
+  // Bake continuity from story order first, then draw pending panels.
+  // FLUX runs panels one-at-a-time (separate API calls): later spicy panels
+  // often descend the fal ladder (FLUX.2 → Qwen → v1.1), and parallelising
+  // that made timeouts / soften races wipe story and cast on the last panels.
+  // OpenAI keeps modest parallelism.
+  const OVERALL_DEADLINE_MS = provider === "flux" ? 240_000 : 150_000;
   const MIN_ATTEMPT_MS = 12_000;
-  const PARALLEL_CONCURRENCY = 4;
+  const PARALLEL_CONCURRENCY = provider === "flux" ? 1 : 4;
   const deadline = buildStart + OVERALL_DEADLINE_MS;
   const canAttempt = () => Date.now() < deadline - MIN_ATTEMPT_MS;
 
@@ -1559,7 +1576,7 @@ export async function buildComic(
   }
 
   console.log(
-    `[comic] drawing ${planned.length} panels in parallel ` +
+    `[comic] drawing ${planned.length} panels ` +
       `(provider=${provider}, concurrency=${PARALLEL_CONCURRENCY}, ` +
       `kept=${keptPanels.size})`
   );
@@ -1574,6 +1591,7 @@ export async function buildComic(
         characters,
         liveDescriptions,
         baseCaption,
+        labeledCaption,
         labelNames,
         wardrobe,
         continuityNotes,
@@ -1694,51 +1712,78 @@ export async function buildComic(
         }
       };
 
-      await runAttempt({ label: "raw", caption: baseCaption });
+      await runAttempt({
+        label: "raw",
+        // FLUX: send the clean story caption — wardrobe already lives in the
+        // character descriptions. The continuity parenthetical used to bloat
+        // late panels and fight the scene on short-window fallbacks.
+        caption: provider === "flux" ? labeledCaption : baseCaption,
+      });
 
-      const levels: SanitizeLevel[] = [0, 1, 2];
-      for (const level of levels) {
-        if (result.imageUrl) break;
-        if (!canAttempt()) {
-          attemptLog.push({
-            attempt: `soft${level}`,
-            ok: false,
-            reason: "Skipped — overall comic time budget exhausted.",
-          });
-          break;
-        }
-
-        let softer = localSoften(baseCaption, level, labelNames);
-        if (
-          !softer ||
-          tried.has(`t:${softer.trim()}`) ||
-          tried.has(`e:${softer.trim()}`)
-        ) {
-          const [llmSoft] = await sanitizeCaptionsForImage(
-            [
-              {
-                caption: baseCaption,
-                names: labelNames,
-                refusedCaption: lastRefusedCaption,
-              },
-            ],
-            level,
-            { force: true }
-          );
-          if (llmSoft && llmSoft.trim() !== baseCaption.trim()) {
-            softer = llmSoft;
+      // Soften ladder is for OpenAI moderation. FLUX already has its own
+      // permissive fal ladder; LLM softens were rewriting late-panel stories
+      // into generic "cuddled under a duvet" mush and dropping likeness.
+      if (provider === "flux") {
+        // One local soften only if the whole fal ladder refused — keeps the
+        // same characters/setting without inventing a new scene via LLM.
+        if (!result.imageUrl && canAttempt()) {
+          const softer = localSoften(labeledCaption, 0, labelNames);
+          if (softer && softer.trim() !== labeledCaption.trim()) {
+            await runAttempt({
+              label: "local0",
+              caption: softer,
+              textOnly: true,
+            });
           }
         }
-        if (!softer || softer.trim() === baseCaption.trim()) continue;
-        if (tried.has(`t:${softer.trim()}`) || tried.has(`e:${softer.trim()}`)) {
-          continue;
-        }
+      } else {
+        const levels: SanitizeLevel[] = [0, 1, 2];
+        for (const level of levels) {
+          if (result.imageUrl) break;
+          if (!canAttempt()) {
+            attemptLog.push({
+              attempt: `soft${level}`,
+              ok: false,
+              reason: "Skipped — overall comic time budget exhausted.",
+            });
+            break;
+          }
 
-        await runAttempt({
-          label: `soft${level}`,
-          caption: softer,
-          textOnly: true,
-        });
+          let softer = localSoften(baseCaption, level, labelNames);
+          if (
+            !softer ||
+            tried.has(`t:${softer.trim()}`) ||
+            tried.has(`e:${softer.trim()}`)
+          ) {
+            const [llmSoft] = await sanitizeCaptionsForImage(
+              [
+                {
+                  caption: baseCaption,
+                  names: labelNames,
+                  refusedCaption: lastRefusedCaption,
+                },
+              ],
+              level,
+              { force: true }
+            );
+            if (llmSoft && llmSoft.trim() !== baseCaption.trim()) {
+              softer = llmSoft;
+            }
+          }
+          if (!softer || softer.trim() === baseCaption.trim()) continue;
+          if (
+            tried.has(`t:${softer.trim()}`) ||
+            tried.has(`e:${softer.trim()}`)
+          ) {
+            continue;
+          }
+
+          await runAttempt({
+            label: `soft${level}`,
+            caption: softer,
+            textOnly: true,
+          });
+        }
       }
 
       const budgetExhausted = attemptLog.some(
