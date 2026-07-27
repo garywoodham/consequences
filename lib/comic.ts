@@ -700,9 +700,13 @@ async function callFluxEndpoint(
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       const lower = body.toLowerCase();
+      // fal's un-disableable prompt checker (FLUX.2/BFL endpoints) reports
+      // `content_policy_violation` on HTTP 422 — that specific refusal is
+      // what triggers the permissive fallback ladder.
       const blocked =
         looksLikeModerationBlock(res.status, body) ||
         lower.includes("nsfw") ||
+        lower.includes("content_policy_violation") ||
         (res.status === 422 && lower.includes("content"));
       const rateLimited = res.status === 429;
       const reason = blocked
@@ -753,18 +757,21 @@ async function callFluxEndpoint(
  * (including the STORY WARDROBE continuity clause) all pass through.
  *
  * `refIndex` maps character id → 1-based reference-image index for the edit
- * path; characters present there are anchored as "the person in @imageN".
+ * path; characters present there are anchored as "the person in @imageN"
+ * (or whatever `anchorFor` renders — Qwen uses "image N" phrasing instead).
  */
 function buildFlux2PromptBody(
   sceneWithLabels: string,
   cast: PanelCharacter[],
-  refIndex?: Map<string, number>
+  refIndex?: Map<string, number>,
+  anchorFor: (n: number) => string = (n) => `@image${n}`
 ): string {
   const labelList = cast.map((c) => c.label).join(", ");
   const castLines = cast
     .map((pc) => {
-      const anchor = refIndex?.get(pc.id)
-        ? ` — this is the person shown in @image${refIndex.get(pc.id)}; draw ` +
+      const refN = refIndex?.get(pc.id);
+      const anchor = refN
+        ? ` — this is the person shown in ${anchorFor(refN)}; draw ` +
           `them with the IDENTICAL face, hair, build and skin tone as that ` +
           `reference image`
         : "";
@@ -837,8 +844,108 @@ async function generatePanelWithFlux2Edit(
 }
 
 /**
- * FLUX.2 [pro] text-to-image with full-detail descriptions — used when no
- * cast references exist or when the soften ladder falls back to text-only.
+ * Qwen Image Edit Plus (open weights, via fal.ai) — fallback rung when the
+ * FLUX.2 prompt checker refuses a scene. Keeps character consistency via
+ * multiple reference images ("image 1", "image 2", …) and long prompts
+ * (Qwen2.5-VL encoder, ~1K tokens), and its safety checker can be fully
+ * disabled — fal runs no un-disableable prompt checker on open models.
+ */
+async function generatePanelWithQwenEdit(
+  sceneWithLabels: string,
+  cast: PanelCharacter[],
+  refCast: PanelCharacter[],
+  seed: number
+): Promise<PanelResult> {
+  const refs = refCast.slice(0, 4);
+  const refIndex = new Map<string, number>();
+  refs.forEach((pc, i) => refIndex.set(pc.id, i + 1));
+
+  // Qwen under-weights negative prompts, so the no-text rule leads the
+  // positive prompt too (models weight the opening most heavily).
+  const prompt = scrubRealNamesFromPrompt(
+    `Create ONE brand-new comic panel with absolutely NO text, NO speech ` +
+      `bubbles, NO words and NO letters anywhere in the image.\n\n` +
+      buildFlux2PromptBody(
+        sceneWithLabels,
+        cast,
+        refIndex,
+        (n) => `image ${n}`
+      ),
+    cast
+  );
+
+  return callFluxEndpoint(
+    "fal-ai/qwen-image-edit-plus",
+    {
+      prompt,
+      image_urls: refs.map((pc) => pc.image as string),
+      image_size: "square_hd",
+      num_images: 1,
+      output_format: "png",
+      enable_safety_checker: false,
+      negative_prompt:
+        "text, words, letters, typography, writing, captions, subtitles, " +
+        "speech bubbles, dialogue balloons, signs, logos, watermark, " +
+        "side-by-side collage, photo grid",
+      seed,
+    },
+    prompt
+  );
+}
+
+/**
+ * Compress a model-sheet description so it survives FLUX v1.1's short prompt
+ * window: keep the leading feature sentences, always keep the STORY WARDROBE
+ * clause (continuity), and trim at a word boundary.
+ */
+function compactDescriptionForFlux(desc: string, maxChars = 420): string {
+  const cleaned = desc.replace(/\s+/g, " ").trim();
+  if (cleaned.length <= maxChars) return cleaned;
+
+  const wardrobeMatch = cleaned.match(/STORY WARDROBE\b[\s\S]*$/i);
+  const wardrobe = wardrobeMatch ? ` ${wardrobeMatch[0].trim()}` : "";
+  const budget = Math.max(80, maxChars - wardrobe.length);
+  const base = wardrobeMatch
+    ? cleaned.slice(0, wardrobeMatch.index).trim()
+    : cleaned;
+  let head = base.slice(0, budget);
+  const lastSpace = head.lastIndexOf(" ");
+  if (lastSpace > 40) head = head.slice(0, lastSpace);
+  return `${head.replace(/[,;.\s]+$/, "")}.${wardrobe}`;
+}
+
+/** Compact prompt body for FLUX v1.1's short text-encoder window. */
+function buildFluxCompactPromptBody(
+  sceneWithLabels: string,
+  cast: PanelCharacter[]
+): string {
+  const labelList = cast.map((c) => c.label).join(" and ");
+  const headcount =
+    cast.length > 1
+      ? `The panel MUST show ALL ${cast.length} people together, every one ` +
+        `fully visible: ${labelList}. Do not leave anyone out or merge them.\n\n`
+      : "";
+  const castLines = cast
+    .map((pc) => {
+      const features = pc.description
+        ? compactDescriptionForFlux(pc.description)
+        : "an original cartoon character with a distinct, consistent look";
+      return `${pc.label}: ${features}`;
+    })
+    .join("\n");
+  return (
+    headcount +
+    `SCENE: ${sceneWithLabels}\n\n` +
+    (castLines ? `WHO THEY ARE (fictional cartoon characters):\n${castLines}` : "")
+  );
+}
+
+/**
+ * FLUX Pro v1.1 text-to-image at fal's most permissive settings (tolerance 6,
+ * checker off) — the last, least-restricted rung of the ladder. No reference
+ * images and a short prompt window (hence the compact prompt), but it
+ * generates content every other engine refuses; the shared seed keeps
+ * characters roughly consistent across panels.
  */
 async function generatePanelFromFlux(
   sceneWithLabels: string,
@@ -846,19 +953,22 @@ async function generatePanelFromFlux(
   seed?: number
 ): Promise<PanelResult> {
   const prompt = scrubRealNamesFromPrompt(
-    `Create ONE comic panel.\n\n` + buildFlux2PromptBody(sceneWithLabels, cast),
+    `Silent wordless illustration: absolutely no text, no words, no letters, ` +
+      `no speech bubbles, no dialogue balloons, no captions, no signs ` +
+      `anywhere. ${PANEL_STYLE}, nobody is speaking.\n\n` +
+      buildFluxCompactPromptBody(sceneWithLabels, cast),
     cast
   );
 
   return callFluxEndpoint(
-    "fal-ai/flux-2-pro",
+    "fal-ai/flux-pro/v1.1",
     {
       prompt,
       image_size: "square_hd",
       num_images: 1,
       output_format: "png",
-      // Most permissive settings this endpoint exposes.
-      safety_tolerance: "5",
+      // Most permissive settings fal exposes for this model.
+      safety_tolerance: "6",
       enable_safety_checker: false,
       ...(seed != null ? { seed } : {}),
     },
@@ -901,9 +1011,15 @@ async function generatePanelImage(
   // leftover real names become Character N before the prompt is built.
   const labeledScene = sceneCaptionRewriter(caption);
 
-  // FLUX path: FLUX.2 [pro] edit with each caricature as its own reference
-  // image (@imageN) and full uncompressed descriptions; soften retries and
-  // refusals fall back to seeded FLUX.2 text-to-image.
+  // FLUX path — permissive fallback ladder:
+  //   1. FLUX.2 [pro] edit: best likeness (per-character @imageN references,
+  //      32K-token prompts) but fal's prompt checker refuses risqué scenes.
+  //   2. Qwen Image Edit Plus: keeps references + long prompts, checker fully
+  //      disabled (open weights) — handles most scenes FLUX.2 refuses.
+  //   3. FLUX Pro v1.1 @ tolerance 6: text-only compact prompt, the most
+  //      permissive engine fal exposes.
+  // Rate limits return immediately (the outer retry loop handles waiting);
+  // only content refusals and hard failures descend the ladder.
   if (provider === "flux") {
     const seed = options.seed ?? 0;
     const fluxRefs = cast.filter((c) => c.image);
@@ -918,7 +1034,22 @@ async function generatePanelImage(
       if (viaEdit.rateLimited) return viaEdit;
       console.warn(
         `[comic] flux-2 edit failed (${viaEdit.reason}); ` +
-          `falling back to seeded text-to-image`
+          (viaEdit.blocked
+            ? `content refusal — trying qwen edit (references kept)`
+            : `trying qwen edit (references kept)`)
+      );
+
+      const viaQwen = await generatePanelWithQwenEdit(
+        labeledScene,
+        cast,
+        fluxRefs,
+        seed
+      );
+      if (viaQwen.imageUrl) return viaQwen;
+      if (viaQwen.rateLimited) return viaQwen;
+      console.warn(
+        `[comic] qwen edit failed (${viaQwen.reason}); ` +
+          `falling back to flux v1.1 text-to-image`
       );
     }
     return generatePanelFromFlux(labeledScene, cast, seed);
