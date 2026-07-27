@@ -24,6 +24,7 @@ import {
   wardrobeNotes,
   type ContinuityMap,
 } from "./continuity";
+import { getCelebrityLook } from "./celebrity-looks";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const FAL_KEY = process.env.FAL_KEY;
@@ -375,11 +376,12 @@ function cleanupPersonDescription(text: string, name: string): string {
 }
 
 /**
- * When a player types a NAME that has no uploaded photo, try to find a physical
- * description online (via the OpenAI Responses web-search tool) so the image
- * model can draw a matching likeness. Returns "" for ordinary names that don't
- * resolve to a recognisable public figure. The name itself is never sent to
- * the image model — only the resulting appearance description.
+ * When a player types a NAME that has no uploaded photo, resolve a physical
+ * description so the image model can draw a matching likeness:
+ *   1. Curated celebrity look bank (preset public figures — most reliable)
+ *   2. Live web-search lookup for other recognisable names
+ * Returns "" for ordinary names. The name itself is never sent to the image
+ * model — only the appearance description (and a generated lookalike ref).
  */
 async function lookupPersonDescription(name: string): Promise<string> {
   if (!OPENAI_API_KEY) return "";
@@ -389,6 +391,14 @@ async function lookupPersonDescription(name: string): Promise<string> {
   const cacheKey = trimmed.toLowerCase();
   const cached = personLookupCache.get(cacheKey);
   if (cached !== undefined) return cached;
+
+  // Curated bank first — web search often returns generic features for
+  // well-known faces (e.g. "blonde woman" for Sydney Sweeney).
+  const curated = getCelebrityLook(trimmed);
+  if (curated) {
+    personLookupCache.set(cacheKey, curated);
+    return curated;
+  }
 
   let result = "";
   try {
@@ -409,14 +419,15 @@ async function lookupPersonDescription(name: string): Promise<string> {
           `real public figure (celebrity, musician, actor, athlete, politician, ` +
           `historical figure, etc.). Search the web to confirm their appearance ` +
           `if helpful.\n\n` +
-          `If YES: reply with ONLY a 45-75 word physical-appearance description ` +
-          `an artist could use to draw a caricature. Begin DIRECTLY with the ` +
-          `appearance (e.g. "a 40-year-old woman with...") and cover perceived ` +
-          `gender & age range, build, skin tone, face shape, hair ` +
-          `(colour/length/style), facial hair, glasses/accessories, ` +
-          `distinctive features, and their typical/signature clothing or look. ` +
-          `Physical appearance ONLY. Do NOT include the person's name anywhere, ` +
-          `no citations, no commentary.\n\n` +
+          `If YES: reply with ONLY a 60-90 word physical-appearance description ` +
+          `an artist could use to draw a recognisable caricature. Begin DIRECTLY ` +
+          `with the appearance (e.g. "a 40-year-old woman with...") and cover ` +
+          `perceived gender & age range, build/body type, skin tone, face shape, ` +
+          `eyes (colour and shape), nose, lips, hair (colour/length/style), ` +
+          `facial hair, glasses/accessories, distinctive features, and their ` +
+          `typical/signature clothing or look. Emphasise what makes THIS person ` +
+          `visually distinctive — not generic traits. Physical appearance ONLY. ` +
+          `Do NOT include the person's name anywhere, no citations, no commentary.\n\n` +
           `If it is NOT a clearly recognisable public figure (e.g. an ordinary ` +
           `first name like "Dave" or "Sarah"), reply with exactly: NONE`,
       }),
@@ -434,6 +445,72 @@ async function lookupPersonDescription(name: string): Promise<string> {
 
   personLookupCache.set(cacheKey, result);
   return result;
+}
+
+/**
+ * Generate a cartoon lookalike reference image from a text description when
+ * there is no uploaded photo (celebrity / public-figure names). Gives both
+ * OpenAI cast-sheet and FLUX @imageN paths a visual identity to lock onto.
+ */
+async function generateLookalikeFromDescription(
+  description: string,
+  style: CaricatureStyle = "balanced"
+): Promise<string | null> {
+  if (!OPENAI_API_KEY || !description.trim()) return null;
+
+  const styleHint =
+    style === "exaggerated"
+      ? "bold heavily exaggerated caricature, amplify distinctive features"
+      : style === "flattering"
+        ? "flattering idealised cartoon caricature, glamorous and clear-skinned"
+        : style === "faithful"
+          ? "clean lightly stylised cartoon portrait, true-to-life proportions"
+          : "moderately exaggerated cartoon caricature, instantly recognisable";
+
+  const prompt =
+    `Create a single cartoon CHARACTER PORTRAIT (head-and-shoulders, facing ` +
+    `camera, plain light background) that is an INSTANTLY RECOGNISABLE ` +
+    `caricature lookalike of this exact appearance:\n` +
+    `${description}\n\n` +
+    `CRITICAL: amplify the most distinctive features so the face is unique ` +
+    `and memorable (not a generic pretty face). ${styleHint}. ` +
+    `${PANEL_STYLE}. This portrait will be reused as a cast reference across ` +
+    `a whole comic strip — consistency matters. ${NO_TEXT_BRIEF}.`;
+
+  try {
+    const res = await fetch("https://api.openai.com/v1/images/generations", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-image-1",
+        prompt,
+        size: "1024x1024",
+        quality: "medium",
+        moderation: "low",
+        n: 1,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.warn(
+        `[comic] lookalike caricature failed status=${res.status} ` +
+          body.slice(0, 160)
+      );
+      return null;
+    }
+    const data = (await res.json()) as { data?: { b64_json?: string }[] };
+    const b64 = data?.data?.[0]?.b64_json;
+    return b64 ? `data:image/png;base64,${b64}` : null;
+  } catch (err) {
+    console.warn(
+      `[comic] lookalike caricature network error: ` +
+        (err instanceof Error ? err.message : "unknown")
+    );
+    return null;
+  }
 }
 
 /** Whole-word, Unicode-aware replacement of a character's name with a label. */
@@ -482,10 +559,11 @@ function buildPanelCast(
 }
 
 const FICTIONAL_NOTE =
-  "IMPORTANT: the people below are ORIGINAL FICTIONAL cartoon characters, each " +
-  "defined ONLY by the feature description given. They are NOT real, famous or " +
-  "identifiable individuals — draw an original cartoon character that matches " +
-  "the described features. Keep each character's look identical in every panel.";
+  "IMPORTANT: draw ORIGINAL cartoon characters defined by the feature " +
+  "descriptions (and reference images when provided). Match those features " +
+  "closely so each person is a recognisable LOOKALIKE of the described " +
+  "appearance — do not invent a random unrelated face. Keep each character's " +
+  "look identical in every panel.";
 
 /**
  * Guarantee the scene text references every character, so that even after the
@@ -1188,7 +1266,8 @@ async function generatePanelImage(
       `feature description exactly (age/build, skin tone, hair, facial hair, ` +
       `glasses, notable clothing). Keep them consistent across panels.\n` +
       `  • Do NOT swap features between characters, do NOT merge them, do NOT ` +
-      `replace anyone with a random or famous-looking person.\n` +
+      `replace anyone with a random unrelated face — match each description ` +
+      `and cast-sheet tile exactly.\n` +
       `  • EVERY character listed MUST appear in the panel, even if the scene ` +
       `sentence only names some of them: ${labelList}.\n` +
       `  • Prefer a wider composition over leaving anyone out.\n\n` +
@@ -1420,6 +1499,24 @@ export async function buildComic(
           if (desc) {
             descriptionCache.set(c.id, desc);
             descriptionSource.set(c.id, "web");
+            // No uploaded photo — bake a visual lookalike reference from the
+            // description so panel engines (OpenAI cast sheet / FLUX @imageN)
+            // can lock onto a consistent celebrity-like face.
+            const lookalike = await generateLookalikeFromDescription(
+              desc,
+              style
+            );
+            if (lookalike) {
+              caricatureCache.set(c.id, lookalike);
+              console.log(
+                `[comic] lookalike caricature ready for public figure "${c.name}"`
+              );
+            } else {
+              console.warn(
+                `[comic] lookalike caricature failed for "${c.name}" — ` +
+                  `panels will rely on the text description only`
+              );
+            }
           }
         }
       })
