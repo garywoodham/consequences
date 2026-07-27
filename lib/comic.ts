@@ -697,6 +697,15 @@ function panelSeed(storySeed: number, panelIndex: number): number {
   return (storySeed + (panelIndex + 1) * 100_003) % 2147483647;
 }
 
+/** Quick check: fal's FLUX.2 prompt checker refuses these — skip that rung. */
+function sceneLikelyBlockedByFlux2(scene: string): boolean {
+  return (
+    /\b(?:naked|nude|nudity|topless|bottomless|undress(?:ed|ing)?|strip(?:ped|ping)?|skinny[- ]?dip|lingerie|sex(?:y|ual)?|shag|bonk|horny|fuck|willy|boobs?|breasts?|nipples?|arse|ass\b|genitals?)\b/i.test(
+      scene
+    )
+  );
+}
+
 /** POST to a fal.ai endpoint, inline the resulting image as a data URL. */
 async function callFluxEndpoint(
   endpoint: string,
@@ -1082,17 +1091,39 @@ async function generatePanelImage(
   const labeledScene = sceneCaptionRewriter(caption);
 
   // FLUX path — permissive fallback ladder:
-  //   1. FLUX.2 [pro] edit: best likeness (per-character @imageN references,
-  //      32K-token prompts) but fal's prompt checker refuses risqué scenes.
-  //   2. Qwen Image Edit Plus: keeps references + long prompts, checker fully
-  //      disabled (open weights) — handles most scenes FLUX.2 refuses.
-  //   3. FLUX Pro v1.1 @ tolerance 6: text-only compact prompt, the most
-  //      permissive engine fal exposes.
-  // Rate limits return immediately (the outer retry loop handles waiting);
-  // only content refusals and hard failures descend the ladder.
+  //   Tame scenes: FLUX.2 edit → Qwen → v1.1 (best likeness first)
+  //   Spicy scenes: skip FLUX.2 (always refused) and try v1.1 FIRST —
+  //   it's fast (~15s) and most permissive. Qwen is second for likeness
+  //   if v1.1 fails. (Qwen-first was taking 60–90s and killing the tunnel.)
   if (provider === "flux") {
     const seed = options.seed ?? 0;
     const fluxRefs = cast.filter((c) => c.image);
+    const spicy = sceneLikelyBlockedByFlux2(labeledScene);
+
+    if (spicy) {
+      console.log(
+        `[comic] spicy scene — trying flux v1.1 first (skip flux-2)`
+      );
+      const viaV11 = await generatePanelFromFlux(labeledScene, cast, seed);
+      if (viaV11.imageUrl) return viaV11;
+      if (viaV11.rateLimited) return viaV11;
+
+      if (!options.textOnly && fluxRefs.length > 0) {
+        console.warn(
+          `[comic] flux v1.1 failed (${viaV11.reason}); trying qwen edit`
+        );
+        const viaQwen = await generatePanelWithQwenEdit(
+          labeledScene,
+          cast,
+          fluxRefs,
+          seed
+        );
+        if (viaQwen.imageUrl) return viaQwen;
+        if (viaQwen.rateLimited) return viaQwen;
+      }
+      return viaV11;
+    }
+
     if (!options.textOnly && fluxRefs.length > 0) {
       const viaEdit = await generatePanelWithFlux2Edit(
         labeledScene,
@@ -1463,11 +1494,12 @@ export async function buildComic(
   }));
 
   // Bake continuity from story order first, then draw pending panels.
-  // FLUX runs panels one-at-a-time (separate API calls): later spicy panels
-  // often descend the fal ladder (FLUX.2 → Qwen → v1.1), and parallelising
-  // that made timeouts / soften races wipe story and cast on the last panels.
-  // OpenAI keeps modest parallelism.
-  const OVERALL_DEADLINE_MS = provider === "flux" ? 240_000 : 150_000;
+  // FLUX: ONE panel per HTTP chunk. Serial-all-in-one-request was timing out
+  // Cloudflare tunnels (~100s) so the client saw constant failures. The client
+  // resume loop already expects multi-chunk generation. OpenAI still draws
+  // several panels per chunk in parallel.
+  const MAX_DRAW_PER_CHUNK = provider === "flux" ? 1 : 4;
+  const OVERALL_DEADLINE_MS = provider === "flux" ? 75_000 : 150_000;
   const MIN_ATTEMPT_MS = 12_000;
   const PARALLEL_CONCURRENCY = provider === "flux" ? 1 : 4;
   const deadline = buildStart + OVERALL_DEADLINE_MS;
@@ -1576,13 +1608,17 @@ export async function buildComic(
   }
 
   console.log(
-    `[comic] drawing ${planned.length} panels ` +
+    `[comic] drawing up to ${Math.min(planned.length, MAX_DRAW_PER_CHUNK)} ` +
+      `of ${planned.length} pending panels ` +
       `(provider=${provider}, concurrency=${PARALLEL_CONCURRENCY}, ` +
       `kept=${keptPanels.size})`
   );
 
+  const toDraw = planned.slice(0, MAX_DRAW_PER_CHUNK);
+  const deferredPlans = planned.slice(MAX_DRAW_PER_CHUNK);
+
   const drawnPanels: StoryPanel[] = await mapPool(
-    planned,
+    toDraw,
     PARALLEL_CONCURRENCY,
     async (plan): Promise<StoryPanel> => {
       const {
@@ -1821,6 +1857,28 @@ export async function buildComic(
       };
     }
   );
+
+  // Panels beyond this chunk's draw budget — client resumes with previousComic.
+  for (const plan of deferredPlans) {
+    const noteParts = [
+      ...plan.wardrobe.map((w) => `In character sheet: ${w}`),
+      ...plan.continuityNotes,
+    ];
+    drawnPanels.push({
+      ...plan.panel,
+      characters: plan.characters,
+      imageFailureReason:
+        "Deferred — continuing in next pass (one FLUX panel per request).",
+      imageAttempts: [
+        {
+          attempt: "deferred",
+          ok: false,
+          reason: "Queued — continuing in next pass.",
+        },
+      ],
+      continuityNote: noteParts.length > 0 ? noteParts.join("; ") : undefined,
+    });
+  }
 
   const drawnByIndex = new Map(drawnPanels.map((p) => [p.index, p]));
   const panels: StoryPanel[] = scripted.map((panel) => {
