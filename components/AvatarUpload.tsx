@@ -1,8 +1,7 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useId, useState } from "react";
 import { Camera, Upload } from "lucide-react";
-import { Button } from "@/components/ui/button";
 import { resizeImageToAvatar } from "@/lib/image-utils";
 import { cn } from "@/lib/utils";
 import { PlayerAvatar } from "./PlayerAvatar";
@@ -15,7 +14,8 @@ type AvatarUploadProps = {
 };
 
 export function AvatarUpload({ name, value, onChange, className }: AvatarUploadProps) {
-  const inputRef = useRef<HTMLInputElement>(null);
+  const galleryId = useId();
+  const cameraId = useId();
   const [uploading, setUploading] = useState(false);
   const [localPreview, setLocalPreview] = useState<string | undefined>();
   const [error, setError] = useState<string | null>(null);
@@ -35,7 +35,7 @@ export function AvatarUpload({ name, value, onChange, className }: AvatarUploadP
       });
 
       if (!response.ok) {
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
         throw new Error(data.error ?? "Upload failed");
       }
 
@@ -49,35 +49,21 @@ export function AvatarUpload({ name, value, onChange, className }: AvatarUploadP
     }
   }
 
+  const pickerClass =
+    "inline-flex h-9 cursor-pointer items-center justify-center gap-2 rounded-lg border border-white/20 bg-white/10 px-3 text-sm font-medium text-white transition hover:bg-white/20";
+
   return (
     <div className={cn("flex flex-col items-center gap-3", className)}>
       <PlayerAvatar name={name || "Player"} avatarUrl={preview} size="lg" />
       <div className="flex gap-2">
-        <Button
-          type="button"
-          variant="secondary"
-          size="sm"
-          disabled={uploading}
-          onClick={() => inputRef.current?.click()}
-        >
+        <label htmlFor={galleryId} className={cn(pickerClass, uploading && "pointer-events-none opacity-50")}>
           <Upload className="h-4 w-4" />
           {uploading ? "Uploading..." : "Upload photo"}
-        </Button>
-        <Button
-          type="button"
-          variant="secondary"
-          size="sm"
-          disabled={uploading}
-          onClick={() => {
-            if (inputRef.current) {
-              inputRef.current.setAttribute("capture", "user");
-              inputRef.current.click();
-            }
-          }}
-        >
+        </label>
+        <label htmlFor={cameraId} className={cn(pickerClass, uploading && "pointer-events-none opacity-50")}>
           <Camera className="h-4 w-4" />
           Camera
-        </Button>
+        </label>
       </div>
       {preview && (
         <button
@@ -96,10 +82,24 @@ export function AvatarUpload({ name, value, onChange, className }: AvatarUploadP
       )}
       {error && <p className="text-center text-xs text-red-300">{error}</p>}
       <input
-        ref={inputRef}
+        id={galleryId}
         type="file"
         accept="image/*"
-        className="hidden"
+        className="sr-only"
+        disabled={uploading}
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) handleFile(file);
+          e.target.value = "";
+        }}
+      />
+      <input
+        id={cameraId}
+        type="file"
+        accept="image/*"
+        capture="user"
+        className="sr-only"
+        disabled={uploading}
         onChange={(e) => {
           const file = e.target.files?.[0];
           if (file) handleFile(file);

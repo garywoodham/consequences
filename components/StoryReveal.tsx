@@ -14,13 +14,14 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardTitle } from "@/components/ui/card";
-import type {
-  CaricatureStyle,
-  ComicBuildResult,
-  ComicStripData,
-  GameState,
-  ImageProvider,
-  Story,
+import {
+  IMAGE_PROVIDERS,
+  type CaricatureStyle,
+  type ComicBuildResult,
+  type ComicStripData,
+  type GameState,
+  type ImageProvider,
+  type Story,
 } from "@/lib/types";
 import { recommendImageProvider } from "@/lib/provider-recommend";
 import { PlayerAvatar } from "./PlayerAvatar";
@@ -670,21 +671,17 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
             {STYLE_OPTIONS.find((o) => o.value === caricatureStyle)?.hint}
           </p>
         </div>
-        {providersAvailable.length > 1 && (
+        {providersAvailable.length > 0 && (
           <div className="mb-3 rounded-xl border border-white/10 bg-white/5 p-3">
             <p className="mb-2 text-xs font-medium uppercase tracking-wide text-white/60">
               Image engine
             </p>
-            <div
-              className={`grid gap-2 ${
-                providersAvailable.length >= 3
-                  ? "grid-cols-1 sm:grid-cols-3"
-                  : "grid-cols-2"
-              }`}
-            >
-              {providersAvailable.map((p) => {
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+              {IMAGE_PROVIDERS.map((p) => {
+                const configured = providersAvailable.includes(p);
                 const selected = imageProvider === p;
-                const recommended = recommendation?.provider === p;
+                const recommended =
+                  configured && recommendation?.provider === p;
                 const label =
                   p === "openai"
                     ? "OpenAI"
@@ -696,18 +693,35 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
                     key={p}
                     type="button"
                     onClick={() => {
+                      if (!configured) return;
                       providerTouchedRef.current = true;
                       setImageProvider(p);
                     }}
-                    disabled={comicLoading}
+                    disabled={comicLoading || !configured}
                     aria-pressed={selected}
-                    className={`relative rounded-lg border px-3 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60 ${
-                      selected
-                        ? "border-violet-400 bg-violet-500/20 text-white"
-                        : "border-white/10 bg-white/5 text-white/70 hover:border-white/30 hover:text-white"
+                    title={
+                      configured
+                        ? undefined
+                        : p === "openai"
+                          ? "Set OPENAI_API_KEY in .env.local"
+                          : p === "flux"
+                            ? "Set FAL_KEY in .env.local"
+                            : "Set COMFYUI_URL in .env.local"
+                    }
+                    className={`relative rounded-lg border px-3 py-2 text-sm font-medium transition disabled:cursor-not-allowed ${
+                      !configured
+                        ? "border-white/5 bg-white/[0.02] text-white/30"
+                        : selected
+                          ? "border-violet-400 bg-violet-500/20 text-white"
+                          : "border-white/10 bg-white/5 text-white/70 hover:border-white/30 hover:text-white disabled:opacity-60"
                     }`}
                   >
                     {label}
+                    {!configured && (
+                      <span className="ml-1 text-[10px] font-normal text-white/40">
+                        (not configured)
+                      </span>
+                    )}
                     {recommended && (
                       <span className="ml-2 rounded-full bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-300">
                         Recommended

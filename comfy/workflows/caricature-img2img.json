@@ -1,7 +1,7 @@
 {
   "1": {
     "inputs": {
-      "ckpt_name": "your_checkpoint.safetensors"
+      "ckpt_name": "RealVisXL_V5.0_fp16.safetensors"
     },
     "class_type": "CheckpointLoaderSimple",
     "_meta": {
@@ -44,11 +44,11 @@
   "6": {
     "inputs": {
       "seed": 0,
-      "steps": 28,
-      "cfg": 7,
+      "steps": 12,
+      "cfg": 5.5,
       "sampler_name": "euler",
       "scheduler": "normal",
-      "denoise": 0.55,
+      "denoise": 0.52,
       "model": ["1", 0],
       "positive": ["2", 0],
       "negative": ["3", 0],

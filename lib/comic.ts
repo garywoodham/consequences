@@ -30,6 +30,7 @@ import {
   generateLookalikeWithComfy,
   generatePanelWithComfy,
   isComfyConfigured,
+  isComfySkipCaricature,
   lookalikeStyleHint,
 } from "./providers/comfy";
 
@@ -1558,32 +1559,40 @@ export async function buildComic(
         }
 
         if (c.imageUrl) {
-          const caricature = await generateCaricatureWithRetry(
-            c.imageUrl as string,
-            style,
-            provider
-          );
-          caricatureCache.set(c.id, caricature);
-
-          if (provider === "local") {
-            if (caricature) {
-              descriptionCache.set(c.id, LOCAL_CAST_DESCRIPTION);
-              descriptionSource.set(c.id, "photo");
-            }
+          if (provider === "local" && isComfySkipCaricature()) {
+            descriptionCache.set(c.id, LOCAL_CAST_DESCRIPTION);
+            descriptionSource.set(c.id, "photo");
+            console.log(
+              `[comic] skip caricature for "${c.name}" — using photo directly (COMFYUI_SKIP_CARICATURE)`
+            );
           } else {
-            const desc = await describeCaricature(
-              caricature ?? (c.imageUrl as string)
+            const caricature = await generateCaricatureWithRetry(
+              c.imageUrl as string,
+              style,
+              provider
             );
-            if (desc) {
-              descriptionCache.set(c.id, desc);
-              descriptionSource.set(c.id, "photo");
-            }
-          }
+            caricatureCache.set(c.id, caricature);
 
-          if (!caricature) {
-            console.warn(
-              `[comic] caricature failed for "${c.name}", using original photo + description`
-            );
+            if (provider === "local") {
+              if (caricature) {
+                descriptionCache.set(c.id, LOCAL_CAST_DESCRIPTION);
+                descriptionSource.set(c.id, "photo");
+              }
+            } else {
+              const desc = await describeCaricature(
+                caricature ?? (c.imageUrl as string)
+              );
+              if (desc) {
+                descriptionCache.set(c.id, desc);
+                descriptionSource.set(c.id, "photo");
+              }
+            }
+
+            if (!caricature) {
+              console.warn(
+                `[comic] caricature failed for "${c.name}", using original photo + description`
+              );
+            }
           }
         } else {
           const desc = await lookupPersonDescription(c.name, {

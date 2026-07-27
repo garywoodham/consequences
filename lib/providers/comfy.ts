@@ -1,6 +1,7 @@
 // Server-only: calls a local ComfyUI instance via its HTTP API.
 import fs from "fs";
 import path from "path";
+import sharp from "sharp";
 import type { CaricatureStyle } from "../types";
 import defaultPanelTxt2Img from "../../comfy/workflows/panel-txt2img.json";
 import defaultPanelImg2Img from "../../comfy/workflows/panel-img2img.json";
@@ -10,6 +11,7 @@ const PROMPT_PLACEHOLDER = "__PROMPT__";
 const IMAGE_PLACEHOLDER = "__IMAGE__";
 const DEFAULT_TIMEOUT_MS = 300_000;
 const POLL_INTERVAL_MS = 1_500;
+const DEFAULT_UPLOAD_MAX_PX = 768;
 
 export type ComfyImageResult = {
   imageUrl: string | null;
@@ -42,6 +44,40 @@ const workflowCache = new Map<string, ComfyWorkflow>();
 
 export function isComfyConfigured(): boolean {
   return Boolean(process.env.COMFYUI_URL?.trim());
+}
+
+/** Skip the separate caricature pass — use the player photo directly for panels. */
+export function isComfySkipCaricature(): boolean {
+  const raw = process.env.COMFYUI_SKIP_CARICATURE?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
+function readEnvNumber(key: string): number | undefined {
+  const raw = process.env[key]?.trim();
+  if (!raw) return undefined;
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function uploadMaxPx(): number {
+  const configured = readEnvNumber("COMFYUI_UPLOAD_MAX_PX");
+  return configured && configured > 0 ? Math.round(configured) : DEFAULT_UPLOAD_MAX_PX;
+}
+
+function workflowTuningFromEnv(): {
+  steps?: number;
+  cfg?: number;
+  denoise?: number;
+  width?: number;
+  height?: number;
+} {
+  return {
+    steps: readEnvNumber("COMFYUI_STEPS"),
+    cfg: readEnvNumber("COMFYUI_CFG"),
+    denoise: readEnvNumber("COMFYUI_DENOISE"),
+    width: readEnvNumber("COMFYUI_WIDTH"),
+    height: readEnvNumber("COMFYUI_HEIGHT"),
+  };
 }
 
 function comfyBaseUrl(): string {
@@ -96,8 +132,19 @@ function caricatureWorkflow(): ComfyWorkflow {
 
 function injectWorkflowValues(
   workflow: ComfyWorkflow,
-  values: { prompt: string; seed?: number; imageFilename?: string }
+  values: {
+    prompt: string;
+    seed?: number;
+    imageFilename?: string;
+    steps?: number;
+    cfg?: number;
+    denoise?: number;
+    width?: number;
+    height?: number;
+  }
 ): ComfyWorkflow {
+  const tuning = workflowTuningFromEnv();
+
   for (const node of Object.values(workflow)) {
     if (!node.inputs) continue;
 
@@ -110,8 +157,21 @@ function injectWorkflowValues(
       }
     }
 
-    if (node.class_type === "KSampler" && values.seed != null) {
-      node.inputs!.seed = values.seed;
+    if (node.class_type === "KSampler") {
+      if (values.seed != null) node.inputs!.seed = values.seed;
+      const steps = values.steps ?? tuning.steps;
+      const cfg = values.cfg ?? tuning.cfg;
+      const denoise = values.denoise ?? tuning.denoise;
+      if (steps != null) node.inputs!.steps = Math.round(steps);
+      if (cfg != null) node.inputs!.cfg = cfg;
+      if (denoise != null) node.inputs!.denoise = denoise;
+    }
+
+    if (node.class_type === "EmptyLatentImage") {
+      const width = values.width ?? tuning.width;
+      const height = values.height ?? tuning.height;
+      if (width != null) node.inputs!.width = Math.round(width);
+      if (height != null) node.inputs!.height = Math.round(height);
     }
   }
 
@@ -119,16 +179,38 @@ function injectWorkflowValues(
 }
 
 async function imageUrlToBuffer(imageUrl: string): Promise<Buffer> {
+  let buf: Buffer;
   if (imageUrl.startsWith("data:")) {
     const comma = imageUrl.indexOf(",");
     const b64 = comma >= 0 ? imageUrl.slice(comma + 1) : imageUrl;
-    return Buffer.from(b64, "base64");
+    buf = Buffer.from(b64, "base64");
+  } else {
+    const res = await fetch(imageUrl);
+    if (!res.ok) {
+      throw new Error(`Failed to fetch image (${res.status})`);
+    }
+    buf = Buffer.from(await res.arrayBuffer());
   }
-  const res = await fetch(imageUrl);
-  if (!res.ok) {
-    throw new Error(`Failed to fetch image (${res.status})`);
+  return downscaleForComfy(buf);
+}
+
+async function downscaleForComfy(buf: Buffer): Promise<Buffer> {
+  const maxPx = uploadMaxPx();
+  const meta = await sharp(buf).metadata();
+  const width = meta.width ?? maxPx;
+  const height = meta.height ?? maxPx;
+  if (width <= maxPx && height <= maxPx) {
+    return sharp(buf).jpeg({ quality: 88 }).toBuffer();
   }
-  return Buffer.from(await res.arrayBuffer());
+  return sharp(buf)
+    .resize({
+      width: maxPx,
+      height: maxPx,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .jpeg({ quality: 88 })
+    .toBuffer();
 }
 
 async function uploadImageToComfy(imageUrl: string): Promise<string> {
@@ -136,8 +218,8 @@ async function uploadImageToComfy(imageUrl: string): Promise<string> {
   const form = new FormData();
   form.append(
     "image",
-    new Blob([new Uint8Array(buf)], { type: "image/png" }),
-    `consequences_${Date.now()}.png`
+    new Blob([new Uint8Array(buf)], { type: "image/jpeg" }),
+    `consequences_${Date.now()}.jpg`
   );
   form.append("type", "input");
   form.append("overwrite", "true");
@@ -274,7 +356,11 @@ function comfyFailure(error: unknown, prompt: string): ComfyImageResult {
 async function runComfyGeneration(
   workflow: ComfyWorkflow,
   prompt: string,
-  options: { seed?: number; referenceImageUrl?: string } = {}
+  options: {
+    seed?: number;
+    referenceImageUrl?: string;
+    denoise?: number;
+  } = {}
 ): Promise<ComfyImageResult> {
   if (!isComfyConfigured()) {
     return {
@@ -294,6 +380,7 @@ async function runComfyGeneration(
       prompt,
       seed: options.seed,
       imageFilename,
+      denoise: options.denoise,
     });
 
     const promptId = await submitPrompt(prepared);
@@ -338,7 +425,8 @@ export async function generateLookalikeWithComfy(
 export async function generatePanelWithComfy(
   prompt: string,
   seed?: number,
-  referenceImageUrl?: string
+  referenceImageUrl?: string,
+  options: { denoise?: number } = {}
 ): Promise<ComfyImageResult> {
   const workflow = referenceImageUrl
     ? panelImg2ImgWorkflow()
@@ -346,6 +434,7 @@ export async function generatePanelWithComfy(
   return runComfyGeneration(workflow, prompt, {
     seed,
     referenceImageUrl,
+    denoise: options.denoise ?? readEnvNumber("COMFYUI_PANEL_DENOISE"),
   });
 }
 

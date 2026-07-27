@@ -47,6 +47,10 @@ cp .env.local.example .env.local
 | `COMFYUI_PANEL_IMG2IMG_WORKFLOW` | Optional | img2img workflow for panels anchored to a caricature. Default: `comfy/workflows/panel-img2img.json`. |
 | `COMFYUI_CARICATURE_WORKFLOW` | Optional | img2img workflow for photo → caricature. Default: `comfy/workflows/caricature-img2img.json`. |
 | `COMFYUI_TIMEOUT_MS` | Optional | Max wait per ComfyUI job in ms (default `300000`). |
+| `COMFYUI_SKIP_CARICATURE` | Optional | `1` = skip photo→caricature pass; panels img2img from player photos (much faster on CPU). |
+| `COMFYUI_PANEL_DENOISE` | Optional | Panel img2img denoise when skipping caricatures (default workflow `0.68`; try `0.78`). |
+| `COMFYUI_UPLOAD_MAX_PX` | Optional | Max edge length for images uploaded to ComfyUI (default `768`). |
+| `COMFYUI_STEPS` / `CFG` / `WIDTH` / `HEIGHT` | Optional | Override sampler steps, CFG, and txt2img resolution at runtime. |
 
 When two or more image engines are configured, an **Image engine** toggle appears on the story reveal screen (OpenAI / FLUX / Local).
 
@@ -131,6 +135,17 @@ When you pick **Local**, the entire comic pipeline bypasses cloud moderation —
 5. **`npm run dev`** — pick **Local** on the story reveal screen. Spicy stories auto-recommend it.
 
 **Deploy note:** Vercel cannot reach `127.0.0.1`. Local is for laptop/dev use unless you expose ComfyUI via VPN or tunnel.
+
+#### Local speed (CPU / no NVIDIA GPU)
+
+On a laptop without CUDA, generation is slow by default. These changes are already wired in:
+
+1. **Start ComfyUI with `--fast`** — run `.\scripts\start-comfyui.ps1` (CPU + experimental speed opts). Only one ComfyUI process should run on `:8188`.
+2. **Faster workflows** — bundled templates use 768×768, ~12–14 steps, lower CFG (override via `COMFYUI_STEPS`, `COMFYUI_WIDTH`, etc. in `.env.local`).
+3. **Skip caricatures** — `COMFYUI_SKIP_CARICATURE=1` uses player photos directly for panel img2img (one fewer SDXL run per player). Set `COMFYUI_PANEL_DENOISE=0.78` so panels still stylise from the photo.
+4. **Smaller uploads** — reference images are downscaled to `COMFYUI_UPLOAD_MAX_PX` (default 768) before ComfyUI sees them.
+
+**NVIDIA GPU:** install CUDA PyTorch in ComfyUI, drop `--cpu`, and omit `COMFYUI_SKIP_CARICATURE` for best quality. **AMD integrated GPUs** are not supported well on Python 3.13 (DirectML unavailable).
 
 ## Tech stack
 
