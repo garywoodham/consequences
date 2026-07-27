@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronLeft,
   ChevronRight,
@@ -22,6 +22,7 @@ import type {
   ImageProvider,
   Story,
 } from "@/lib/types";
+import { recommendImageProvider } from "@/lib/provider-recommend";
 import { PlayerAvatar } from "./PlayerAvatar";
 import { ComicStrip } from "./ComicStrip";
 
@@ -124,6 +125,8 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
   const [providersAvailable, setProvidersAvailable] = useState<ImageProvider[]>([
     "openai",
   ]);
+  // True once the user picks an engine by hand — stops auto-recommendation.
+  const providerTouchedRef = useRef(false);
   const tidyAttemptRef = useRef<string>("");
 
   // Discover which image engines the server has keys for.
@@ -148,6 +151,19 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
   const stories = state.stories;
   const story = stories[index];
   const currentComic = story ? comics[story.id] : undefined;
+
+  // Per-story engine recommendation (spicy content → FLUX). Auto-applied
+  // until the user picks an engine manually.
+  const recommendation = useMemo(
+    () => (story ? recommendImageProvider(story) : null),
+    [story]
+  );
+  useEffect(() => {
+    if (providerTouchedRef.current) return;
+    if (!recommendation) return;
+    if (!providersAvailable.includes(recommendation.provider)) return;
+    setImageProvider(recommendation.provider);
+  }, [recommendation, providersAvailable]);
 
   // Host polishes the stories once and broadcasts the result to everyone.
   useEffect(() => {
@@ -660,25 +676,39 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
             <div className="grid grid-cols-2 gap-2">
               {providersAvailable.map((p) => {
                 const selected = imageProvider === p;
+                const recommended = recommendation?.provider === p;
                 return (
                   <button
                     key={p}
                     type="button"
-                    onClick={() => setImageProvider(p)}
+                    onClick={() => {
+                      providerTouchedRef.current = true;
+                      setImageProvider(p);
+                    }}
                     disabled={comicLoading}
                     aria-pressed={selected}
-                    className={`rounded-lg border px-3 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                    className={`relative rounded-lg border px-3 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60 ${
                       selected
                         ? "border-violet-400 bg-violet-500/20 text-white"
                         : "border-white/10 bg-white/5 text-white/70 hover:border-white/30 hover:text-white"
                     }`}
                   >
                     {p === "openai" ? "OpenAI" : "FLUX"}
+                    {recommended && (
+                      <span className="ml-2 rounded-full bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-300">
+                        Recommended
+                      </span>
+                    )}
                   </button>
                 );
               })}
             </div>
-            <p className="mt-2 text-xs text-white/50">
+            {recommendation && (
+              <p className="mt-2 text-xs text-emerald-300/80">
+                {recommendation.reason}
+              </p>
+            )}
+            <p className="mt-1 text-xs text-white/50">
               {imageProvider === "flux"
                 ? "FLUX.2 (fal.ai) — character reference images + full descriptions for consistency. Scenes its filter refuses automatically retry on more permissive engines (Qwen, FLUX v1.1)."
                 : "OpenAI gpt-image-1 — stricter moderation, but uses the cast sheet for stronger likenesses."}
