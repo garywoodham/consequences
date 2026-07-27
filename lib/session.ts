@@ -9,6 +9,11 @@ export type GameSession = {
   sample?: boolean;
   /** Host preference: polish story wording with AI on reveal. */
   tidyEnabled?: boolean;
+  /**
+   * When true, the answer form highlights preset famous-name fills and sample
+   * games draw from that library by default.
+   */
+  usePresets?: boolean;
 };
 
 const SESSION_KEY = "consequences-session";

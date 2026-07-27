@@ -1,6 +1,10 @@
 "use client";
 
+import { useState } from "react";
+import { Download } from "lucide-react";
 import type { ComicStripData } from "@/lib/types";
+import { downloadComicImages } from "@/lib/download-comic";
+import { Button } from "@/components/ui/button";
 import { PlayerAvatar } from "./PlayerAvatar";
 
 const PANEL_TINTS = [
@@ -17,12 +21,57 @@ type ComicStripProps = {
 };
 
 export function ComicStrip({ comic }: ComicStripProps) {
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const imageCount = comic.panels.filter((p) => p.imageUrl).length;
+
+  const handleDownload = async () => {
+    if (downloading || imageCount === 0) return;
+    setDownloading(true);
+    setDownloadError(null);
+    try {
+      await downloadComicImages(comic.panels);
+    } catch (err) {
+      setDownloadError(
+        err instanceof Error ? err.message : "Could not download images"
+      );
+    } finally {
+      setDownloading(false);
+    }
+  };
+
   return (
     <div className="space-y-4">
       {comic.mode === "photo" && (
         <p className="text-center text-xs text-white/50">
           Photo comic — add an image API key to generate AI caricature art.
         </p>
+      )}
+      {imageCount > 0 && (
+        <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:justify-end">
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={handleDownload}
+            disabled={downloading}
+            aria-label={
+              imageCount === 1
+                ? "Download comic image"
+                : `Download all ${imageCount} comic images as a zip`
+            }
+          >
+            <Download className="h-4 w-4" />
+            {downloading
+              ? "Preparing download…"
+              : imageCount === 1
+                ? "Download image"
+                : `Download all images (${imageCount})`}
+          </Button>
+          {downloadError && (
+            <p className="text-xs text-rose-300 sm:text-right">{downloadError}</p>
+          )}
+        </div>
       )}
       <div className="grid gap-4 sm:grid-cols-2" data-testid="comic-panels">
         {comic.panels.map((panel) => (
@@ -73,6 +122,52 @@ export function ComicStrip({ comic }: ComicStripProps) {
             <figcaption className="border-t-2 border-white/80 bg-white px-3 py-2 text-sm font-medium leading-snug text-zinc-900">
               {panel.caption}
             </figcaption>
+            {panel.continuityNote && (
+              <div className="border-t border-sky-200 bg-sky-50 px-3 py-1.5">
+                <p className="text-[11px] leading-snug text-sky-900">
+                  <span className="font-semibold">Carried look: </span>
+                  {panel.continuityNote}
+                </p>
+              </div>
+            )}
+            {!panel.imageUrl && panel.imageFailureReason && (
+              <div className="border-t border-amber-200 bg-amber-50 px-3 py-2">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-amber-800">
+                  Image failed
+                </p>
+                <p className="mt-1 text-[12px] leading-snug text-amber-900">
+                  {panel.imageFailureReason}
+                </p>
+              </div>
+            )}
+            {panel.imageAttempts && panel.imageAttempts.length > 0 && (
+              <details className="border-t border-zinc-200 bg-zinc-50 px-3 py-2">
+                <summary className="cursor-pointer text-[11px] font-medium text-zinc-500">
+                  Image attempt log ({panel.imageAttempts.length})
+                  {panel.imageUrl ? " — recovered after retries" : " — all failed"}
+                </summary>
+                <ul className="mt-2 space-y-2">
+                  {panel.imageAttempts.map((a, i) => (
+                    <li
+                      key={`${a.attempt}-${i}`}
+                      className="rounded-lg border border-zinc-200 bg-white px-2 py-1.5 text-[11px] leading-snug"
+                    >
+                      <p className="font-medium text-zinc-800">
+                        {a.ok ? "✓" : "✗"} {a.attempt}
+                      </p>
+                      {a.reason && (
+                        <p className="mt-0.5 text-amber-800">{a.reason}</p>
+                      )}
+                      {a.caption && (
+                        <p className="mt-0.5 text-zinc-500">
+                          Caption tried: {a.caption}
+                        </p>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
             {panel.imagePrompt && (
               <details className="border-t border-zinc-200 bg-zinc-50 px-3 py-2">
                 <summary className="cursor-pointer text-[11px] font-medium text-zinc-500">

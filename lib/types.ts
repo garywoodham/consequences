@@ -22,6 +22,30 @@ export type StoryLine = {
   playerAvatarUrl?: string;
 };
 
+/**
+ * Which image API draws the comic panels:
+ * - "openai" — gpt-image-1 (stricter moderation, supports cast-sheet edits)
+ * - "flux"   — FLUX Pro via fal.ai (fewer content restrictions, text-to-image)
+ */
+export const IMAGE_PROVIDERS = ["openai", "flux"] as const;
+export type ImageProvider = (typeof IMAGE_PROVIDERS)[number];
+
+/**
+ * How the player photos are stylised into caricatures for the comic:
+ * - "faithful"    — stay close to the original photo (low exaggeration)
+ * - "balanced"    — moderate, recognisable caricature (default)
+ * - "exaggerated" — heavily amplify distinctive features (high harshness)
+ * - "flattering"  — enhance attractive features, idealised look
+ */
+export type CaricatureStyle = "faithful" | "balanced" | "exaggerated" | "flattering";
+
+export const CARICATURE_STYLES: CaricatureStyle[] = [
+  "faithful",
+  "balanced",
+  "exaggerated",
+  "flattering",
+];
+
 export type ComicCharacter = {
   id: string;
   name: string;
@@ -40,6 +64,16 @@ export type ComicCharacter = {
   descriptionSource?: "photo" | "web";
 };
 
+export type PanelImageAttempt = {
+  /** raw / raw-retry / local0 / level0 / level1 / level2 / local2 */
+  attempt: string;
+  ok: boolean;
+  /** Human-readable reason when the attempt failed. */
+  reason?: string;
+  /** Caption variant tried (already name→label substituted for image use). */
+  caption?: string;
+};
+
 export type StoryPanel = {
   index: number;
   caption: string;
@@ -54,6 +88,19 @@ export type StoryPanel = {
    * exact instruction behind each image can be reviewed.
    */
   imagePrompt?: string;
+  /**
+   * Why this panel has no image (or why generation struggled). Surfaced under
+   * the panel when imageUrl is missing, and as a summary when an image was
+   * only obtained after retries.
+   */
+  imageFailureReason?: string;
+  /** Per-attempt log so you can see exactly why each try failed. */
+  imageAttempts?: PanelImageAttempt[];
+  /**
+   * Visual state carried forward from earlier panels (e.g. still naked /
+   * covering / in underwear) so image progression stays consistent.
+   */
+  continuityNote?: string;
 };
 
 export type ComicStripData = {
@@ -66,6 +113,21 @@ export type ComicStripData = {
    * descriptions can be reviewed against who they belong to in the UI).
    */
   cast?: ComicCharacter[];
+};
+
+/**
+ * Result of one comic-generation chunk. When `complete` is false the client
+ * should call again with `comic` as `previousComic` to resume — cast,
+ * caricatures, baked wardrobe/continuity, and finished panels are reused.
+ * After cast setup, a chunk may generate multiple panel images in parallel.
+ */
+export type ComicBuildResult = {
+  comic: ComicStripData;
+  complete: boolean;
+  /** Panel indexes still missing an image after this chunk. */
+  pendingPanelIndexes: number[];
+  /** How many panel images were newly generated in this chunk. */
+  generatedThisChunk: number;
 };
 
 export type Story = {

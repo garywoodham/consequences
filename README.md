@@ -6,7 +6,7 @@ An online multiplayer version of the classic **Consequences** parlour game. Play
 
 - **Create or join** games with a 6-character room code
 - **Profile photos** — upload a selfie when joining (optional)
-- **4 story templates** — Classic, Short, Adventure, and Gender-neutral
+- **4 story templates** — Classic, Short, Adventure, and Simple
 - **Name picker** — choose a fellow player's name or type your own for name prompts
 - **Real-time multiplayer** via PartyKit WebSockets
 - **Story reveal** — navigate mixed-up stories with read-aloud mode
@@ -41,6 +41,7 @@ cp .env.local.example .env.local
 | `PARTYKIT_HOST` | Runtime override | Read at request time by `/api/config`, so the host can change without rebuilding (handy for preview tunnels). |
 | `BLOB_READ_WRITE_TOKEN` | Optional | Vercel Blob token for avatar uploads. Without it, avatars use base64 fallback. |
 | `OPENAI_API_KEY` | Optional | Enables AI comic strips: caricatures of player photos + illustrated panels. Without it, a photo-based comic is rendered instead. |
+| `FAL_KEY` | Optional | Enables the FLUX.2 image engine (via [fal.ai](https://fal.ai)) as an alternative to OpenAI for panel art — fewer content restrictions, per-character reference images. When set, an "Image engine" toggle appears on the story reveal screen. |
 
 The client resolves the PartyKit host in this order: it first uses
 `NEXT_PUBLIC_PARTYKIT_HOST` (if set at build time), then overrides it with

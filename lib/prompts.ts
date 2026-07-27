@@ -69,8 +69,8 @@ export const PROMPT_TEMPLATES: PromptTemplate[] = [
   },
   {
     id: "neutral",
-    name: "Gender-neutral",
-    description: "Inclusive groups (7 prompts)",
+    name: "Simple",
+    description: "Easy prompts for any group (7 prompts)",
     prompts: [
       { id: "p1", label: "Person 1's name", segment: "{answer}", type: "name", placeholder: "e.g. Alex" },
       { id: "p2", label: "Person 2's name", segment: "and {answer}", type: "name", placeholder: "e.g. Jordan" },

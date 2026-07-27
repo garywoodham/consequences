@@ -225,7 +225,11 @@ export default class GameServer implements Party.Server {
 
     const template = getTemplateById(this.state.templateId);
     const playerIds = this.state.players.map((p) => p.id);
-    this.state.submissions = buildSampleSubmissions(template.prompts, playerIds);
+    this.state.submissions = buildSampleSubmissions(
+      template.prompts,
+      playerIds,
+      this.state.templateId
+    );
     this.state.players.forEach((p) => {
       p.hasSubmitted = true;
     });

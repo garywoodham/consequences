@@ -1,14 +1,79 @@
-// Server-only module: reads OPENAI_API_KEY and calls external image APIs.
-import type { ComicCharacter, ComicStripData, Story, StoryLine, StoryPanel } from "./types";
-import { sanitizeCaptionsForImage, type SanitizeLevel } from "./safe-rewrite";
+// Server-only module: reads OPENAI_API_KEY / FAL_KEY and calls image APIs.
+import type {
+  CaricatureStyle,
+  ComicBuildResult,
+  ComicCharacter,
+  ComicStripData,
+  ImageProvider,
+  PanelImageAttempt,
+  Story,
+  StoryLine,
+  StoryPanel,
+} from "./types";
+import {
+  localSoften,
+  sanitizeCaptionsForImage,
+  type SanitizeLevel,
+} from "./safe-rewrite";
 import { buildCastSheet } from "./cast-sheet";
+import {
+  applyContinuity,
+  descriptionsWithContinuity,
+  emptyContinuity,
+  updateContinuityFromCaption,
+  wardrobeNotes,
+  type ContinuityMap,
+} from "./continuity";
+import { getCelebrityLook } from "./celebrity-looks";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const CARICATURE_STYLE =
-  "bold-outlined cartoon caricature with all distinctive facial features clearly " +
-  "preserved (hair color and style, eye color, skin tone, glasses, facial hair, " +
-  "notable clothing) — exaggerated but instantly recognisable, flat vibrant colors, " +
-  "clean white background, character reference sheet style";
+const FAL_KEY = process.env.FAL_KEY;
+
+const CARICATURE_STYLE_BASE =
+  "bold ink outlines, flat vibrant colors, clean white background, single " +
+  "character, character reference sheet style";
+
+/** Build the caricature instruction for the chosen harshness/flattery style. */
+function caricaturePrompt(style: CaricatureStyle): string {
+  switch (style) {
+    case "faithful":
+      return (
+        "Turn this person into a clean cartoon version of themselves that stays " +
+        "TRUE TO LIFE. Keep facial proportions, features and skin tone close to " +
+        "the photo — only lightly stylise into a cartoon, do NOT exaggerate. " +
+        "Preserve every distinctive feature (hair colour/style, eye colour, skin " +
+        "tone, glasses, facial hair, notable clothing). " +
+        `${CARICATURE_STYLE_BASE}.`
+      );
+    case "exaggerated":
+      return (
+        "Turn this person into a BOLD, heavily EXAGGERATED caricature. Greatly " +
+        "amplify their most distinctive features (nose, jaw, ears, hair, " +
+        "expression) in classic over-the-top caricature style, while keeping " +
+        "them clearly recognisable. Preserve hair colour/style, skin tone, " +
+        "glasses, facial hair and notable clothing. " +
+        `${CARICATURE_STYLE_BASE}.`
+      );
+    case "flattering":
+      return (
+        "Turn this person into a FLATTERING, idealised cartoon caricature. " +
+        "Enhance their most attractive features and make them look their best — " +
+        "glamorous, clear skin, bright eyes, great hair, confident smile — while " +
+        "keeping them recognisable. Preserve hair colour/style, skin tone, " +
+        "glasses, facial hair and notable clothing. " +
+        `${CARICATURE_STYLE_BASE}.`
+      );
+    case "balanced":
+    default:
+      return (
+        "Transform this person into a cartoon caricature with all distinctive " +
+        "facial features clearly preserved (hair colour and style, eye colour, " +
+        "skin tone, glasses, facial hair, notable clothing) — moderately " +
+        "exaggerated but instantly recognisable. " +
+        `${CARICATURE_STYLE_BASE}.`
+      );
+  }
+}
 const PANEL_STYLE =
   "fun comic book panel, bold ink outlines, halftone shading, vibrant flat colors, " +
   "expressive cartoon characters, dynamic composition";
@@ -20,9 +85,35 @@ const NO_TEXT =
   "captions, no titles, no chapter headings, no speech bubbles, no thought " +
   "bubbles, no signs, no book covers, no shop names, no logos, no watermarks, " +
   "no scribbles that resemble writing. All storytelling must be visual only.";
+// Single compact no-text rule for the FLUX prompts, stated once so the prompt
+// budget goes to character and scene detail instead.
+const NO_TEXT_BRIEF =
+  "Wordless image: no text, speech bubbles or signs anywhere — visual " +
+  "storytelling only";
 
 export function hasAiProvider(): boolean {
-  return Boolean(OPENAI_API_KEY);
+  return Boolean(OPENAI_API_KEY || FAL_KEY);
+}
+
+/** Which image engines are configured (drives the UI provider toggle). */
+export function availableImageProviders(): ImageProvider[] {
+  const providers: ImageProvider[] = [];
+  if (OPENAI_API_KEY) providers.push("openai");
+  if (FAL_KEY) providers.push("flux");
+  return providers;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Whole-word, Unicode-aware regex matching `needle` (already escaped inside).
+ * Shared by every name-lookup/rewrite/scrub helper below so they all use the
+ * exact same boundary semantics.
+ */
+function wordBoundaryRegex(needle: string, flags: string): RegExp {
+  return new RegExp(`(?<!\\p{L})${escapeRegExp(needle)}(?!\\p{L})`, flags);
 }
 
 /** Split a finished story into 3-6 comic panels deterministically. */
@@ -47,13 +138,19 @@ export function scriptPanels(story: Story): Omit<StoryPanel, "imageUrl">[] {
       .replace(/\s+/g, " ")
       .trim();
 
-    // ALWAYS include every named story character in every panel, so each
-    // character's description is passed to the image model for all panels
-    // (keeps the whole cast consistent, never dropping anyone). Only legacy
-    // stories with no resolved cast fall back to the panel's line authors.
+    // Default every panel to the story's two leads (person1/person2). Those
+    // are the same people throughout unless a free-text answer explicitly
+    // names someone else (via the person-insert dropdown). Extra named people
+    // are ADDED; leads are never dropped just because a line only mentions one
+    // of them — that was swapping/dropping faces across panels.
+    // Legacy stories with no resolved cast fall back to the panel's line authors.
     let characters: ComicCharacter[];
     if (storyCast.length > 0) {
-      characters = storyCast;
+      const leads = storyCast.slice(0, 2);
+      const extras = storyCast
+        .slice(2)
+        .filter((c) => mentionsName(caption, c.name));
+      characters = [...leads, ...extras];
     } else {
       characters = [];
       for (const line of group) {
@@ -80,16 +177,16 @@ export function scriptPanels(story: Story): Omit<StoryPanel, "imageUrl">[] {
 function mentionsName(text: string, name: string): boolean {
   const needle = name.trim();
   if (!needle) return false;
-  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "iu").test(text);
+  return wordBoundaryRegex(needle, "iu").test(text);
 }
 
 function buildSceneDescription(caption: string, characters: ComicCharacter[]): string {
+  // Use neutral labels here too — this field is review/debug only and must
+  // not reintroduce real names into anything that might reach an image model.
+  const labels = characters.map((_, i) => `Character ${i + 1}`);
   return (
     `Illustrate this story moment: ${caption}` +
-    (characters.length
-      ? ` Featuring ${characters.map((c) => c.name).join(" and ")}.`
-      : "") +
+    (labels.length ? ` Featuring ${labels.join(" and ")}.` : "") +
     ` Style: ${PANEL_STYLE}.`
   );
 }
@@ -108,8 +205,22 @@ async function fetchAsBlob(url: string): Promise<Blob | null> {
   }
 }
 
+/**
+ * Caricature generation once, retried once on failure — image generation is
+ * non-deterministic and an occasional flaky refusal shouldn't drop a character.
+ */
+async function generateCaricatureWithRetry(
+  imageUrl: string,
+  style: CaricatureStyle
+): Promise<string | null> {
+  return (await generateCaricature(imageUrl, style)) ?? (await generateCaricature(imageUrl, style));
+}
+
 /** Turn an uploaded photo into a cartoon caricature (OpenAI image edit). */
-export async function generateCaricature(imageUrl: string): Promise<string | null> {
+export async function generateCaricature(
+  imageUrl: string,
+  style: CaricatureStyle = "balanced"
+): Promise<string | null> {
   if (!OPENAI_API_KEY) return null;
 
   const blob = await fetchAsBlob(imageUrl);
@@ -119,10 +230,7 @@ export async function generateCaricature(imageUrl: string): Promise<string | nul
     const form = new FormData();
     form.append("model", "gpt-image-1");
     form.append("image", blob, "photo.png");
-    form.append(
-      "prompt",
-      `Transform this person into a ${CARICATURE_STYLE}. Keep them recognizable.`
-    );
+    form.append("prompt", caricaturePrompt(style));
     form.append("size", "1024x1024");
     form.append("quality", "medium");
     form.append("moderation", "low");
@@ -171,8 +279,13 @@ const DESCRIBE_SYSTEM_PROMPT =
   "to any real or famous person. No preamble, no bullet characters — just the " +
   "description sentence(s).";
 
-async function describeCaricature(dataUrl: string): Promise<string> {
-  if (!OPENAI_API_KEY || !dataUrl.startsWith("data:image")) return "";
+async function describeCaricature(imageUrl: string): Promise<string> {
+  // Accept both the caricature data URL and a plain http(s) photo URL — the
+  // vision endpoint handles either, and describing the original photo is a
+  // valuable fallback when caricature generation flakes out.
+  const usable =
+    imageUrl.startsWith("data:image") || /^https?:\/\//i.test(imageUrl);
+  if (!OPENAI_API_KEY || !usable) return "";
   try {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -188,7 +301,7 @@ async function describeCaricature(dataUrl: string): Promise<string> {
             role: "user",
             content: [
               { type: "text", text: "Create the model-sheet description for this character:" },
-              { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
+              { type: "image_url", image_url: { url: imageUrl, detail: "high" } },
             ],
           },
         ],
@@ -257,27 +370,41 @@ function cleanupPersonDescription(text: string, name: string): string {
   for (const token of name.split(/\s+/)) {
     const t = token.trim();
     if (t.length < 2) continue;
-    const escaped = t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    out = out.replace(new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "giu"), "");
+    out = out.replace(wordBoundaryRegex(t, "giu"), "");
   }
   return out.replace(/\s{2,}/g, " ").replace(/\s+([,.])/g, "$1").trim();
 }
 
 /**
- * When a player types a NAME that has no uploaded photo, try to find a physical
- * description online (via the OpenAI Responses web-search tool) so the image
- * model can draw a matching likeness. Returns "" for ordinary names that don't
- * resolve to a recognisable public figure. The name itself is never sent to
- * the image model — only the resulting appearance description.
+ * When a player types a NAME that has no uploaded photo, resolve a physical
+ * description so the image model can draw a matching likeness.
+ *
+ * OpenAI path: live web-search only (unchanged from the proven behaviour).
+ * FLUX path: curated celebrity look bank first, then web-search fallback.
+ *
+ * The name itself is never sent to the image model — only the appearance
+ * description (and, on FLUX, a generated lookalike reference image).
  */
-async function lookupPersonDescription(name: string): Promise<string> {
+async function lookupPersonDescription(
+  name: string,
+  options: { useCuratedLooks?: boolean } = {}
+): Promise<string> {
   if (!OPENAI_API_KEY) return "";
   const trimmed = name.trim();
   if (!trimmed) return "";
 
-  const cacheKey = trimmed.toLowerCase();
+  const cacheKey = `${options.useCuratedLooks ? "c:" : "w:"}${trimmed.toLowerCase()}`;
   const cached = personLookupCache.get(cacheKey);
   if (cached !== undefined) return cached;
+
+  // Curated bank is FLUX-only — must not change OpenAI's text path.
+  if (options.useCuratedLooks) {
+    const curated = getCelebrityLook(trimmed);
+    if (curated) {
+      personLookupCache.set(cacheKey, curated);
+      return curated;
+    }
+  }
 
   let result = "";
   try {
@@ -325,15 +452,81 @@ async function lookupPersonDescription(name: string): Promise<string> {
   return result;
 }
 
+/**
+ * Generate a cartoon lookalike reference image from a text description when
+ * there is no uploaded photo (celebrity / public-figure names). Gives both
+ * OpenAI cast-sheet and FLUX @imageN paths a visual identity to lock onto.
+ */
+async function generateLookalikeFromDescription(
+  description: string,
+  style: CaricatureStyle = "balanced"
+): Promise<string | null> {
+  if (!OPENAI_API_KEY || !description.trim()) return null;
+
+  const styleHint =
+    style === "exaggerated"
+      ? "bold heavily exaggerated caricature, amplify distinctive features"
+      : style === "flattering"
+        ? "flattering idealised cartoon caricature, glamorous and clear-skinned"
+        : style === "faithful"
+          ? "clean lightly stylised cartoon portrait, true-to-life proportions"
+          : "moderately exaggerated cartoon caricature, instantly recognisable";
+
+  const prompt =
+    `Create a single cartoon CHARACTER PORTRAIT (head-and-shoulders, facing ` +
+    `camera, plain light background) that is an INSTANTLY RECOGNISABLE ` +
+    `caricature lookalike of this exact appearance:\n` +
+    `${description}\n\n` +
+    `CRITICAL: amplify the most distinctive features so the face is unique ` +
+    `and memorable (not a generic pretty face). ${styleHint}. ` +
+    `${PANEL_STYLE}. This portrait will be reused as a cast reference across ` +
+    `a whole comic strip — consistency matters. ${NO_TEXT_BRIEF}.`;
+
+  try {
+    const res = await fetch("https://api.openai.com/v1/images/generations", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-image-1",
+        prompt,
+        size: "1024x1024",
+        quality: "medium",
+        moderation: "low",
+        n: 1,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.warn(
+        `[comic] lookalike caricature failed status=${res.status} ` +
+          body.slice(0, 160)
+      );
+      return null;
+    }
+    const data = (await res.json()) as { data?: { b64_json?: string }[] };
+    const b64 = data?.data?.[0]?.b64_json;
+    return b64 ? `data:image/png;base64,${b64}` : null;
+  } catch (err) {
+    console.warn(
+      `[comic] lookalike caricature network error: ` +
+        (err instanceof Error ? err.message : "unknown")
+    );
+    return null;
+  }
+}
+
 /** Whole-word, Unicode-aware replacement of a character's name with a label. */
 function replaceNameWithLabel(text: string, name: string, label: string): string {
   const needle = name.trim();
   if (!needle) return text;
-  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return text.replace(new RegExp(`(?<!\\p{L})${escaped}(?!\\p{L})`, "giu"), label);
+  return text.replace(wordBoundaryRegex(needle, "giu"), label);
 }
 
 type PanelCharacter = {
+  id: string;
   name: string;
   label: string;
   description: string;
@@ -352,6 +545,7 @@ function buildPanelCast(
   caricatures: Map<string, string | null>
 ): { cast: PanelCharacter[]; sceneCaptionRewriter: (caption: string) => string } {
   const cast: PanelCharacter[] = characters.map((c, i) => ({
+    id: c.id,
     name: c.name,
     label: `Character ${i + 1}`,
     description: descriptions.get(c.id) ?? "",
@@ -369,11 +563,20 @@ function buildPanelCast(
   return { cast, sceneCaptionRewriter };
 }
 
-const FICTIONAL_NOTE =
+/** OpenAI panel prompts — keep the proven wording; do not share FLUX edits. */
+const OPENAI_FICTIONAL_NOTE =
   "IMPORTANT: the people below are ORIGINAL FICTIONAL cartoon characters, each " +
   "defined ONLY by the feature description given. They are NOT real, famous or " +
   "identifiable individuals — draw an original cartoon character that matches " +
   "the described features. Keep each character's look identical in every panel.";
+
+/** FLUX panel prompts — allow recognisable lookalikes from curated descriptions. */
+const FLUX_FICTIONAL_NOTE =
+  "IMPORTANT: draw ORIGINAL cartoon characters defined by the feature " +
+  "descriptions (and reference images when provided). Match those features " +
+  "closely so each person is a recognisable LOOKALIKE of the described " +
+  "appearance — do not invent a random unrelated face. Keep each character's " +
+  "look identical in every panel.";
 
 /**
  * Guarantee the scene text references every character, so that even after the
@@ -399,7 +602,12 @@ function buildCharacterGuide(cast: PanelCharacter[], withCastSheet: boolean): st
       const features = pc.description
         ? pc.description
         : "an original cartoon character — invent a distinct, consistent look";
-      return `  • ${pc.label}${tile}: ${features}.`;
+      // Wardrobe baked into the description is the source of truth for props
+      // like hats — call it out so the model doesn't drop it between panels.
+      const wardrobeNote = /STORY WARDROBE/i.test(features)
+        ? " Honour the STORY WARDROBE in this description in this panel."
+        : "";
+      return `  • ${pc.label}${tile}: ${features}.${wardrobeNote}`;
     })
     .join("\n");
 }
@@ -408,7 +616,92 @@ function buildCharacterGuide(cast: PanelCharacter[], withCastSheet: boolean): st
  * Text-to-image fallback (no reference photos). Characters are still described
  * by features + neutral labels so we get consistent lookalikes, not real people.
  */
-type PanelResult = { imageUrl: string | null; prompt: string };
+type PanelResult = {
+  imageUrl: string | null;
+  prompt: string;
+  /** True when the image API refused for safety/moderation. */
+  blocked?: boolean;
+  /** True when OpenAI returned a rate-limit (429) — caller should wait & retry. */
+  rateLimited?: boolean;
+  /** Human-readable explanation of why generation failed (when imageUrl is null). */
+  reason?: string;
+};
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function looksLikeModerationBlock(status: number, body: string): boolean {
+  if (status === 400 || status === 403 || status === 451) {
+    const lower = body.toLowerCase();
+    return (
+      lower.includes("moderation") ||
+      lower.includes("safety") ||
+      lower.includes("refus") ||
+      lower.includes("not allowed") ||
+      lower.includes("content policy") ||
+      lower.includes("violat") ||
+      lower.includes("blocked") ||
+      lower.includes("sensitive")
+    );
+  }
+  return false;
+}
+
+/** Turn an OpenAI image API error into a short, user-facing reason. */
+function explainImageApiFailure(status: number, body: string): string {
+  const lower = body.toLowerCase();
+  let apiMessage = "";
+  try {
+    const parsed = JSON.parse(body) as {
+      error?: { message?: string; code?: string; type?: string };
+    };
+    apiMessage = parsed?.error?.message?.trim() || "";
+  } catch {
+    apiMessage = body.replace(/\s+/g, " ").trim().slice(0, 180);
+  }
+
+  if (looksLikeModerationBlock(status, body)) {
+    return apiMessage
+      ? `Blocked by image moderation: ${apiMessage}`
+      : "Blocked by image moderation (content filter refused the prompt).";
+  }
+  if (status === 401 || status === 403) {
+    return apiMessage || "OpenAI API key rejected (unauthorized).";
+  }
+  if (status === 429 || lower.includes("rate_limit") || lower.includes("quota")) {
+    return apiMessage || "OpenAI rate limit / quota exceeded — try again shortly.";
+  }
+  if (status === 402 || lower.includes("billing") || lower.includes("insufficient")) {
+    return apiMessage || "OpenAI billing/credits issue — check your account balance.";
+  }
+  if (status >= 500) {
+    return apiMessage || `OpenAI server error (HTTP ${status}).`;
+  }
+  if (status > 0) {
+    return apiMessage || `Image API error (HTTP ${status}).`;
+  }
+  return apiMessage || "Image API request failed.";
+}
+
+/**
+ * Final safety net: replace any leftover real character names in a prompt
+ * with their Character N labels so the image model never sees real identities.
+ */
+function scrubRealNamesFromPrompt(
+  prompt: string,
+  people: { name: string; label: string }[]
+): string {
+  let out = prompt;
+  // Longer names first so "Mary Anne" wins over "Mary".
+  const sorted = [...people].sort((a, b) => b.name.length - a.name.length);
+  for (const { name, label } of sorted) {
+    const needle = name.trim();
+    if (!needle) continue;
+    out = out.replace(wordBoundaryRegex(needle, "giu"), label);
+  }
+  return out;
+}
 
 async function generatePanelFromTextCast(
   sceneWithLabels: string,
@@ -417,14 +710,16 @@ async function generatePanelFromTextCast(
   const guide = cast.length ? buildCharacterGuide(cast, false) : "";
   const labelList = cast.map((c) => c.label).join(", ");
   const guideBlock = guide
-    ? `${FICTIONAL_NOTE}\n\nCHARACTER GUIDE:\n${guide}\n\n` +
+    ? `${OPENAI_FICTIONAL_NOTE}\n\nCHARACTER GUIDE:\n${guide}\n\n` +
       `All of these characters (${labelList}) must appear in the panel doing ` +
       `exactly what the scene says; do not swap or omit anyone.\n\n`
     : "";
   const scene = ensureAllPresent(sceneWithLabels, cast);
-  const prompt =
+  const prompt = scrubRealNamesFromPrompt(
     `${NO_TEXT}\n\n${guideBlock}SCENE: ${scene}\n\n` +
-    `STYLE: ${PANEL_STYLE}.\n\n${NO_TEXT}`;
+      `STYLE: ${PANEL_STYLE}.\n\n${NO_TEXT}`,
+    cast
+  );
 
   try {
     const res = await fetch("https://api.openai.com/v1/images/generations", {
@@ -437,18 +732,418 @@ async function generatePanelFromTextCast(
         model: "gpt-image-1",
         prompt,
         size: "1024x1024",
-        quality: "low",
+        quality: "medium",
         moderation: "low",
         n: 1,
       }),
     });
-    if (!res.ok) return { imageUrl: null, prompt };
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      const blocked = looksLikeModerationBlock(res.status, body);
+      const rateLimited = res.status === 429;
+      const reason = explainImageApiFailure(res.status, body);
+      console.warn(
+        `[comic] text-to-image failed status=${res.status} blocked=${blocked} ` +
+          `rateLimited=${rateLimited} reason=${reason}`
+      );
+      return { imageUrl: null, prompt, blocked, rateLimited, reason };
+    }
     const data = await res.json();
     const b64 = data?.data?.[0]?.b64_json;
-    return { imageUrl: b64 ? `data:image/png;base64,${b64}` : null, prompt };
-  } catch {
-    return { imageUrl: null, prompt };
+    if (!b64) {
+      return {
+        imageUrl: null,
+        prompt,
+        reason: "Image API returned success but no image data.",
+      };
+    }
+    return { imageUrl: `data:image/png;base64,${b64}`, prompt };
+  } catch (err) {
+    return {
+      imageUrl: null,
+      prompt,
+      reason: `Network error calling image API: ${
+        err instanceof Error ? err.message : "unknown"
+      }`,
+    };
   }
+}
+
+/** Stable positive seed from a story id so every panel shares it (djb2). */
+function stableSeedFromId(id: string): number {
+  let h = 5381;
+  for (let i = 0; i < id.length; i++) {
+    h = ((h << 5) + h + id.charCodeAt(i)) >>> 0;
+  }
+  return h % 2147483647;
+}
+
+/**
+ * Per-panel seed: same story base (so character look stays in one family) but
+ * unique per panel index. A single shared seed + character-first prompts made
+ * later panels render as near-duplicates — FLUX reuses the same noise when the
+ * leading prompt tokens match.
+ */
+function panelSeed(storySeed: number, panelIndex: number): number {
+  return (storySeed + (panelIndex + 1) * 100_003) % 2147483647;
+}
+
+/** Quick check: fal's FLUX.2 prompt checker refuses these — skip that rung. */
+function sceneLikelyBlockedByFlux2(scene: string): boolean {
+  return (
+    /\b(?:naked|nude|nudity|topless|bottomless|undress(?:ed|ing)?|strip(?:ped|ping)?|skinny[- ]?dip|lingerie|sex(?:y|ual)?|shag|bonk|horny|fuck|willy|boobs?|breasts?|nipples?|arse|ass\b|genitals?)\b/i.test(
+      scene
+    )
+  );
+}
+
+/** POST to a fal.ai endpoint, inline the resulting image as a data URL. */
+async function callFluxEndpoint(
+  endpoint: string,
+  payload: Record<string, unknown>,
+  prompt: string
+): Promise<PanelResult> {
+  try {
+    const res = await fetch(`https://fal.run/${endpoint}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Key ${FAL_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      const lower = body.toLowerCase();
+      // fal's un-disableable prompt checker (FLUX.2/BFL endpoints) reports
+      // `content_policy_violation` on HTTP 422 — that specific refusal is
+      // what triggers the permissive fallback ladder.
+      const blocked =
+        looksLikeModerationBlock(res.status, body) ||
+        lower.includes("nsfw") ||
+        lower.includes("content_policy_violation") ||
+        (res.status === 422 && lower.includes("content"));
+      const rateLimited = res.status === 429;
+      const reason = blocked
+        ? "Blocked by FLUX content filter."
+        : `FLUX API error (HTTP ${res.status}): ${body.slice(0, 160)}`;
+      console.warn(
+        `[comic] flux ${endpoint} failed status=${res.status} blocked=${blocked} reason=${reason}`
+      );
+      return { imageUrl: null, prompt, blocked, rateLimited, reason };
+    }
+
+    const data = (await res.json()) as {
+      images?: { url?: string; content_type?: string }[];
+      has_nsfw_concepts?: boolean[];
+    };
+    const url = data?.images?.[0]?.url;
+    if (!url) {
+      return {
+        imageUrl: null,
+        prompt,
+        reason: "FLUX returned success but no image URL.",
+      };
+    }
+
+    // Inline as a data URL so downloads/resume behave exactly like OpenAI
+    // panels (fal-hosted URLs also expire).
+    const imgRes = await fetch(url);
+    if (!imgRes.ok) {
+      return { imageUrl: url, prompt };
+    }
+    const buf = Buffer.from(await imgRes.arrayBuffer());
+    const mime = imgRes.headers.get("content-type") ?? "image/png";
+    return { imageUrl: `data:${mime};base64,${buf.toString("base64")}`, prompt };
+  } catch (err) {
+    return {
+      imageUrl: null,
+      prompt,
+      reason: `Network error calling FLUX API: ${
+        err instanceof Error ? err.message : "unknown"
+      }`,
+    };
+  }
+}
+
+/**
+ * Strip the "(CRITICAL VISUAL CONTINUITY FROM EARLIER PANELS …)" parenthetical
+ * that `applyContinuity` appends to captions. On the FLUX path that bloat
+ * belongs in the character guide (STORY WARDROBE), not in the scene sentence —
+ * leaving it in the scene pushes identity detail toward the end of the prompt
+ * where later panels drift. OpenAI still receives the bloated caption.
+ */
+function stripContinuityParenthetical(scene: string): string {
+  return scene
+    .replace(
+      /\s*\(CRITICAL VISUAL CONTINUITY FROM EARLIER PANELS[^)]*\)\.?/gi,
+      ""
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Full-detail prompt body shared by the FLUX.2 / Qwen paths.
+ *
+ * Order matters for later panels (spicier → often fall to shorter-window
+ * engines): story beat must stay early and intact, characters stay anchored
+ * by reference images + a short roster up front, full descriptions follow,
+ * no-text is last and brief.
+ *
+ *   1. Brief cast roster (@imageN / image N)
+ *   2. SCENE (clean story action — never buried)
+ *   3. Full character guide + wardrobe
+ *   4. Composition / style / no-text
+ */
+function buildFlux2PromptBody(
+  sceneWithLabels: string,
+  cast: PanelCharacter[],
+  refIndex?: Map<string, number>,
+  anchorFor: (n: number) => string = (n) => `@image${n}`
+): string {
+  const scene = stripContinuityParenthetical(sceneWithLabels);
+  const labelList = cast.map((c) => c.label).join(", ");
+
+  const roster = cast
+    .map((pc) => {
+      const refN = refIndex?.get(pc.id);
+      return refN
+        ? `  • ${pc.label} = the person in ${anchorFor(refN)}`
+        : `  • ${pc.label}`;
+    })
+    .join("\n");
+
+  const castLines = cast
+    .map((pc) => {
+      const refN = refIndex?.get(pc.id);
+      const anchor = refN
+        ? ` — IDENTICAL face/hair/build/skin to ${anchorFor(refN)}`
+        : "";
+      const features = pc.description
+        ? pc.description
+        : "an original cartoon character — invent a distinct look and keep it consistent";
+      const wardrobeNote = /STORY WARDROBE/i.test(features)
+        ? " Honour the STORY WARDROBE clause — it overrides the clothing " +
+          "shown in the reference image for this panel."
+        : "";
+      return `  • ${pc.label}${anchor}: ${features}.${wardrobeNote}`;
+    })
+    .join("\n");
+
+  return (
+    `${FLUX_FICTIONAL_NOTE}\n\n` +
+    `CAST:\n${roster}\n\n` +
+    `SCENE TO ILLUSTRATE (do exactly this — do not invent a different story):\n` +
+    `${scene}\n\n` +
+    `Render a full moment mid-action with a rich environment (location, ` +
+    `furniture, props, lighting, time of day) and expressive faces/body ` +
+    `language. Every listed character must appear (${labelList}) doing ` +
+    `exactly what the scene says — do not drop, merge or duplicate anyone.\n\n` +
+    `CHARACTER DETAILS (match precisely; keep looks identical across the strip):\n` +
+    `${castLines}\n\n` +
+    `This is ONE brand-new illustration with a full background — NOT a copy, ` +
+    `collage or side-by-side line-up of the reference images. ` +
+    `STYLE: ${PANEL_STYLE}. ${NO_TEXT_BRIEF}.`
+  );
+}
+
+/**
+ * FLUX.2 [pro] edit (via fal.ai): each character's caricature is passed as
+ * its own reference image and anchored in the prompt as @imageN, with the
+ * full uncompressed descriptions + scene. Higher safety tolerance than the
+ * old Kontext path even with reference images attached.
+ */
+async function generatePanelWithFlux2Edit(
+  sceneWithLabels: string,
+  cast: PanelCharacter[],
+  refCast: PanelCharacter[],
+  seed: number
+): Promise<PanelResult> {
+  // FLUX.2 edit accepts up to 9 reference images.
+  const refs = refCast.slice(0, 9);
+  const refIndex = new Map<string, number>();
+  refs.forEach((pc, i) => refIndex.set(pc.id, i + 1));
+
+  const prompt = scrubRealNamesFromPrompt(
+    `Create ONE brand-new comic panel.\n\n` +
+      buildFlux2PromptBody(sceneWithLabels, cast, refIndex),
+    cast
+  );
+
+  return callFluxEndpoint(
+    "fal-ai/flux-2-pro/edit",
+    {
+      prompt,
+      image_urls: refs.map((pc) => pc.image as string),
+      image_size: "square_hd",
+      output_format: "png",
+      // Most permissive settings this endpoint exposes.
+      safety_tolerance: "5",
+      enable_safety_checker: false,
+      seed,
+    },
+    prompt
+  );
+}
+
+/**
+ * Qwen Image Edit Plus (open weights, via fal.ai) — fallback rung when the
+ * FLUX.2 prompt checker refuses a scene. Keeps character consistency via
+ * multiple reference images ("image 1", "image 2", …) and long prompts
+ * (Qwen2.5-VL encoder, ~1K tokens), and its safety checker can be fully
+ * disabled — fal runs no un-disableable prompt checker on open models.
+ */
+async function generatePanelWithQwenEdit(
+  sceneWithLabels: string,
+  cast: PanelCharacter[],
+  refCast: PanelCharacter[],
+  seed: number
+): Promise<PanelResult> {
+  const refs = refCast.slice(0, 4);
+  const refIndex = new Map<string, number>();
+  refs.forEach((pc, i) => refIndex.set(pc.id, i + 1));
+
+  // The no-text rule lives once in the shared body (and in the negative
+  // prompt below); the prompt budget goes to character and scene detail.
+  const prompt = scrubRealNamesFromPrompt(
+    `Create ONE brand-new comic panel.\n\n` +
+      buildFlux2PromptBody(
+        sceneWithLabels,
+        cast,
+        refIndex,
+        (n) => `image ${n}`
+      ),
+    cast
+  );
+
+  return callFluxEndpoint(
+    "fal-ai/qwen-image-edit-plus",
+    {
+      prompt,
+      image_urls: refs.map((pc) => pc.image as string),
+      image_size: "square_hd",
+      num_images: 1,
+      output_format: "png",
+      enable_safety_checker: false,
+      negative_prompt:
+        "text, words, letters, typography, writing, captions, subtitles, " +
+        "speech bubbles, dialogue balloons, signs, logos, watermark, " +
+        "side-by-side collage, photo grid",
+      seed,
+    },
+    prompt
+  );
+}
+
+/**
+ * Compress a model-sheet description for FLUX v1.1's short prompt window.
+ * Face/identity keeps a reserved budget; wardrobe is capped second so growing
+ * continuity on later panels cannot push the SCENE out of the encoder window.
+ */
+function compactDescriptionForFlux(desc: string, maxChars = 360): string {
+  const cleaned = desc.replace(/\s+/g, " ").trim();
+  if (cleaned.length <= maxChars) return cleaned;
+
+  const wardrobeMatch = cleaned.match(/STORY WARDROBE\b[\s\S]*$/i);
+  const wardrobeFull = wardrobeMatch ? wardrobeMatch[0].trim() : "";
+  const base = wardrobeMatch
+    ? cleaned.slice(0, wardrobeMatch.index).trim()
+    : cleaned;
+
+  // Face first; wardrobe capped so two characters + scene still fit in ~512 tokens.
+  const IDENTITY_MIN = 220;
+  const WARDROBE_MAX = 120;
+  const identityBudget = Math.min(
+    base.length,
+    Math.max(
+      IDENTITY_MIN,
+      maxChars - Math.min(wardrobeFull.length + 1, WARDROBE_MAX)
+    )
+  );
+  let head = base.slice(0, identityBudget);
+  const lastSpace = head.lastIndexOf(" ");
+  if (lastSpace > 40) head = head.slice(0, lastSpace);
+  head = head.replace(/[,;.\s]+$/, "");
+
+  const wardrobeBudget = Math.min(
+    WARDROBE_MAX,
+    Math.max(0, maxChars - head.length - 2)
+  );
+  let wardrobe = "";
+  if (wardrobeFull && wardrobeBudget > 40) {
+    wardrobe =
+      wardrobeFull.length <= wardrobeBudget
+        ? ` ${wardrobeFull}`
+        : ` ${wardrobeFull.slice(0, wardrobeBudget).replace(/[,;.\s]+$/, "")}`;
+  }
+  return `${head}.${wardrobe}`;
+}
+
+/**
+ * Compact prompt for FLUX v1.1 — SCENE FIRST so later-panel wardrobe growth
+ * cannot truncate the story beat off the end of the short encoder window.
+ * Characters follow with a protected face budget.
+ */
+function buildFluxCompactPromptBody(
+  sceneWithLabels: string,
+  cast: PanelCharacter[]
+): string {
+  const scene = stripContinuityParenthetical(sceneWithLabels);
+  const labelList = cast.map((c) => c.label).join(" and ");
+  const headcount =
+    cast.length > 1
+      ? `ALL ${cast.length} people must appear fully visible: ${labelList}. ` +
+        `Do not leave anyone out or merge them. `
+      : "";
+  const castLines = cast
+    .map((pc) => {
+      const features = pc.description
+        ? compactDescriptionForFlux(pc.description)
+        : "an original cartoon character with a distinct, consistent look";
+      return `${pc.label}: ${features}`;
+    })
+    .join("\n");
+  return (
+    `${headcount}SCENE: ${scene}\n\n` +
+    (castLines
+      ? `WHO THEY ARE (identical faces/hair/builds across every panel):\n${castLines}`
+      : "")
+  );
+}
+
+/**
+ * FLUX Pro v1.1 text-to-image at fal's most permissive settings (tolerance 6,
+ * checker off) — the last, least-restricted rung of the ladder. No reference
+ * images and a short prompt window (hence the compact prompt), but it
+ * generates content every other engine refuses; the shared seed keeps
+ * characters roughly consistent across panels.
+ */
+async function generatePanelFromFlux(
+  sceneWithLabels: string,
+  cast: PanelCharacter[],
+  seed?: number
+): Promise<PanelResult> {
+  const prompt = scrubRealNamesFromPrompt(
+    `${NO_TEXT_BRIEF}. ${PANEL_STYLE}, detailed background setting.\n\n` +
+      buildFluxCompactPromptBody(sceneWithLabels, cast),
+    cast
+  );
+
+  return callFluxEndpoint(
+    "fal-ai/flux-pro/v1.1",
+    {
+      prompt,
+      image_size: "square_hd",
+      num_images: 1,
+      output_format: "png",
+      // Most permissive settings fal exposes for this model.
+      safety_tolerance: "6",
+      enable_safety_checker: false,
+      ...(seed != null ? { seed } : {}),
+    },
+    prompt
+  );
 }
 
 /**
@@ -463,56 +1158,141 @@ async function generatePanelImage(
   caption: string,
   characters: ComicCharacter[],
   descriptions: Map<string, string>,
-  caricatures: Map<string, string | null>
+  caricatures: Map<string, string | null>,
+  options: { textOnly?: boolean; provider?: ImageProvider; seed?: number } = {}
 ): Promise<PanelResult> {
-  if (!OPENAI_API_KEY) return { imageUrl: null, prompt: "" };
+  const provider: ImageProvider =
+    options.provider === "flux" && FAL_KEY ? "flux" : "openai";
+
+  if (provider === "openai" && !OPENAI_API_KEY) {
+    return {
+      imageUrl: null,
+      prompt: "",
+      reason: "No OpenAI API key configured on the server.",
+    };
+  }
 
   const { cast, sceneCaptionRewriter } = buildPanelCast(
     characters,
     descriptions,
     caricatures
   );
-  const sceneWithLabels = sceneCaptionRewriter(caption);
+  // Caption may already be label-substituted by the caller; run again so any
+  // leftover real names become Character N before the prompt is built.
+  const labeledScene = sceneCaptionRewriter(caption);
+
+  // FLUX path — permissive fallback ladder:
+  //   Tame scenes: FLUX.2 edit → Qwen → v1.1 (best likeness first)
+  //   Spicy scenes: skip FLUX.2 (always refused) and try v1.1 FIRST —
+  //   it's fast (~15s) and most permissive. Qwen is second for likeness
+  //   if v1.1 fails. (Qwen-first was taking 60–90s and killing the tunnel.)
+  if (provider === "flux") {
+    const seed = options.seed ?? 0;
+    const fluxRefs = cast.filter((c) => c.image);
+    const spicy = sceneLikelyBlockedByFlux2(labeledScene);
+
+    if (spicy) {
+      console.log(
+        `[comic] spicy scene — trying flux v1.1 first (skip flux-2)`
+      );
+      const viaV11 = await generatePanelFromFlux(labeledScene, cast, seed);
+      if (viaV11.imageUrl) return viaV11;
+      if (viaV11.rateLimited) return viaV11;
+
+      if (!options.textOnly && fluxRefs.length > 0) {
+        console.warn(
+          `[comic] flux v1.1 failed (${viaV11.reason}); trying qwen edit`
+        );
+        const viaQwen = await generatePanelWithQwenEdit(
+          labeledScene,
+          cast,
+          fluxRefs,
+          seed
+        );
+        if (viaQwen.imageUrl) return viaQwen;
+        if (viaQwen.rateLimited) return viaQwen;
+      }
+      return viaV11;
+    }
+
+    if (!options.textOnly && fluxRefs.length > 0) {
+      const viaEdit = await generatePanelWithFlux2Edit(
+        labeledScene,
+        cast,
+        fluxRefs,
+        seed
+      );
+      if (viaEdit.imageUrl) return viaEdit;
+      if (viaEdit.rateLimited) return viaEdit;
+      console.warn(
+        `[comic] flux-2 edit failed (${viaEdit.reason}); ` +
+          (viaEdit.blocked
+            ? `content refusal — trying qwen edit (references kept)`
+            : `trying qwen edit (references kept)`)
+      );
+
+      const viaQwen = await generatePanelWithQwenEdit(
+        labeledScene,
+        cast,
+        fluxRefs,
+        seed
+      );
+      if (viaQwen.imageUrl) return viaQwen;
+      if (viaQwen.rateLimited) return viaQwen;
+      console.warn(
+        `[comic] qwen edit failed (${viaQwen.reason}); ` +
+          `falling back to flux v1.1 text-to-image`
+      );
+    }
+    return generatePanelFromFlux(labeledScene, cast, seed);
+  }
+
   const withRefs = cast.filter((c) => c.image);
 
-  // No reference images at all → text-to-image using feature descriptions.
-  if (withRefs.length === 0) {
-    return generatePanelFromTextCast(sceneWithLabels, cast);
+  // Soften retries use text-only to avoid burning the 5 input-images/min
+  // cast-sheet quota. Feature descriptions still keep likeness.
+  if (options.textOnly || withRefs.length === 0) {
+    return generatePanelFromTextCast(labeledScene, cast);
   }
 
   const castSheetBuf = await buildCastSheet(
     withRefs.map((c) => ({ name: c.label, imageUrl: c.image as string }))
   );
   if (!castSheetBuf) {
-    return generatePanelFromTextCast(sceneWithLabels, cast);
+    return generatePanelFromTextCast(labeledScene, cast);
   }
 
   const castSheetBlob = new Blob([new Uint8Array(castSheetBuf)], { type: "image/png" });
   const guide = buildCharacterGuide(cast, true);
   const labelList = cast.map((c) => c.label).join(", ");
-  const scene = ensureAllPresent(sceneWithLabels, cast);
+  const scene = ensureAllPresent(labeledScene, cast);
 
-  const prompt =
+  const prompt = scrubRealNamesFromPrompt(
     `${NO_TEXT}\n\n` +
-    `TASK: draw ONE brand-new comic panel illustrating the scene below.\n\n` +
-    `${FICTIONAL_NOTE}\n\n` +
-    `CHARACTER GUIDE (match these features precisely):\n${guide}\n\n` +
-    `A cast sheet is attached: each tile shows one character with their label ` +
-    `printed beneath. Use it together with the feature descriptions above.\n\n` +
-    `IDENTITY RULES (highest priority):\n` +
-    `  • Draw each character to match BOTH their cast-sheet tile AND their ` +
-    `feature description exactly (age/build, skin tone, hair, facial hair, ` +
-    `glasses, notable clothing). Keep them consistent across panels.\n` +
-    `  • Do NOT swap features between characters, do NOT merge them, do NOT ` +
-    `replace anyone with a random or famous-looking person.\n` +
-    `  • EVERY character listed MUST appear in the panel, even if the scene ` +
-    `sentence only names some of them: ${labelList}.\n` +
-    `  • Prefer a wider composition over leaving anyone out.\n\n` +
-    `SCENE: ${scene}\n\n` +
-    `STYLE: ${PANEL_STYLE}. This is a NEW illustration, not a re-crop or ` +
-    `re-style of the reference sheet.\n\n` +
-    `${NO_TEXT}`;
+      `TASK: draw ONE brand-new comic panel illustrating the scene below.\n\n` +
+      `${OPENAI_FICTIONAL_NOTE}\n\n` +
+      `CHARACTER GUIDE (match these features precisely):\n${guide}\n\n` +
+      `A cast sheet is attached: each tile shows one character with their label ` +
+      `printed beneath. Use it together with the feature descriptions above.\n\n` +
+      `IDENTITY RULES (highest priority):\n` +
+      `  • Draw each character to match BOTH their cast-sheet tile AND their ` +
+      `feature description exactly (age/build, skin tone, hair, facial hair, ` +
+      `glasses, notable clothing). Keep them consistent across panels.\n` +
+      `  • Do NOT swap features between characters, do NOT merge them, do NOT ` +
+      `replace anyone with a random or famous-looking person.\n` +
+      `  • EVERY character listed MUST appear in the panel, even if the scene ` +
+      `sentence only names some of them: ${labelList}.\n` +
+      `  • Prefer a wider composition over leaving anyone out.\n\n` +
+      `SCENE: ${scene}\n\n` +
+      `STYLE: ${PANEL_STYLE}. This is a NEW illustration, not a re-crop or ` +
+      `re-style of the reference sheet.\n\n` +
+      `${NO_TEXT}`,
+    cast
+  );
 
+  let editBlocked = false;
+  let editRateLimited = false;
+  let editReason: string | undefined;
   try {
     const form = new FormData();
     form.append("model", "gpt-image-1");
@@ -531,58 +1311,287 @@ async function generatePanelImage(
       const data = await res.json();
       const b64 = data?.data?.[0]?.b64_json;
       if (b64) return { imageUrl: `data:image/png;base64,${b64}`, prompt };
+      editReason = "Image-edit API returned success but no image data.";
+    } else {
+      const body = await res.text().catch(() => "");
+      editBlocked = looksLikeModerationBlock(res.status, body);
+      editRateLimited = res.status === 429;
+      editReason = explainImageApiFailure(res.status, body);
+      console.warn(
+        `[comic] image-edit failed status=${res.status} blocked=${editBlocked} ` +
+          `rateLimited=${editRateLimited} reason=${editReason}`
+      );
     }
-  } catch {
-    // fall through to text generation below
+  } catch (err) {
+    editReason = `Network error calling image-edit API: ${
+      err instanceof Error ? err.message : "unknown"
+    }`;
   }
 
   // Fall back to text-to-image, but keep the richer cast-sheet prompt as the
   // record of what we asked for (it's the more descriptive instruction).
-  const fallback = await generatePanelFromTextCast(sceneWithLabels, cast);
-  return { imageUrl: fallback.imageUrl, prompt: fallback.imageUrl ? fallback.prompt : prompt };
-}
-
-/**
- * Build a comic strip from a finished story. When an image provider is
- * configured each player photo is caricatured and every panel is illustrated;
- * otherwise it falls back to a photo-based strip rendered on the client.
- */
-export async function buildComic(story: Story): Promise<ComicStripData> {
-  const scripted = scriptPanels(story);
-
-  if (!hasAiProvider()) {
+  // If the edit call was rate-limited, skip the immediate text fallback — the
+  // caller will wait and retry rather than burning more quota instantly.
+  if (editRateLimited) {
     return {
-      mode: "photo",
-      panels: scripted.map((p) => ({ ...p })),
+      imageUrl: null,
+      prompt,
+      blocked: editBlocked,
+      rateLimited: true,
+      reason: editReason,
     };
   }
 
-  // STEP 1 — up front, lock in every named character's identity: caricature
-  // each unique player photo once and generate a detailed feature description
-  // from it. Descriptions are keyed by character id (which maps 1:1 to the
-  // story name) and reused verbatim in every panel so the look stays
-  // consistent. This is the single source of truth for how each person looks.
+  const fallback = await generatePanelFromTextCast(labeledScene, cast);
+  if (fallback.imageUrl) {
+    return {
+      imageUrl: fallback.imageUrl,
+      prompt: fallback.prompt,
+      blocked: editBlocked || fallback.blocked,
+    };
+  }
+  return {
+    imageUrl: null,
+    prompt,
+    blocked: editBlocked || fallback.blocked,
+    rateLimited: fallback.rateLimited,
+    reason: [
+      editReason ? `Edit: ${editReason}` : null,
+      fallback.reason ? `Text fallback: ${fallback.reason}` : null,
+    ]
+      .filter(Boolean)
+      .join(" → ") || "Image generation failed for an unknown reason.",
+  };
+}
+
+/** Strip baked-in wardrobe so resume can rebuild continuity from captions. */
+function stripWardrobeSuffix(description: string): string {
+  return description.replace(/\.\s*STORY WARDROBE\b[\s\S]*$/i, "").trim();
+}
+
+function lastSuccessfulAttemptCaption(
+  attempts: PanelImageAttempt[] | undefined
+): string | undefined {
+  if (!attempts?.length) return undefined;
+  for (let i = attempts.length - 1; i >= 0; i--) {
+    if (attempts[i].ok && attempts[i].caption?.trim()) {
+      return attempts[i].caption;
+    }
+  }
+  return undefined;
+}
+
+/** Run async work over items with a fixed concurrency limit. */
+async function mapPool<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from(
+    { length: Math.min(Math.max(1, concurrency), Math.max(1, items.length)) },
+    async () => {
+      while (next < items.length) {
+        const index = next;
+        next += 1;
+        results[index] = await fn(items[index], index);
+      }
+    }
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+type PlannedPanel = {
+  panelIdx: number;
+  panel: Omit<StoryPanel, "imageUrl">;
+  characters: ComicCharacter[];
+  liveDescriptions: Map<string, string>;
+  baseCaption: string;
+  labeledCaption: string;
+  labelNames: string[];
+  wardrobe: string[];
+  continuityNotes: string[];
+  panelCast: PanelCharacter[];
+};
+
+/**
+ * Build (or resume) a comic strip from a finished story.
+ *
+ * Call 1 prepares the cast only. Later calls bake wardrobe continuity into
+ * every pending panel up front, then draw those panels in parallel. Pass
+ * `previousComic` to reuse cast/caricatures and keep finished panels. The
+ * client loops until `complete` is true.
+ */
+export async function buildComic(
+  story: Story,
+  style: CaricatureStyle = "balanced",
+  previousComic?: ComicStripData | null,
+  provider: ImageProvider = "openai"
+): Promise<ComicBuildResult> {
+  const buildStart = Date.now();
+  const scripted = scriptPanels(story);
+  // One base seed per story; each panel gets storySeed + panelIndex so
+  // character look stays related but compositions don't collapse into clones.
+  const storySeed = stableSeedFromId(story.id);
+
+  if (!hasAiProvider()) {
+    const comic: ComicStripData = {
+      mode: "photo",
+      panels: scripted.map((p) => ({ ...p })),
+    };
+    return { comic, complete: true, pendingPanelIndexes: [], generatedThisChunk: 0 };
+  }
+
+  const previousByIndex = new Map<number, StoryPanel>();
+  for (const p of previousComic?.panels ?? []) {
+    previousByIndex.set(p.index, p);
+  }
+
+  // STEP 1 — lock character identity (reuse prior cast on resume).
   const storyCast = resolveStoryCast(story, scripted);
   const caricatureCache = new Map<string, string | null>();
   const descriptionCache = new Map<string, string>();
   const descriptionSource = new Map<string, "photo" | "web">();
+  const resolveImage = (c: ComicCharacter): string | undefined =>
+    caricatureCache.get(c.id) ?? c.imageUrl;
 
-  await Promise.all(
-    storyCast.map(async (c) => {
-      if (c.imageUrl) {
-        // Photo uploaded → caricature it and describe the caricature.
-        const caricature = await generateCaricature(c.imageUrl as string);
-        caricatureCache.set(c.id, caricature);
-        if (caricature) {
-          const desc = await describeCaricature(caricature);
+  // Seed caches from a previous chunk so we don't re-caricature / re-lookup.
+  for (const prev of previousComic?.cast ?? []) {
+    if (prev.imageUrl) caricatureCache.set(prev.id, prev.imageUrl);
+    const base = stripWardrobeSuffix(prev.description ?? "");
+    if (base) descriptionCache.set(prev.id, base);
+    if (prev.descriptionSource) {
+      descriptionSource.set(prev.id, prev.descriptionSource);
+    }
+  }
+
+  // Any prior cast means setup already ran — never redo caricature lookups.
+  const castAlreadyReady = Boolean(previousComic?.cast?.length);
+
+  // First call: prepare cast ONLY (no panel images) so caricature work and
+  // image generation never share one tunnel request.
+  if (!castAlreadyReady) {
+    await Promise.all(
+      storyCast.map(async (c) => {
+        if (descriptionCache.has(c.id) || caricatureCache.has(c.id)) {
+          if (!descriptionCache.has(c.id) && c.imageUrl) {
+            const desc = await describeCaricature(
+              (caricatureCache.get(c.id) || c.imageUrl) as string
+            );
+            if (desc) {
+              descriptionCache.set(c.id, desc);
+              descriptionSource.set(c.id, "photo");
+            }
+          }
+          return;
+        }
+
+        if (c.imageUrl) {
+          const caricature = await generateCaricatureWithRetry(
+            c.imageUrl as string,
+            style
+          );
+          caricatureCache.set(c.id, caricature);
+          const desc = await describeCaricature(
+            caricature ?? (c.imageUrl as string)
+          );
           if (desc) {
             descriptionCache.set(c.id, desc);
             descriptionSource.set(c.id, "photo");
           }
+          if (!caricature) {
+            console.warn(
+              `[comic] caricature failed for "${c.name}", using original photo + description`
+            );
+          }
+        } else {
+          const desc = await lookupPersonDescription(c.name, {
+            useCuratedLooks: provider === "flux",
+          });
+          if (desc) {
+            descriptionCache.set(c.id, desc);
+            descriptionSource.set(c.id, "web");
+            // Lookalike reference images are FLUX-only. OpenAI keeps its
+            // proven cast-sheet path (photo caricatures only; celebs stay
+            // description-driven without an extra generated face).
+            if (provider === "flux") {
+              const lookalike = await generateLookalikeFromDescription(
+                desc,
+                style
+              );
+              if (lookalike) {
+                caricatureCache.set(c.id, lookalike);
+                console.log(
+                  `[comic] lookalike caricature ready for public figure "${c.name}"`
+                );
+              } else {
+                console.warn(
+                  `[comic] lookalike caricature failed for "${c.name}" — ` +
+                    `panels will rely on the text description only`
+                );
+              }
+            }
+          }
+        }
+      })
+    );
+
+    const cast: ComicCharacter[] = storyCast.map((c) => ({
+      id: c.id,
+      name: c.name,
+      imageUrl: resolveImage(c),
+      description: descriptionCache.get(c.id) ?? "",
+      descriptionSource: descriptionSource.get(c.id),
+    }));
+
+    const stubPanels: StoryPanel[] = scripted.map((panel) => ({
+      ...panel,
+      characters: panel.characters.map((c) => ({
+        ...c,
+        imageUrl: resolveImage(c),
+        description: descriptionCache.get(c.id) ?? c.description ?? "",
+      })),
+      imageFailureReason:
+        "Deferred — cast prepared; panel will draw on the next pass.",
+      imageAttempts: [
+        {
+          attempt: "deferred",
+          ok: false,
+          reason: "Waiting for per-panel generation pass.",
+        },
+      ],
+    }));
+
+    console.log(
+      `[comic] cast setup done characters=${cast.length} ` +
+        `panels=${stubPanels.length} total=${Date.now() - buildStart}ms`
+    );
+
+    return {
+      comic: { mode: "ai", panels: stubPanels, cast },
+      complete: false,
+      pendingPanelIndexes: stubPanels.map((p) => p.index),
+      generatedThisChunk: 0,
+    };
+  }
+
+  // Resume path — cast is already ready; refill caches for any gaps.
+  await Promise.all(
+    storyCast.map(async (c) => {
+      if (descriptionCache.has(c.id)) return;
+      if (c.imageUrl) {
+        const src = (caricatureCache.get(c.id) || c.imageUrl) as string;
+        const desc = await describeCaricature(src);
+        if (desc) {
+          descriptionCache.set(c.id, desc);
+          descriptionSource.set(c.id, "photo");
         }
       } else {
-        // No photo → search online for a matching public-figure description.
-        const desc = await lookupPersonDescription(c.name);
+        const desc = await lookupPersonDescription(c.name, {
+          useCuratedLooks: provider === "flux",
+        });
         if (desc) {
           descriptionCache.set(c.id, desc);
           descriptionSource.set(c.id, "web");
@@ -591,80 +1600,476 @@ export async function buildComic(story: Story): Promise<ComicStripData> {
     })
   );
 
-  // The cast list returned to the client for review: name + the exact
-  // description that will be handed to the image model (names are not).
   const cast: ComicCharacter[] = storyCast.map((c) => ({
     id: c.id,
     name: c.name,
-    imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
+    imageUrl: resolveImage(c),
     description: descriptionCache.get(c.id) ?? "",
     descriptionSource: descriptionSource.get(c.id),
   }));
 
-  const panels: StoryPanel[] = await Promise.all(
-    scripted.map(async (panel) => {
-      const characters = panel.characters.map((c) => ({
-        ...c,
-        imageUrl: caricatureCache.get(c.id) ?? c.imageUrl,
-        description: descriptionCache.get(c.id) ?? c.description ?? "",
-      }));
-      const names = panel.characters
-        .filter((c) => mentionsName(panel.caption, c.name))
-        .map((c) => c.name);
+  // Bake continuity from story order first, then draw pending panels.
+  // FLUX: ONE panel per HTTP chunk. Serial-all-in-one-request was timing out
+  // Cloudflare tunnels (~100s) so the client saw constant failures. The client
+  // resume loop already expects multi-chunk generation. OpenAI still draws
+  // several panels per chunk in parallel.
+  const MAX_DRAW_PER_CHUNK = provider === "flux" ? 1 : 4;
+  const OVERALL_DEADLINE_MS = provider === "flux" ? 75_000 : 150_000;
+  const MIN_ATTEMPT_MS = 12_000;
+  const PARALLEL_CONCURRENCY = provider === "flux" ? 1 : 4;
+  const deadline = buildStart + OVERALL_DEADLINE_MS;
+  const canAttempt = () => Date.now() < deadline - MIN_ATTEMPT_MS;
 
-      // Push the crudest version FIRST: attempt the raw player caption
-      // unchanged (only names→labels). gpt-image-1 at moderation:"low" allows
-      // a lot of risqué content, and image moderation is somewhat
-      // non-deterministic — so we try the raw text (twice, to ride out flaky
-      // refusals) before softening anything. Only if the model still refuses
-      // do we walk down the softening ladder (0 = surgical swap, 1 =
-      // aftermath, 2 = whimsical), keeping the least-softened version that the
-      // model actually accepts.
-      let caption = panel.caption;
-      let result = await generatePanelImage(
-        caption,
-        characters,
-        descriptionCache,
-        caricatureCache
+  const continuity: ContinuityMap = emptyContinuity();
+  const baseDescriptions = new Map(descriptionCache);
+  const keptPanels = new Map<number, StoryPanel>();
+  const planned: PlannedPanel[] = [];
+
+  for (let panelIdx = 0; panelIdx < scripted.length; panelIdx++) {
+    const panel = scripted[panelIdx];
+    const previousPanel = previousByIndex.get(panel.index);
+
+    const labelingCharacters = panel.characters.map((c) => ({
+      ...c,
+      imageUrl: resolveImage(c),
+      description: baseDescriptions.get(c.id) ?? c.description ?? "",
+    }));
+    const { cast: panelCast, sceneCaptionRewriter } = buildPanelCast(
+      labelingCharacters,
+      baseDescriptions,
+      caricatureCache
+    );
+    const labeledCaption = sceneCaptionRewriter(panel.caption);
+    const labelNames = panelCast.map((c) => c.label);
+
+    // Always advance wardrobe from this panel's story text so later panels
+    // (including after a resume) stay consistent — done before any draws.
+    updateContinuityFromCaption(continuity, labeledCaption, panelCast);
+
+    // Finished in a prior chunk — keep the image and fold any softened caption
+    // into continuity for later panels' baked prompts.
+    if (previousPanel?.imageUrl) {
+      const softCaption = lastSuccessfulAttemptCaption(
+        previousPanel.imageAttempts
       );
-      if (!result.imageUrl) {
-        result = await generatePanelImage(
-          caption,
-          characters,
-          descriptionCache,
-          caricatureCache
+      if (softCaption && softCaption.trim() !== labeledCaption.trim()) {
+        updateContinuityFromCaption(continuity, softCaption, panelCast);
+      }
+      const liveDescriptions = descriptionsWithContinuity(
+        baseDescriptions,
+        continuity,
+        [...baseDescriptions.keys(), ...panelCast.map((c) => c.id)]
+      );
+      for (const [id, desc] of liveDescriptions) {
+        descriptionCache.set(id, desc);
+      }
+      keptPanels.set(panel.index, {
+        ...previousPanel,
+        characters: previousPanel.characters.map((c) => ({
+          ...c,
+          imageUrl: resolveImage(c) ?? c.imageUrl,
+          description: descriptionCache.get(c.id) ?? c.description,
+        })),
+      });
+      continue;
+    }
+
+    const liveDescriptions = descriptionsWithContinuity(
+      baseDescriptions,
+      continuity,
+      [...baseDescriptions.keys(), ...panelCast.map((c) => c.id)]
+    );
+    for (const [id, desc] of liveDescriptions) {
+      descriptionCache.set(id, desc);
+    }
+
+    const characters = panel.characters.map((c) => ({
+      ...c,
+      imageUrl: resolveImage(c),
+      description: liveDescriptions.get(c.id) ?? c.description ?? "",
+    }));
+
+    const withContinuity = applyContinuity(
+      labeledCaption,
+      panelCast,
+      continuity
+    );
+    const wardrobe = wardrobeNotes(continuity, panelCast);
+    if (wardrobe.length > 0) {
+      console.log(
+        `[comic] panel ${panelIdx} wardrobe baked upfront: ` +
+          wardrobe.join("; ")
+      );
+    }
+    if (withContinuity.notes.length > 0) {
+      console.log(
+        `[comic] panel ${panelIdx} scene continuity baked upfront: ` +
+          withContinuity.notes.join("; ")
+      );
+    }
+
+    planned.push({
+      panelIdx,
+      panel,
+      characters,
+      liveDescriptions,
+      baseCaption: withContinuity.caption,
+      labeledCaption,
+      labelNames,
+      wardrobe,
+      continuityNotes: withContinuity.notes,
+      panelCast,
+    });
+  }
+
+  console.log(
+    `[comic] drawing up to ${Math.min(planned.length, MAX_DRAW_PER_CHUNK)} ` +
+      `of ${planned.length} pending panels ` +
+      `(provider=${provider}, concurrency=${PARALLEL_CONCURRENCY}, ` +
+      `kept=${keptPanels.size})`
+  );
+
+  const toDraw = planned.slice(0, MAX_DRAW_PER_CHUNK);
+  const deferredPlans = planned.slice(MAX_DRAW_PER_CHUNK);
+
+  const drawnPanels: StoryPanel[] = await mapPool(
+    toDraw,
+    PARALLEL_CONCURRENCY,
+    async (plan): Promise<StoryPanel> => {
+      const {
+        panelIdx,
+        panel,
+        characters,
+        liveDescriptions,
+        baseCaption,
+        labeledCaption,
+        labelNames,
+        wardrobe,
+        continuityNotes,
+      } = plan;
+
+      const noteParts = [
+        ...wardrobe.map((w) => `In character sheet: ${w}`),
+        ...continuityNotes,
+      ];
+      const continuityNote =
+        noteParts.length > 0 ? noteParts.join("; ") : undefined;
+
+      if (!canAttempt()) {
+        console.warn(
+          `[comic] panel ${panelIdx} deferred — chunk time budget exhausted ` +
+            `(will resume in a follow-up request)`
         );
+        return {
+          ...panel,
+          characters,
+          imageFailureReason:
+            "Deferred — comic time budget reached; continuing in next pass.",
+          imageAttempts: [
+            {
+              attempt: "deferred",
+              ok: false,
+              reason: "Skipped — overall comic time budget exhausted.",
+            },
+          ],
+          continuityNote,
+        };
       }
 
-      const levels: SanitizeLevel[] = [0, 1, 2];
-      for (const level of levels) {
-        if (result.imageUrl) break;
-        const [softer] = await sanitizeCaptionsForImage(
-          [{ caption: panel.caption, names }],
-          level
-        );
-        if (!softer || softer === caption) continue;
-        caption = softer;
-        result = await generatePanelImage(
-          caption,
-          characters,
-          descriptionCache,
-          caricatureCache
+      type Attempt = { label: string; caption: string; textOnly?: boolean };
+      let result: PanelResult = { imageUrl: null, prompt: "" };
+      const tried = new Set<string>();
+      const attemptLog: PanelImageAttempt[] = [];
+      let lastRefusedCaption = baseCaption;
+      let useTextOnly = false;
+
+      const runAttempt = async (a: Attempt) => {
+        const key = `${a.textOnly ? "t:" : "e:"}${a.caption.trim()}`;
+        if (tried.has(key)) return;
+        tried.add(key);
+
+        for (let rateTry = 0; rateTry < 3; rateTry++) {
+          if (!canAttempt()) {
+            attemptLog.push({
+              attempt: a.label,
+              ok: false,
+              reason: "Skipped — overall comic time budget exhausted.",
+              caption: a.caption.slice(0, 160),
+            });
+            return;
+          }
+          const t0 = Date.now();
+          result = await generatePanelImage(
+            a.caption,
+            characters,
+            liveDescriptions,
+            caricatureCache,
+            {
+              textOnly: a.textOnly || useTextOnly,
+              provider,
+              seed: panelSeed(storySeed, panelIdx),
+            }
+          );
+          if (result.imageUrl) {
+            attemptLog.push({
+              attempt: a.label,
+              ok: true,
+              caption: a.caption.slice(0, 160),
+            });
+            console.log(
+              `[comic] panel ${panelIdx} attempt=${a.label} imageOk=true ` +
+                `took=${Date.now() - t0}ms remaining=${deadline - Date.now()}ms ` +
+                `caption=${JSON.stringify(a.caption.slice(0, 80))}`
+            );
+            return;
+          }
+
+          if (result.rateLimited && rateTry < 1) {
+            const waitMs = 8_000;
+            console.warn(
+              `[comic] panel ${panelIdx} rate-limited on ${a.label}, ` +
+                `waiting ${waitMs}ms then retrying same caption`
+            );
+            attemptLog.push({
+              attempt: `${a.label}-ratewait`,
+              ok: false,
+              reason: `Rate limited — waiting ${waitMs / 1000}s then retrying.`,
+              caption: a.caption.slice(0, 160),
+            });
+            await sleep(waitMs);
+            continue;
+          }
+
+          const reason =
+            result.reason ||
+            (result.blocked
+              ? "Blocked by image moderation."
+              : "Image generation failed.");
+          lastRefusedCaption = a.caption;
+          // Only force text-only after rate limits / quota pressure on the
+          // cast-sheet edit path. Moderation blocks should still retry with
+          // the cast sheet once the caption is softened — otherwise the
+          // panel drops to a low-consistency text-only draw and looks fuzzy
+          // next to the rest of the strip.
+          if (result.rateLimited) useTextOnly = true;
+          attemptLog.push({
+            attempt: a.label,
+            ok: false,
+            reason,
+            caption: a.caption.slice(0, 160),
+          });
+          console.log(
+            `[comic] panel ${panelIdx} attempt=${a.label} imageOk=false ` +
+              `blocked=${Boolean(result.blocked)} ` +
+              `took=${Date.now() - t0}ms remaining=${deadline - Date.now()}ms ` +
+              `reason=${reason} caption=${JSON.stringify(a.caption.slice(0, 80))}`
+          );
+          return;
+        }
+      };
+
+      await runAttempt({
+        label: "raw",
+        // FLUX: send the clean story caption — wardrobe already lives in the
+        // character descriptions. The continuity parenthetical used to bloat
+        // late panels and fight the scene on short-window fallbacks.
+        caption: provider === "flux" ? labeledCaption : baseCaption,
+      });
+
+      // Soften ladder is for OpenAI moderation. FLUX already has its own
+      // permissive fal ladder; LLM softens were rewriting late-panel stories
+      // into generic "cuddled under a duvet" mush and dropping likeness.
+      if (provider === "flux") {
+        // One local soften only if the whole fal ladder refused — keeps the
+        // same characters/setting without inventing a new scene via LLM.
+        if (!result.imageUrl && canAttempt()) {
+          const softer = localSoften(labeledCaption, 0, labelNames);
+          if (softer && softer.trim() !== labeledCaption.trim()) {
+            await runAttempt({
+              label: "local0",
+              caption: softer,
+              textOnly: true,
+            });
+          }
+        }
+      } else {
+        const levels: SanitizeLevel[] = [0, 1, 2];
+        for (const level of levels) {
+          if (result.imageUrl) break;
+          if (!canAttempt()) {
+            attemptLog.push({
+              attempt: `soft${level}`,
+              ok: false,
+              reason: "Skipped — overall comic time budget exhausted.",
+            });
+            break;
+          }
+
+          let softer = localSoften(baseCaption, level, labelNames);
+          if (
+            !softer ||
+            tried.has(`t:${softer.trim()}`) ||
+            tried.has(`e:${softer.trim()}`)
+          ) {
+            const [llmSoft] = await sanitizeCaptionsForImage(
+              [
+                {
+                  caption: baseCaption,
+                  names: labelNames,
+                  refusedCaption: lastRefusedCaption,
+                },
+              ],
+              level,
+              { force: true }
+            );
+            if (llmSoft && llmSoft.trim() !== baseCaption.trim()) {
+              softer = llmSoft;
+            }
+          }
+          if (!softer || softer.trim() === baseCaption.trim()) continue;
+          if (
+            tried.has(`t:${softer.trim()}`) ||
+            tried.has(`e:${softer.trim()}`)
+          ) {
+            continue;
+          }
+
+          // Keep the cast sheet on soften retries so toned-down panels stay
+          // the same quality/likeness as the rest of the strip. Text-only is
+          // only used if the edit path set useTextOnly (rate limits).
+          await runAttempt({
+            label: `soft${level}`,
+            caption: softer,
+          });
+        }
+      }
+
+      const budgetExhausted = attemptLog.some(
+        (a) => a.reason?.includes("time budget exhausted")
+      );
+      const failureReason = result.imageUrl
+        ? undefined
+        : budgetExhausted
+          ? "Deferred — comic time budget reached; continuing in next pass."
+          : attemptLog
+              .filter((a) => !a.ok && a.reason)
+              .map((a) => `${a.attempt}: ${a.reason}`)
+              .join(" | ") ||
+            result.reason ||
+            "All image attempts failed.";
+
+      if (!result.imageUrl) {
+        console.warn(
+          `[comic] panel ${panelIdx} produced no image, ` +
+            `total=${Date.now() - buildStart}ms reason=${failureReason}`
         );
       }
 
       return {
         ...panel,
-        characters,
+        characters: characters.map((c) => ({
+          ...c,
+          description: liveDescriptions.get(c.id) ?? c.description,
+        })),
         imageUrl: result.imageUrl ?? undefined,
         imagePrompt: result.prompt || undefined,
+        imageFailureReason: failureReason,
+        imageAttempts: attemptLog,
+        continuityNote,
       };
-    })
+    }
   );
 
-  // If image generation failed across the board, present as a photo strip.
+  // Panels beyond this chunk's draw budget — client resumes with previousComic.
+  for (const plan of deferredPlans) {
+    const noteParts = [
+      ...plan.wardrobe.map((w) => `In character sheet: ${w}`),
+      ...plan.continuityNotes,
+    ];
+    drawnPanels.push({
+      ...plan.panel,
+      characters: plan.characters,
+      imageFailureReason:
+        "Deferred — continuing in next pass (one FLUX panel per request).",
+      imageAttempts: [
+        {
+          attempt: "deferred",
+          ok: false,
+          reason: "Queued — continuing in next pass.",
+        },
+      ],
+      continuityNote: noteParts.length > 0 ? noteParts.join("; ") : undefined,
+    });
+  }
+
+  const drawnByIndex = new Map(drawnPanels.map((p) => [p.index, p]));
+  const panels: StoryPanel[] = scripted.map((panel) => {
+    const kept = keptPanels.get(panel.index);
+    if (kept) return kept;
+    const drawn = drawnByIndex.get(panel.index);
+    if (drawn) return drawn;
+    return {
+      ...panel,
+      characters: panel.characters.map((c) => ({
+        ...c,
+        imageUrl: resolveImage(c),
+        description: descriptionCache.get(c.id) ?? c.description ?? "",
+      })),
+      imageFailureReason: "Panel was not planned for this pass.",
+    };
+  });
+
+  // Fold successful softened captions into the exported cast wardrobe so the
+  // next resume pass (if any) sees them during the upfront bake.
+  for (const p of panels) {
+    const softCaption = lastSuccessfulAttemptCaption(p.imageAttempts);
+    if (!softCaption) continue;
+    const plan = planned.find((pl) => pl.panel.index === p.index);
+    if (!plan) continue;
+    if (softCaption.trim() === plan.labeledCaption.trim()) continue;
+    updateContinuityFromCaption(continuity, softCaption, plan.panelCast);
+  }
+
+  const finalDescriptions = descriptionsWithContinuity(
+    baseDescriptions,
+    continuity,
+    baseDescriptions.keys()
+  );
+  const castWithWardrobe: ComicCharacter[] = cast.map((c) => ({
+    ...c,
+    description: finalDescriptions.get(c.id) ?? c.description,
+  }));
+
+  const generatedThisChunk = drawnPanels.filter((p) => p.imageUrl).length;
   const anyImages = panels.some((p) => p.imageUrl);
-  return { mode: anyImages ? "ai" : "photo", panels, cast };
+  const pendingPanelIndexes = panels
+    .filter((p) => !p.imageUrl)
+    .map((p) => p.index);
+  // "complete" means every panel that still needs an image either has one, or
+  // failed for a non-budget reason (so another chunk won't help). Budget
+  // deferrals keep complete=false so the client resumes.
+  const pendingBudget = panels.some(
+    (p) =>
+      !p.imageUrl &&
+      (p.imageFailureReason?.includes("continuing in next pass") ||
+        p.imageAttempts?.some((a) =>
+          a.reason?.includes("time budget exhausted")
+        ))
+  );
+  const complete = !pendingBudget;
+
+  const comic: ComicStripData = {
+    mode: anyImages ? "ai" : "photo",
+    panels,
+    cast: castWithWardrobe,
+  };
+
+  console.log(
+    `[comic] chunk done complete=${complete} generated=${generatedThisChunk} ` +
+      `pending=[${pendingPanelIndexes.join(",")}] total=${Date.now() - buildStart}ms`
+  );
+
+  return { comic, complete, pendingPanelIndexes, generatedThisChunk };
 }
 
 /**

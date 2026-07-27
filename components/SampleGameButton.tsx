@@ -22,6 +22,7 @@ export function SampleGameButton() {
         templateId: "classic",
         roomCode,
         sample: true,
+        usePresets: true,
       });
 
       window.location.href = `/game/${roomCode}`;
