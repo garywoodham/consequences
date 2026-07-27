@@ -732,7 +732,7 @@ async function generatePanelFromTextCast(
         model: "gpt-image-1",
         prompt,
         size: "1024x1024",
-        quality: "low",
+        quality: "medium",
         moderation: "low",
         n: 1,
       }),
@@ -1846,7 +1846,12 @@ export async function buildComic(
               ? "Blocked by image moderation."
               : "Image generation failed.");
           lastRefusedCaption = a.caption;
-          if (result.blocked) useTextOnly = true;
+          // Only force text-only after rate limits / quota pressure on the
+          // cast-sheet edit path. Moderation blocks should still retry with
+          // the cast sheet once the caption is softened — otherwise the
+          // panel drops to a low-consistency text-only draw and looks fuzzy
+          // next to the rest of the strip.
+          if (result.rateLimited) useTextOnly = true;
           attemptLog.push({
             attempt: a.label,
             ok: false,
@@ -1929,10 +1934,12 @@ export async function buildComic(
             continue;
           }
 
+          // Keep the cast sheet on soften retries so toned-down panels stay
+          // the same quality/likeness as the rest of the strip. Text-only is
+          // only used if the edit path set useTextOnly (rate limits).
           await runAttempt({
             label: `soft${level}`,
             caption: softer,
-            textOnly: true,
           });
         }
       }
