@@ -1,0 +1,76 @@
+{
+  "1": {
+    "inputs": {
+      "ckpt_name": "your_checkpoint.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint — replace with your Flux or SDXL checkpoint"
+    }
+  },
+  "2": {
+    "inputs": {
+      "text": "__PROMPT__",
+      "clip": ["1", 1]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Positive prompt (injected by Consequences)"
+    }
+  },
+  "3": {
+    "inputs": {
+      "text": "text, watermark, blurry, low quality, deformed, multiple people",
+      "clip": ["1", 1]
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "4": {
+    "inputs": {
+      "image": "__IMAGE__"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Uploaded player photo (injected at runtime)"
+    }
+  },
+  "5": {
+    "inputs": {
+      "pixels": ["4", 0],
+      "vae": ["1", 2]
+    },
+    "class_type": "VAEEncode"
+  },
+  "6": {
+    "inputs": {
+      "seed": 0,
+      "steps": 28,
+      "cfg": 7,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 0.55,
+      "model": ["1", 0],
+      "positive": ["2", 0],
+      "negative": ["3", 0],
+      "latent_image": ["5", 0]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "Img2img caricature — lower denoise keeps likeness"
+    }
+  },
+  "7": {
+    "inputs": {
+      "samples": ["6", 0],
+      "vae": ["1", 2]
+    },
+    "class_type": "VAEDecode"
+  },
+  "8": {
+    "inputs": {
+      "filename_prefix": "consequences_caricature",
+      "images": ["7", 0]
+    },
+    "class_type": "SaveImage"
+  }
+}

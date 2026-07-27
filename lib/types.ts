@@ -26,8 +26,9 @@ export type StoryLine = {
  * Which image API draws the comic panels:
  * - "openai" — gpt-image-1 (stricter moderation, supports cast-sheet edits)
  * - "flux"   — FLUX Pro via fal.ai (fewer content restrictions, text-to-image)
+ * - "local"  — self-hosted ComfyUI: full uncensored pipeline (caricatures + panels)
  */
-export const IMAGE_PROVIDERS = ["openai", "flux"] as const;
+export const IMAGE_PROVIDERS = ["openai", "flux", "local"] as const;
 export type ImageProvider = (typeof IMAGE_PROVIDERS)[number];
 
 /**

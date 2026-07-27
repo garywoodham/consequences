@@ -2,9 +2,9 @@
 import type { ImageProvider, Story } from "./types";
 
 /**
- * Content that OpenAI's image moderation reliably refuses but the FLUX
- * fallback ladder handles: nudity, sexual situations, hard profanity and
- * general filth. Whole-word stems, checked case-insensitively.
+ * Content that OpenAI's image moderation reliably refuses but local ComfyUI
+ * or the FLUX fallback ladder handles: nudity, sexual situations, hard
+ * profanity and general filth. Whole-word stems, checked case-insensitively.
  */
 const SPICY_PATTERNS: RegExp[] = [
   /\bnaked\b/i,
@@ -86,11 +86,11 @@ export function recommendImageProvider(story: Story): ProviderRecommendation {
   if (matches.length > 0) {
     const shown = matches.slice(0, 3).join('", "');
     return {
-      provider: "flux",
+      provider: "local",
       reason:
         `This story gets spicy ("${shown}"${
           matches.length > 3 ? ", …" : ""
-        }) — FLUX's permissive fallbacks can draw scenes OpenAI refuses.`,
+        }) — Local (ComfyUI) on your machine has no cloud moderation; FLUX is the cloud fallback if Local isn't running.`,
       matches,
     };
   }

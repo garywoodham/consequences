@@ -17,7 +17,7 @@ export async function POST(request: NextRequest) {
   let body: {
     story?: Story;
     style?: CaricatureStyle;
-    /** Which image engine draws the panels ("openai" default, or "flux"). */
+    /** Which image engine draws the panels ("openai" default, "flux", or "local"). */
     provider?: ImageProvider;
     /** Partial comic from a previous chunk — resume keeps cast + finished panels. */
     previousComic?: ComicStripData;

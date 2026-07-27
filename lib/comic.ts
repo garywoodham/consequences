@@ -25,9 +25,20 @@ import {
   type ContinuityMap,
 } from "./continuity";
 import { getCelebrityLook } from "./celebrity-looks";
+import {
+  generateCaricatureWithComfy,
+  generateLookalikeWithComfy,
+  generatePanelWithComfy,
+  isComfyConfigured,
+  lookalikeStyleHint,
+} from "./providers/comfy";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const FAL_KEY = process.env.FAL_KEY;
+
+/** Fallback cast description when Local skips OpenAI vision (reference image carries likeness). */
+const LOCAL_CAST_DESCRIPTION =
+  "original cartoon character matching the reference portrait — same face, hair, build and skin tone in every panel";
 
 const CARICATURE_STYLE_BASE =
   "bold ink outlines, flat vibrant colors, clean white background, single " +
@@ -92,7 +103,7 @@ const NO_TEXT_BRIEF =
   "storytelling only";
 
 export function hasAiProvider(): boolean {
-  return Boolean(OPENAI_API_KEY || FAL_KEY);
+  return Boolean(OPENAI_API_KEY || FAL_KEY || isComfyConfigured());
 }
 
 /** Which image engines are configured (drives the UI provider toggle). */
@@ -100,7 +111,14 @@ export function availableImageProviders(): ImageProvider[] {
   const providers: ImageProvider[] = [];
   if (OPENAI_API_KEY) providers.push("openai");
   if (FAL_KEY) providers.push("flux");
+  if (isComfyConfigured()) providers.push("local");
   return providers;
+}
+
+function resolveImageProvider(requested?: ImageProvider): ImageProvider {
+  if (requested === "local" && isComfyConfigured()) return "local";
+  if (requested === "flux" && FAL_KEY) return "flux";
+  return "openai";
 }
 
 function escapeRegExp(s: string): string {
@@ -211,16 +229,27 @@ async function fetchAsBlob(url: string): Promise<Blob | null> {
  */
 async function generateCaricatureWithRetry(
   imageUrl: string,
-  style: CaricatureStyle
+  style: CaricatureStyle,
+  provider?: ImageProvider
 ): Promise<string | null> {
-  return (await generateCaricature(imageUrl, style)) ?? (await generateCaricature(imageUrl, style));
+  const first = await generateCaricature(imageUrl, style, provider);
+  return first ?? (await generateCaricature(imageUrl, style, provider));
 }
 
-/** Turn an uploaded photo into a cartoon caricature (OpenAI image edit). */
+/** Turn an uploaded photo into a cartoon caricature. */
 export async function generateCaricature(
   imageUrl: string,
-  style: CaricatureStyle = "balanced"
+  style: CaricatureStyle = "balanced",
+  provider?: ImageProvider
 ): Promise<string | null> {
+  if (provider === "local" || (!OPENAI_API_KEY && isComfyConfigured())) {
+    const result = await generateCaricatureWithComfy(
+      imageUrl,
+      caricaturePrompt(style)
+    );
+    return result.imageUrl;
+  }
+
   if (!OPENAI_API_KEY) return null;
 
   const blob = await fetchAsBlob(imageUrl);
@@ -389,7 +418,6 @@ async function lookupPersonDescription(
   name: string,
   options: { useCuratedLooks?: boolean } = {}
 ): Promise<string> {
-  if (!OPENAI_API_KEY) return "";
   const trimmed = name.trim();
   if (!trimmed) return "";
 
@@ -397,13 +425,18 @@ async function lookupPersonDescription(
   const cached = personLookupCache.get(cacheKey);
   if (cached !== undefined) return cached;
 
-  // Curated bank is FLUX-only — must not change OpenAI's text path.
+  // Curated bank works without OpenAI — used by Local and FLUX paths.
   if (options.useCuratedLooks) {
     const curated = getCelebrityLook(trimmed);
     if (curated) {
       personLookupCache.set(cacheKey, curated);
       return curated;
     }
+  }
+
+  if (!OPENAI_API_KEY) {
+    personLookupCache.set(cacheKey, "");
+    return "";
   }
 
   let result = "";
@@ -459,20 +492,31 @@ async function lookupPersonDescription(
  */
 async function generateLookalikeFromDescription(
   description: string,
-  style: CaricatureStyle = "balanced"
+  style: CaricatureStyle = "balanced",
+  provider?: ImageProvider
 ): Promise<string | null> {
-  if (!OPENAI_API_KEY || !description.trim()) return null;
-
-  const styleHint =
-    style === "exaggerated"
-      ? "bold heavily exaggerated caricature, amplify distinctive features"
-      : style === "flattering"
-        ? "flattering idealised cartoon caricature, glamorous and clear-skinned"
-        : style === "faithful"
-          ? "clean lightly stylised cartoon portrait, true-to-life proportions"
-          : "moderately exaggerated cartoon caricature, instantly recognisable";
+  if (!description.trim()) return null;
 
   const prompt =
+    `Create a single cartoon CHARACTER PORTRAIT (head-and-shoulders, facing ` +
+    `camera, plain light background) that is an INSTANTLY RECOGNISABLE ` +
+    `caricature lookalike of this exact appearance:\n` +
+    `${description}\n\n` +
+    `CRITICAL: amplify the most distinctive features so the face is unique ` +
+    `and memorable (not a generic pretty face). ${lookalikeStyleHint(style)}. ` +
+    `${PANEL_STYLE}. This portrait will be reused as a cast reference across ` +
+    `a whole comic strip — consistency matters. ${NO_TEXT_BRIEF}.`;
+
+  if (provider === "local" || (!OPENAI_API_KEY && isComfyConfigured())) {
+    const result = await generateLookalikeWithComfy(prompt);
+    return result.imageUrl;
+  }
+
+  if (!OPENAI_API_KEY) return null;
+
+  const styleHint = lookalikeStyleHint(style);
+
+  const openAiPrompt =
     `Create a single cartoon CHARACTER PORTRAIT (head-and-shoulders, facing ` +
     `camera, plain light background) that is an INSTANTLY RECOGNISABLE ` +
     `caricature lookalike of this exact appearance:\n` +
@@ -491,7 +535,7 @@ async function generateLookalikeFromDescription(
       },
       body: JSON.stringify({
         model: "gpt-image-1",
-        prompt,
+        prompt: openAiPrompt,
         size: "1024x1024",
         quality: "medium",
         moderation: "low",
@@ -1161,14 +1205,21 @@ async function generatePanelImage(
   caricatures: Map<string, string | null>,
   options: { textOnly?: boolean; provider?: ImageProvider; seed?: number } = {}
 ): Promise<PanelResult> {
-  const provider: ImageProvider =
-    options.provider === "flux" && FAL_KEY ? "flux" : "openai";
+  const provider: ImageProvider = resolveImageProvider(options.provider);
 
   if (provider === "openai" && !OPENAI_API_KEY) {
     return {
       imageUrl: null,
       prompt: "",
       reason: "No OpenAI API key configured on the server.",
+    };
+  }
+
+  if (provider === "local" && !isComfyConfigured()) {
+    return {
+      imageUrl: null,
+      prompt: "",
+      reason: "ComfyUI is not configured (set COMFYUI_URL).",
     };
   }
 
@@ -1180,6 +1231,17 @@ async function generatePanelImage(
   // Caption may already be label-substituted by the caller; run again so any
   // leftover real names become Character N before the prompt is built.
   const labeledScene = sceneCaptionRewriter(caption);
+
+  // Local ComfyUI — text-only prompt, no moderation ladder (full user control).
+  if (provider === "local") {
+    const prompt = scrubRealNamesFromPrompt(
+      `${NO_TEXT_BRIEF}. ${PANEL_STYLE}, detailed background setting.\n\n` +
+        buildFluxCompactPromptBody(labeledScene, cast),
+      cast
+    );
+    const refImage = cast.find((c) => c.image)?.image;
+    return generatePanelWithComfy(prompt, options.seed, refImage);
+  }
 
   // FLUX path — permissive fallback ladder:
   //   Tame scenes: FLUX.2 edit → Qwen → v1.1 (best likeness first)
@@ -1475,14 +1537,21 @@ export async function buildComic(
   if (!castAlreadyReady) {
     await Promise.all(
       storyCast.map(async (c) => {
+        const useCuratedLooks = provider === "flux" || provider === "local";
+
         if (descriptionCache.has(c.id) || caricatureCache.has(c.id)) {
           if (!descriptionCache.has(c.id) && c.imageUrl) {
-            const desc = await describeCaricature(
-              (caricatureCache.get(c.id) || c.imageUrl) as string
-            );
-            if (desc) {
-              descriptionCache.set(c.id, desc);
+            if (provider === "local") {
+              descriptionCache.set(c.id, LOCAL_CAST_DESCRIPTION);
               descriptionSource.set(c.id, "photo");
+            } else {
+              const desc = await describeCaricature(
+                (caricatureCache.get(c.id) || c.imageUrl) as string
+              );
+              if (desc) {
+                descriptionCache.set(c.id, desc);
+                descriptionSource.set(c.id, "photo");
+              }
             }
           }
           return;
@@ -1491,16 +1560,26 @@ export async function buildComic(
         if (c.imageUrl) {
           const caricature = await generateCaricatureWithRetry(
             c.imageUrl as string,
-            style
+            style,
+            provider
           );
           caricatureCache.set(c.id, caricature);
-          const desc = await describeCaricature(
-            caricature ?? (c.imageUrl as string)
-          );
-          if (desc) {
-            descriptionCache.set(c.id, desc);
-            descriptionSource.set(c.id, "photo");
+
+          if (provider === "local") {
+            if (caricature) {
+              descriptionCache.set(c.id, LOCAL_CAST_DESCRIPTION);
+              descriptionSource.set(c.id, "photo");
+            }
+          } else {
+            const desc = await describeCaricature(
+              caricature ?? (c.imageUrl as string)
+            );
+            if (desc) {
+              descriptionCache.set(c.id, desc);
+              descriptionSource.set(c.id, "photo");
+            }
           }
+
           if (!caricature) {
             console.warn(
               `[comic] caricature failed for "${c.name}", using original photo + description`
@@ -1508,18 +1587,17 @@ export async function buildComic(
           }
         } else {
           const desc = await lookupPersonDescription(c.name, {
-            useCuratedLooks: provider === "flux",
+            useCuratedLooks,
           });
           if (desc) {
             descriptionCache.set(c.id, desc);
             descriptionSource.set(c.id, "web");
-            // Lookalike reference images are FLUX-only. OpenAI keeps its
-            // proven cast-sheet path (photo caricatures only; celebs stay
-            // description-driven without an extra generated face).
-            if (provider === "flux") {
+            // Lookalike reference images for FLUX and Local (OpenAI uses cast sheet only).
+            if (provider === "flux" || provider === "local") {
               const lookalike = await generateLookalikeFromDescription(
                 desc,
-                style
+                style,
+                provider
               );
               if (lookalike) {
                 caricatureCache.set(c.id, lookalike);
@@ -1582,6 +1660,11 @@ export async function buildComic(
     storyCast.map(async (c) => {
       if (descriptionCache.has(c.id)) return;
       if (c.imageUrl) {
+        if (provider === "local") {
+          descriptionCache.set(c.id, LOCAL_CAST_DESCRIPTION);
+          descriptionSource.set(c.id, "photo");
+          return;
+        }
         const src = (caricatureCache.get(c.id) || c.imageUrl) as string;
         const desc = await describeCaricature(src);
         if (desc) {
@@ -1590,7 +1673,7 @@ export async function buildComic(
         }
       } else {
         const desc = await lookupPersonDescription(c.name, {
-          useCuratedLooks: provider === "flux",
+          useCuratedLooks: provider === "flux" || provider === "local",
         });
         if (desc) {
           descriptionCache.set(c.id, desc);
@@ -1613,10 +1696,13 @@ export async function buildComic(
   // Cloudflare tunnels (~100s) so the client saw constant failures. The client
   // resume loop already expects multi-chunk generation. OpenAI still draws
   // several panels per chunk in parallel.
-  const MAX_DRAW_PER_CHUNK = provider === "flux" ? 1 : 4;
-  const OVERALL_DEADLINE_MS = provider === "flux" ? 75_000 : 150_000;
+  const MAX_DRAW_PER_CHUNK =
+    provider === "flux" || provider === "local" ? 1 : 4;
+  const OVERALL_DEADLINE_MS =
+    provider === "local" ? 280_000 : provider === "flux" ? 75_000 : 150_000;
   const MIN_ATTEMPT_MS = 12_000;
-  const PARALLEL_CONCURRENCY = provider === "flux" ? 1 : 4;
+  const PARALLEL_CONCURRENCY =
+    provider === "flux" || provider === "local" ? 1 : 4;
   const deadline = buildStart + OVERALL_DEADLINE_MS;
   const canAttempt = () => Date.now() < deadline - MIN_ATTEMPT_MS;
 
@@ -1873,12 +1959,14 @@ export async function buildComic(
         // FLUX: send the clean story caption — wardrobe already lives in the
         // character descriptions. The continuity parenthetical used to bloat
         // late panels and fight the scene on short-window fallbacks.
-        caption: provider === "flux" ? labeledCaption : baseCaption,
+        caption:
+          provider === "flux" || provider === "local"
+            ? labeledCaption
+            : baseCaption,
       });
 
       // Soften ladder is for OpenAI moderation. FLUX already has its own
-      // permissive fal ladder; LLM softens were rewriting late-panel stories
-      // into generic "cuddled under a duvet" mush and dropping likeness.
+      // permissive fal ladder. Local ComfyUI skips softening entirely.
       if (provider === "flux") {
         // One local soften only if the whole fal ladder refused — keeps the
         // same characters/setting without inventing a new scene via LLM.
@@ -1892,7 +1980,7 @@ export async function buildComic(
             });
           }
         }
-      } else {
+      } else if (provider !== "local") {
         const levels: SanitizeLevel[] = [0, 1, 2];
         for (const level of levels) {
           if (result.imageUrl) break;

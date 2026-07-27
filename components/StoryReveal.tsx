@@ -152,8 +152,8 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
   const story = stories[index];
   const currentComic = story ? comics[story.id] : undefined;
 
-  // Per-story engine recommendation (spicy content → FLUX). Auto-applied
-  // until the user picks an engine manually.
+  // Per-story engine recommendation (spicy content → Local when available).
+  // Auto-applied until the user picks an engine manually.
   const recommendation = useMemo(
     () => (story ? recommendImageProvider(story) : null),
     [story]
@@ -670,15 +670,27 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
             {STYLE_OPTIONS.find((o) => o.value === caricatureStyle)?.hint}
           </p>
         </div>
-        {providersAvailable.includes("flux") && (
+        {providersAvailable.length > 1 && (
           <div className="mb-3 rounded-xl border border-white/10 bg-white/5 p-3">
             <p className="mb-2 text-xs font-medium uppercase tracking-wide text-white/60">
               Image engine
             </p>
-            <div className="grid grid-cols-2 gap-2">
+            <div
+              className={`grid gap-2 ${
+                providersAvailable.length >= 3
+                  ? "grid-cols-1 sm:grid-cols-3"
+                  : "grid-cols-2"
+              }`}
+            >
               {providersAvailable.map((p) => {
                 const selected = imageProvider === p;
                 const recommended = recommendation?.provider === p;
+                const label =
+                  p === "openai"
+                    ? "OpenAI"
+                    : p === "flux"
+                      ? "FLUX"
+                      : "Local";
                 return (
                   <button
                     key={p}
@@ -695,7 +707,7 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
                         : "border-white/10 bg-white/5 text-white/70 hover:border-white/30 hover:text-white"
                     }`}
                   >
-                    {p === "openai" ? "OpenAI" : "FLUX"}
+                    {label}
                     {recommended && (
                       <span className="ml-2 rounded-full bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-300">
                         Recommended
@@ -711,9 +723,11 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
               </p>
             )}
             <p className="mt-1 text-xs text-white/50">
-              {imageProvider === "flux"
-                ? "FLUX.2 (fal.ai) — character reference images + full descriptions for consistency. Scenes its filter refuses automatically retry on more permissive engines (Qwen, FLUX v1.1)."
-                : "OpenAI gpt-image-1 — stricter moderation, but uses the cast sheet for stronger likenesses."}
+              {imageProvider === "local"
+                ? "Local (ComfyUI) — full uncensored pipeline: caricatures, lookalikes, and panels all run on your machine with no cloud moderation. May take several minutes per step."
+                : imageProvider === "flux"
+                  ? "FLUX.2 (fal.ai) — character reference images + full descriptions for consistency. Scenes its filter refuses automatically retry on more permissive engines (Qwen, FLUX v1.1)."
+                  : "OpenAI gpt-image-1 — stricter moderation, but uses the cast sheet for stronger likenesses."}
             </p>
           </div>
         )}
