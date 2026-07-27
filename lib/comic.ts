@@ -687,6 +687,16 @@ function stableSeedFromId(id: string): number {
   return h % 2147483647;
 }
 
+/**
+ * Per-panel seed: same story base (so character look stays in one family) but
+ * unique per panel index. A single shared seed + character-first prompts made
+ * later panels render as near-duplicates — FLUX reuses the same noise when the
+ * leading prompt tokens match.
+ */
+function panelSeed(storySeed: number, panelIndex: number): number {
+  return (storySeed + (panelIndex + 1) * 100_003) % 2147483647;
+}
+
 /** POST to a fal.ai endpoint, inline the resulting image as a data URL. */
 async function callFluxEndpoint(
   endpoint: string,
@@ -1286,8 +1296,8 @@ export async function buildComic(
 ): Promise<ComicBuildResult> {
   const buildStart = Date.now();
   const scripted = scriptPanels(story);
-  // One seed per story so FLUX renders characters consistently across panels
-  // (and across resume passes).
+  // One base seed per story; each panel gets storySeed + panelIndex so
+  // character look stays related but compositions don't collapse into clones.
   const storySeed = stableSeedFromId(story.id);
 
   if (!hasAiProvider()) {
@@ -1625,7 +1635,11 @@ export async function buildComic(
             characters,
             liveDescriptions,
             caricatureCache,
-            { textOnly: a.textOnly || useTextOnly, provider, seed: storySeed }
+            {
+              textOnly: a.textOnly || useTextOnly,
+              provider,
+              seed: panelSeed(storySeed, panelIdx),
+            }
           );
           if (result.imageUrl) {
             attemptLog.push({
