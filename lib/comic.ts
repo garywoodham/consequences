@@ -225,16 +225,15 @@ async function fetchAsBlob(url: string): Promise<Blob | null> {
 }
 
 /**
- * Caricature generation once, retried once on failure — image generation is
- * non-deterministic and an occasional flaky refusal shouldn't drop a character.
+ * Caricature generation with built-in rate-limit backoff. OpenAI Tier 1 is
+ * ~5 images/min — a naive immediate retry makes 429s worse.
  */
 async function generateCaricatureWithRetry(
   imageUrl: string,
   style: CaricatureStyle,
   provider?: ImageProvider
 ): Promise<string | null> {
-  const first = await generateCaricature(imageUrl, style, provider);
-  return first ?? (await generateCaricature(imageUrl, style, provider));
+  return generateCaricature(imageUrl, style, provider);
 }
 
 /** Turn an uploaded photo into a cartoon caricature. */
@@ -256,27 +255,54 @@ export async function generateCaricature(
   const blob = await fetchAsBlob(imageUrl);
   if (!blob) return null;
 
-  try {
-    const form = new FormData();
-    form.append("model", "gpt-image-1");
-    form.append("image", blob, "photo.png");
-    form.append("prompt", caricaturePrompt(style));
-    form.append("size", "1024x1024");
-    form.append("quality", "medium");
-    form.append("moderation", "low");
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const form = new FormData();
+      form.append("model", "gpt-image-1");
+      form.append("image", blob, "photo.png");
+      form.append("prompt", caricaturePrompt(style));
+      form.append("size", "1024x1024");
+      form.append("quality", "medium");
+      form.append("moderation", "low");
 
-    const res = await fetch("https://api.openai.com/v1/images/edits", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: form,
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const b64 = data?.data?.[0]?.b64_json;
-    return b64 ? `data:image/png;base64,${b64}` : null;
-  } catch {
-    return null;
+      const res = await fetch("https://api.openai.com/v1/images/edits", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+        body: form,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const b64 = data?.data?.[0]?.b64_json;
+        return b64 ? `data:image/png;base64,${b64}` : null;
+      }
+
+      const body = await res.text().catch(() => "");
+      if (isRateLimitResponse(res.status, body) && attempt < 3) {
+        const waitMs = rateLimitBackoffMs(attempt, parseRetryAfterMs(res));
+        console.warn(
+          `[comic] caricature rate-limited (attempt ${attempt + 1}/4), ` +
+            `waiting ${waitMs}ms`
+        );
+        await sleep(waitMs);
+        continue;
+      }
+      console.warn(
+        `[comic] caricature failed status=${res.status} ` + body.slice(0, 160)
+      );
+      return null;
+    } catch (err) {
+      if (attempt < 3) {
+        await sleep(2_000);
+        continue;
+      }
+      console.warn(
+        `[comic] caricature network error: ` +
+          (err instanceof Error ? err.message : "unknown")
+      );
+      return null;
+    }
   }
+  return null;
 }
 
 /**
@@ -528,32 +554,45 @@ async function generateLookalikeFromDescription(
     `a whole comic strip — consistency matters. ${NO_TEXT_BRIEF}.`;
 
   try {
-    const res = await fetch("https://api.openai.com/v1/images/generations", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-image-1",
-        prompt: openAiPrompt,
-        size: "1024x1024",
-        quality: "medium",
-        moderation: "low",
-        n: 1,
-      }),
-    });
-    if (!res.ok) {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const res = await fetch("https://api.openai.com/v1/images/generations", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-image-1",
+          prompt: openAiPrompt,
+          size: "1024x1024",
+          quality: "medium",
+          moderation: "low",
+          n: 1,
+        }),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as { data?: { b64_json?: string }[] };
+        const b64 = data?.data?.[0]?.b64_json;
+        return b64 ? `data:image/png;base64,${b64}` : null;
+      }
+
       const body = await res.text().catch(() => "");
+      if (isRateLimitResponse(res.status, body) && attempt < 3) {
+        const waitMs = rateLimitBackoffMs(attempt, parseRetryAfterMs(res));
+        console.warn(
+          `[comic] lookalike rate-limited (attempt ${attempt + 1}/4), ` +
+            `waiting ${waitMs}ms`
+        );
+        await sleep(waitMs);
+        continue;
+      }
       console.warn(
         `[comic] lookalike caricature failed status=${res.status} ` +
           body.slice(0, 160)
       );
       return null;
     }
-    const data = (await res.json()) as { data?: { b64_json?: string }[] };
-    const b64 = data?.data?.[0]?.b64_json;
-    return b64 ? `data:image/png;base64,${b64}` : null;
+    return null;
   } catch (err) {
     console.warn(
       `[comic] lookalike caricature network error: ` +
@@ -666,14 +705,72 @@ type PanelResult = {
   prompt: string;
   /** True when the image API refused for safety/moderation. */
   blocked?: boolean;
-  /** True when OpenAI returned a rate-limit (429) — caller should wait & retry. */
+  /** True when OpenAI/fal returned a rate-limit — caller should wait & retry. */
   rateLimited?: boolean;
+  /** Suggested wait from Retry-After (ms), when the provider sent one. */
+  retryAfterMs?: number;
   /** Human-readable explanation of why generation failed (when imageUrl is null). */
   reason?: string;
 };
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Parse Retry-After header (seconds or HTTP-date) into a capped wait in ms. */
+function parseRetryAfterMs(res: Response): number | undefined {
+  const header = res.headers.get("retry-after");
+  if (!header) return undefined;
+  const seconds = Number.parseFloat(header);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(Math.round(seconds * 1000), 120_000);
+  }
+  const dateMs = Date.parse(header);
+  if (Number.isFinite(dateMs)) {
+    return Math.min(Math.max(0, dateMs - Date.now()), 120_000);
+  }
+  return undefined;
+}
+
+/**
+ * OpenAI Tier 1 is only ~5 images/minute for gpt-image-1; fal also throttles.
+ * Treat 429 plus common body / capacity signals as rate limits.
+ */
+function isRateLimitResponse(status: number, body: string): boolean {
+  if (status === 429) return true;
+  const lower = body.toLowerCase();
+  if (
+    lower.includes("rate_limit") ||
+    lower.includes("rate limit") ||
+    lower.includes("too many requests") ||
+    lower.includes("quota") ||
+    lower.includes("tokens per min") ||
+    lower.includes("images per min") ||
+    lower.includes("ipm")
+  ) {
+    return true;
+  }
+  // fal / upstream capacity pressure
+  if (
+    status === 503 &&
+    (lower.includes("capacity") ||
+      lower.includes("throttl") ||
+      lower.includes("overload") ||
+      lower.includes("busy"))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Backoff for Tier-1 IPM (~12s/image). Prefer Retry-After when present. */
+function rateLimitBackoffMs(attempt: number, retryAfterMs?: number): number {
+  if (retryAfterMs != null && retryAfterMs > 0) {
+    // Add a small cushion so we don't re-hit the window edge.
+    return Math.min(Math.max(retryAfterMs + 1_500, 5_000), 90_000);
+  }
+  const table = [15_000, 30_000, 45_000];
+  return table[Math.min(attempt, table.length - 1)] ?? 45_000;
 }
 
 function looksLikeModerationBlock(status: number, body: string): boolean {
@@ -714,7 +811,7 @@ function explainImageApiFailure(status: number, body: string): string {
   if (status === 401 || status === 403) {
     return apiMessage || "OpenAI API key rejected (unauthorized).";
   }
-  if (status === 429 || lower.includes("rate_limit") || lower.includes("quota")) {
+  if (status === 429 || isRateLimitResponse(status, body)) {
     return apiMessage || "OpenAI rate limit / quota exceeded — try again shortly.";
   }
   if (status === 402 || lower.includes("billing") || lower.includes("insufficient")) {
@@ -785,13 +882,14 @@ async function generatePanelFromTextCast(
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       const blocked = looksLikeModerationBlock(res.status, body);
-      const rateLimited = res.status === 429;
+      const rateLimited = isRateLimitResponse(res.status, body);
+      const retryAfterMs = rateLimited ? parseRetryAfterMs(res) : undefined;
       const reason = explainImageApiFailure(res.status, body);
       console.warn(
         `[comic] text-to-image failed status=${res.status} blocked=${blocked} ` +
           `rateLimited=${rateLimited} reason=${reason}`
       );
-      return { imageUrl: null, prompt, blocked, rateLimited, reason };
+      return { imageUrl: null, prompt, blocked, rateLimited, retryAfterMs, reason };
     }
     const data = await res.json();
     const b64 = data?.data?.[0]?.b64_json;
@@ -868,14 +966,18 @@ async function callFluxEndpoint(
         lower.includes("nsfw") ||
         lower.includes("content_policy_violation") ||
         (res.status === 422 && lower.includes("content"));
-      const rateLimited = res.status === 429;
-      const reason = blocked
-        ? "Blocked by FLUX content filter."
-        : `FLUX API error (HTTP ${res.status}): ${body.slice(0, 160)}`;
+      const rateLimited = isRateLimitResponse(res.status, body);
+      const retryAfterMs = rateLimited ? parseRetryAfterMs(res) : undefined;
+      const reason = rateLimited
+        ? "FLUX rate limit / capacity — will wait and retry."
+        : blocked
+          ? "Blocked by FLUX content filter."
+          : `FLUX API error (HTTP ${res.status}): ${body.slice(0, 160)}`;
       console.warn(
-        `[comic] flux ${endpoint} failed status=${res.status} blocked=${blocked} reason=${reason}`
+        `[comic] flux ${endpoint} failed status=${res.status} ` +
+          `blocked=${blocked} rateLimited=${rateLimited} reason=${reason}`
       );
-      return { imageUrl: null, prompt, blocked, rateLimited, reason };
+      return { imageUrl: null, prompt, blocked, rateLimited, retryAfterMs, reason };
     }
 
     const data = (await res.json()) as {
@@ -1355,6 +1457,7 @@ async function generatePanelImage(
 
   let editBlocked = false;
   let editRateLimited = false;
+  let editRetryAfterMs: number | undefined;
   let editReason: string | undefined;
   try {
     const form = new FormData();
@@ -1378,7 +1481,8 @@ async function generatePanelImage(
     } else {
       const body = await res.text().catch(() => "");
       editBlocked = looksLikeModerationBlock(res.status, body);
-      editRateLimited = res.status === 429;
+      editRateLimited = isRateLimitResponse(res.status, body);
+      editRetryAfterMs = editRateLimited ? parseRetryAfterMs(res) : undefined;
       editReason = explainImageApiFailure(res.status, body);
       console.warn(
         `[comic] image-edit failed status=${res.status} blocked=${editBlocked} ` +
@@ -1401,6 +1505,7 @@ async function generatePanelImage(
       prompt,
       blocked: editBlocked,
       rateLimited: true,
+      retryAfterMs: editRetryAfterMs,
       reason: editReason,
     };
   }
@@ -1535,9 +1640,10 @@ export async function buildComic(
 
   // First call: prepare cast ONLY (no panel images) so caricature work and
   // image generation never share one tunnel request.
+  // Serialise cast image work — OpenAI Tier 1 is ~5 images/min; parallel
+  // caricatures for every player was the main rate-limit trigger.
   if (!castAlreadyReady) {
-    await Promise.all(
-      storyCast.map(async (c) => {
+    await mapPool(storyCast, 1, async (c) => {
         const useCuratedLooks = provider === "flux" || provider === "local";
 
         if (descriptionCache.has(c.id) || caricatureCache.has(c.id)) {
@@ -1622,8 +1728,7 @@ export async function buildComic(
             }
           }
         }
-      })
-    );
+    });
 
     const cast: ComicCharacter[] = storyCast.map((c) => ({
       id: c.id,
@@ -1701,17 +1806,16 @@ export async function buildComic(
   }));
 
   // Bake continuity from story order first, then draw pending panels.
-  // FLUX: ONE panel per HTTP chunk. Serial-all-in-one-request was timing out
-  // Cloudflare tunnels (~100s) so the client saw constant failures. The client
-  // resume loop already expects multi-chunk generation. OpenAI still draws
-  // several panels per chunk in parallel.
+  // FLUX / Local: ONE panel per HTTP chunk (slow / tunnel timeouts).
+  // OpenAI: also serial — Tier 1 gpt-image-1 is only ~5 images/minute;
+  // drawing 4 panels in parallel was the main rate-limit failure mode.
+  // The client resume loop already expects multi-chunk generation.
   const MAX_DRAW_PER_CHUNK =
-    provider === "flux" || provider === "local" ? 1 : 4;
+    provider === "flux" || provider === "local" ? 1 : 2;
   const OVERALL_DEADLINE_MS =
-    provider === "local" ? 280_000 : provider === "flux" ? 75_000 : 150_000;
+    provider === "local" ? 280_000 : provider === "flux" ? 120_000 : 200_000;
   const MIN_ATTEMPT_MS = 12_000;
-  const PARALLEL_CONCURRENCY =
-    provider === "flux" || provider === "local" ? 1 : 4;
+  const PARALLEL_CONCURRENCY = 1;
   const deadline = buildStart + OVERALL_DEADLINE_MS;
   const canAttempt = () => Date.now() < deadline - MIN_ATTEMPT_MS;
 
@@ -1919,16 +2023,16 @@ export async function buildComic(
             return;
           }
 
-          if (result.rateLimited && rateTry < 1) {
-            const waitMs = 8_000;
+          if (result.rateLimited && rateTry < 2) {
+            const waitMs = rateLimitBackoffMs(rateTry, result.retryAfterMs);
             console.warn(
-              `[comic] panel ${panelIdx} rate-limited on ${a.label}, ` +
-                `waiting ${waitMs}ms then retrying same caption`
+              `[comic] panel ${panelIdx} rate-limited on ${a.label} ` +
+                `(try ${rateTry + 1}/3), waiting ${waitMs}ms then retrying same caption`
             );
             attemptLog.push({
               attempt: `${a.label}-ratewait`,
               ok: false,
-              reason: `Rate limited — waiting ${waitMs / 1000}s then retrying.`,
+              reason: `Rate limited — waiting ${Math.round(waitMs / 1000)}s then retrying.`,
               caption: a.caption.slice(0, 160),
             });
             await sleep(waitMs);

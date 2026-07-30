@@ -319,9 +319,10 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
         if (data.generatedThisChunk === 0) {
           stallCount += 1;
           // First call is cast-only (0 images). After that, a few stalls in a
-          // row means we aren't making progress. FLUX draws one panel per
-          // pass, so allow more retries before giving up.
-          const stallLimit = imageProvider === "flux" ? 4 : 2;
+          // row means we aren't making progress. OpenAI / FLUX both draw
+          // slowly under rate limits, so allow more empty passes before giving up.
+          const stallLimit =
+            imageProvider === "flux" || imageProvider === "openai" ? 5 : 2;
           if (chunk > 1 && stallCount >= stallLimit) {
             setComicError(
               `Stopped after ${doneCount}/${total} panels — remaining panels could not be drawn.`
