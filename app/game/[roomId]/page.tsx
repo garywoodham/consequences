@@ -34,11 +34,20 @@ export default function GamePage() {
     }
   }, [session, roomId, router]);
 
-  const { state, error, connected, startGame, submitAnswers, playAgain, submitTidy } =
-    useGame({
-      roomId,
-      session,
-    });
+  const {
+    state,
+    error,
+    connected,
+    connectionError,
+    partyHost,
+    startGame,
+    submitAnswers,
+    playAgain,
+    submitTidy,
+  } = useGame({
+    roomId,
+    session,
+  });
 
   if (!session) {
     return (
@@ -68,12 +77,37 @@ export default function GamePage() {
           Leave game
         </button>
         <p className="text-sm text-white/60">
-          <span className={connected ? "text-emerald-300" : "text-amber-300"}>
-            {connected ? "Connected" : "Connecting..."}
+          <span
+            className={
+              connected
+                ? "text-emerald-300"
+                : connectionError
+                  ? "text-rose-300"
+                  : "text-amber-300"
+            }
+          >
+            {connected
+              ? "Connected"
+              : connectionError
+                ? "Connection failed"
+                : "Connecting..."}
           </span>{" "}
           · {template.name} · {state.players.length} players
         </p>
       </div>
+
+      {connectionError && !connected && (
+        <div
+          className="rounded-2xl border border-rose-400/40 bg-rose-950/50 px-4 py-3 text-sm text-rose-100"
+          role="alert"
+        >
+          <p className="font-medium">Can&apos;t reach the lobby server</p>
+          <p className="mt-1 text-rose-100/80">{connectionError}</p>
+          {partyHost ? (
+            <p className="mt-2 font-mono text-xs text-rose-100/60">Host: {partyHost}</p>
+          ) : null}
+        </div>
+      )}
 
       {state.phase === "lobby" && (
         <Lobby

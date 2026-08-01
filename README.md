@@ -29,15 +29,16 @@ npm install
 
 ### Environment variables
 
-Copy `.env.local.example` to `.env.local`:
+Copy `.env.example` to `.env.local`:
 
 ```bash
-cp .env.local.example .env.local
+cp .env.example .env.local
 ```
 
 | Variable | Required | Description |
 |---|---|---|
-| `NEXT_PUBLIC_PARTYKIT_HOST` | Build-time fallback | PartyKit host baked into the client (used on Vercel). |
+| `ACCESS_CODE` | Optional | Party login code for `/login` (default `5075`). |
+| `NEXT_PUBLIC_PARTYKIT_HOST` | **Required on Vercel** | PartyKit host baked into the client (e.g. `consequences.you.partykit.dev`). |
 | `PARTYKIT_HOST` | Runtime override | Read at request time by `/api/config`, so the host can change without rebuilding (handy for preview tunnels). |
 | `BLOB_READ_WRITE_TOKEN` | Optional | Vercel Blob token for avatar uploads. Without it, avatars use base64 fallback. |
 | `OPENAI_API_KEY` | Optional | Enables AI comic strips: caricatures of player photos + illustrated panels. Without it, a photo-based comic is rendered instead. |
@@ -86,21 +87,46 @@ npm run dev:party  # PartyKit on :1999
 
 ## Deploy
 
-### Next.js (Vercel)
+The app is **two services**:
+
+1. **Next.js** (Vercel) — UI + API routes  
+2. **PartyKit** (partykit.dev) — live lobby / WebSocket game rooms  
+
+Vercel alone cannot host the lobby. If `NEXT_PUBLIC_PARTYKIT_HOST` is missing, the game stays on **Connecting...** forever.
+
+### 1. Deploy PartyKit
+
+```bash
+npx partykit login
+npm run deploy:party
+```
+
+Note the host printed at the end (e.g. `consequences.<you>.partykit.dev`).
+
+### 2. Deploy Next.js on Vercel
+
+Set these environment variables in the Vercel project (**Production** and **Preview**), then redeploy:
+
+| Variable | Value |
+|---|---|
+| `NEXT_PUBLIC_PARTYKIT_HOST` | `consequences.<you>.partykit.dev` (no `https://`) |
+| `PARTYKIT_HOST` | same as above (optional runtime override) |
+| `ACCESS_CODE` | `5075` (party login code; this is the default if unset) |
+| `OPENAI_API_KEY` | optional, for comics |
+| `FAL_KEY` | optional, for FLUX comics |
 
 ```bash
 npm run build
 ```
 
-Set environment variables in Vercel dashboard.
+### 3. Party login code
 
-### PartyKit
+Visitors hit `/login` and must enter **`5075`** (or whatever you set in `ACCESS_CODE`) before creating or joining a game. The cookie lasts 90 days.
 
-```bash
-npm run deploy:party
-```
+### Quick check
 
-Set `NEXT_PUBLIC_PARTYKIT_HOST` to your deployed PartyKit host (e.g. `consequences.your-username.partykit.dev`).
+Open `https://<your-vercel-app>/api/config` after deploying.  
+`partyHost` must be your `*.partykit.dev` host — **not** `*.vercel.app:1999`.
 
 ## Comic strips (Phase 2)
 
