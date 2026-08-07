@@ -45,6 +45,21 @@ function slimComicForResume(comic: ComicStripData): ComicStripData {
   };
 }
 
+/**
+ * On resume, cast caricatures already travel in previousComic — drop bulky
+ * avatar/photo data URLs from the story so the proxy body stays under budget.
+ */
+function slimStoryForResume(story: Story): Story {
+  return {
+    ...story,
+    comic: undefined,
+    characters: (story.characters ?? []).map((c) => ({
+      ...c,
+      imageUrl: undefined,
+    })),
+  };
+}
+
 /** Re-attach real panel images kept on the client after a slim server round-trip. */
 function mergeComicProgress(
   local: ComicStripData | undefined,
@@ -274,7 +289,8 @@ export function StoryReveal({ state, isHost, onPlayAgain, onSubmitTidy }: StoryR
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              story: target,
+              // After cast setup, skip re-uploading story photo bytes.
+              story: previousComic ? slimStoryForResume(target) : target,
               style: caricatureStyle,
               provider: imageProvider,
               // Slim payload: don't re-upload finished panel PNGs each pass.
