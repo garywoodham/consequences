@@ -85,49 +85,59 @@ npm run dev:party  # PartyKit on :1999
 5. When all submitted, **stories are mixed** and revealed
 6. **Read them aloud** — the mismatches are the fun part!
 
-## Deploy
+## Deploy (permanent free hosting)
 
 The app is **two services**:
 
-1. **Next.js** (Vercel) — UI + API routes  
-2. **PartyKit** (partykit.dev) — live lobby / WebSocket game rooms  
+1. **Next.js** on [Vercel](https://vercel.com) (free) — UI + API routes  
+2. **PartyKit** on [partykit.dev](https://partykit.io) (free) — live lobby / WebSockets  
 
-Vercel alone cannot host the lobby. If `NEXT_PUBLIC_PARTYKIT_HOST` is missing, the game stays on **Connecting...** forever.
+Tunnel / cloud-agent preview links are temporary. For a URL that stays up, deploy both services once.
 
-### 1. Deploy PartyKit
+### Easiest: one script on your laptop
+
+```bash
+git pull
+bash scripts/deploy-permanent.sh
+```
+
+That logs into PartyKit, deploys the lobby, and guides Vercel setup.
+
+### Manual steps
+
+**1. PartyKit lobby**
 
 ```bash
 npx partykit login
 npm run deploy:party
 ```
 
-Note the host printed at the end (e.g. `consequences.<you>.partykit.dev`).
+Copy the host it prints (e.g. `consequences.<you>.partykit.dev`).
 
-### 2. Deploy Next.js on Vercel
+**2. Next.js on Vercel**
 
-Set these environment variables in the Vercel project (**Production** and **Preview**), then redeploy:
+- Go to [vercel.com/new](https://vercel.com/new) → Import `garywoodham/consequences`
+- Add environment variables (**Production** and **Preview**):
 
 | Variable | Value |
 |---|---|
 | `NEXT_PUBLIC_PARTYKIT_HOST` | `consequences.<you>.partykit.dev` (no `https://`) |
-| `PARTYKIT_HOST` | same as above (optional runtime override) |
-| `ACCESS_CODE` | `5075` (party login code; this is the default if unset) |
-| `OPENAI_API_KEY` | optional, for comics |
+| `PARTYKIT_HOST` | same as above |
+| `ACCESS_CODE` | `5075` |
+| `OPENAI_API_KEY` | optional, for OpenAI comics |
 | `FAL_KEY` | optional, for FLUX comics |
 
-```bash
-npm run build
-```
+- Deploy. Later pushes to `main` redeploy automatically.
 
-### 3. Party login code
+**3. Login code**
 
-Visitors hit `/login` and must enter **`5075`** (or whatever you set in `ACCESS_CODE`) before creating or joining a game. The cookie lasts 90 days.
+Visitors hit `/login` and enter **`5075`**. Cookie lasts 90 days.
 
 ### Quick check
 
-Open `https://<your-vercel-app>/api/config` after deploying.  
+Open `https://<your-app>.vercel.app/api/config`.  
 `partyHost` must be your `*.partykit.dev` host — **not** `*.vercel.app:1999`.
-
+If it is wrong, the lobby stays on Connecting forever.
 ## Comic strips (Phase 2)
 
 After the reveal, tap **Generate comic strip** on any story:
