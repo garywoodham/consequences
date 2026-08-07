@@ -121,8 +121,17 @@ const TRIGGER_PATTERNS: RegExp[] = [
   /\bpenis\b/i,
   /\bcock\b/i,
   /\bdick\b/i,
+  /\berection\b/i,
+  /\bhard[- ]?on\b/i,
   /\bvagina\b/i,
   /\bpussy\b/i,
+  /\bnothing (?:beneath|underneath|under)\b/i,
+  /\bno (?:knickers|underwear|pants)\b/i,
+  /\bcompletely bare\b/i,
+  /\bflashed\b/i,
+  /\bflashing\b/i,
+  /\bbodily fluids?\b/i,
+  /\bmid[- ]?(?:thrust|shag|romp)\b/i,
   /\barse\b/i,
   /\bass(hole)?\b/i,
   /\bbutthole\b/i,
@@ -308,11 +317,71 @@ export function localSoften(
       byLevel: ["chest", "outfit", "top"],
     },
     {
-      re: /\b(?:penis|cock|dick|vagina|pussy)\b/gi,
+      re: /\b(?:penis|cock|dick|vagina|pussy|erection|hard[- ]?on)\b/gi,
       byLevel: [
         "nothing visible below a carefully placed sheet",
         "nothing visible under the covers",
         "nothing visible below their underwear",
+      ],
+    },
+    {
+      re: /\blegendary erection\b/gi,
+      byLevel: [
+        "robe held closed with one hand",
+        "bathrobe tied shut",
+        "underwear under an open robe",
+      ],
+    },
+    {
+      re: /\bnothing (?:beneath|underneath|under)(?: it)?\b/gi,
+      byLevel: [
+        "covering themselves modestly underneath",
+        "a slip underneath",
+        "underwear underneath",
+      ],
+    },
+    {
+      re: /\bno (?:knickers|underwear|pants)\b/gi,
+      byLevel: [
+        "covering themselves carefully",
+        "a slip underneath",
+        "underwear on",
+      ],
+    },
+    {
+      re: /\b(?:got |dived in )?completely bare\b/gi,
+      byLevel: [
+        "seen from the shoulders up, covering themselves",
+        "wrapped in a towel covering themselves",
+        "in their swimwear",
+      ],
+    },
+    {
+      re: /\b(?:peeled everything off|flashed(?: the whole \w+)?|flashing)\b/gi,
+      byLevel: [
+        "covered up with their arms, clothes nearby",
+        "wrapped in a towel, clothes in a heap",
+        "changed down to underwear",
+      ],
+    },
+    {
+      re: /\bbodily fluids?\b/gi,
+      byLevel: ["suspicious puddles", "party mess", "spilled drinks"],
+    },
+    {
+      re: /\bhanging fully open\b/gi,
+      byLevel: [
+        "held mostly closed",
+        "loosely tied",
+        "open over underwear",
+      ],
+    },
+    {
+      re: /\bmid[- ]?(?:thrust|shag|romp)\b/gi,
+      byLevel: [
+        "mid-cuddle under covers",
+        "tangled under a duvet, covered up",
+        "cuddling in underwear under covers",
       ],
     },
     {

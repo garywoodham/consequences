@@ -1810,8 +1810,9 @@ export async function buildComic(
   // OpenAI: also serial — Tier 1 gpt-image-1 is only ~5 images/minute;
   // drawing 4 panels in parallel was the main rate-limit failure mode.
   // The client resume loop already expects multi-chunk generation.
-  const MAX_DRAW_PER_CHUNK =
-    provider === "flux" || provider === "local" ? 1 : 2;
+  // One panel per chunk so OpenAI soften retries (caption + wardrobe) fit
+  // inside Vercel request limits without abandoning mid-ladder.
+  const MAX_DRAW_PER_CHUNK = 1;
   const OVERALL_DEADLINE_MS =
     provider === "local" ? 280_000 : provider === "flux" ? 120_000 : 200_000;
   const MIN_ATTEMPT_MS = 12_000;
@@ -1975,7 +1976,13 @@ export async function buildComic(
         };
       }
 
-      type Attempt = { label: string; caption: string; textOnly?: boolean };
+      type Attempt = {
+        label: string;
+        caption: string;
+        textOnly?: boolean;
+        descriptions?: Map<string, string>;
+        characters?: ComicCharacter[];
+      };
       let result: PanelResult = { imageUrl: null, prompt: "" };
       const tried = new Set<string>();
       const attemptLog: PanelImageAttempt[] = [];
@@ -2000,8 +2007,8 @@ export async function buildComic(
           const t0 = Date.now();
           result = await generatePanelImage(
             a.caption,
-            characters,
-            liveDescriptions,
+            a.characters ?? characters,
+            a.descriptions ?? liveDescriptions,
             caricatureCache,
             {
               textOnly: a.textOnly || useTextOnly,
@@ -2135,12 +2142,26 @@ export async function buildComic(
             continue;
           }
 
+          // Soften wardrobe baked into character descriptions too — captions
+          // alone aren't enough when continuity still says "erection" / nude.
+          const softDescs = new Map<string, string>();
+          for (const [id, desc] of liveDescriptions) {
+            const softDesc = localSoften(desc, level, labelNames);
+            softDescs.set(id, softDesc && softDesc.trim() ? softDesc : desc);
+          }
+          const softCharacters = characters.map((c) => ({
+            ...c,
+            description: softDescs.get(c.id) ?? c.description ?? "",
+          }));
+
           // Keep the cast sheet on soften retries so toned-down panels stay
           // the same quality/likeness as the rest of the strip. Text-only is
           // only used if the edit path set useTextOnly (rate limits).
           await runAttempt({
             label: `soft${level}`,
             caption: softer,
+            descriptions: softDescs,
+            characters: softCharacters,
           });
         }
       }
